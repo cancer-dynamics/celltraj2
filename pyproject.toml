@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "celltraj2"
+version = "0.1.0"
+description = "Frame-based microscopy trajectory analysis backend for SITE."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [
+  { name = "Davies Cancer Lab" },
+]
+dependencies = []
+
+[project.optional-dependencies]
+analysis = [
+  "numpy>=1.24",
+  "h5py>=3.10",
+  "zarr>=2.18",
+  "dask[array]>=2024",
+  "tifffile>=2024",
+]
+nd2 = [
+  "nd2>=0.10",
+  "xarray>=2024",
+]
+dev = [
+  "pytest>=8",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
