@@ -1,7 +1,7 @@
-# SITE Handoff Contract
+# SITE Handoff
 
-SITE prepares ROI definitions and image caches. `celltraj2` creates and owns the
-per-ROI analysis H5.
+SITE prepares ROI definitions and image caches. `celltraj2` creates and owns
+the per-ROI analysis H5.
 
 ## Default Flow
 
@@ -67,8 +67,6 @@ Static imaging should be represented as a one-frame acquisition. SITE and
 with only `frame_1`.
 
 ## First Test Hook For SITE
-
-The first integration point is:
 
 ```python
 from celltraj2.sitelab import create_analysis_h5_from_site_roi

@@ -1,7 +1,7 @@
-# Focused Implementation Plan
+# Implementation Plan
 
 This repository starts with the batch segmentation and analysis-file backbone,
-not the full legacy celltraj feature surface.
+not the full legacy `celltraj` feature surface.
 
 ## Phase 1: Repository And Contract
 

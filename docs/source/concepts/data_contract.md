@@ -1,8 +1,8 @@
-# celltraj2 Data Contract
+# Data Contract
 
-This document defines the first `celltraj2` analysis H5 contract. The guiding
-rule is simple: segmentation and derived masks are written one local frame at a
-time, because that is how batch segmentation actually runs.
+The first `celltraj2` analysis contract is frame based. Segmentation and derived
+masks are written one local frame at a time, because that is how batch
+segmentation runs in practice.
 
 ## Frame IDs
 
