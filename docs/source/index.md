@@ -25,6 +25,7 @@ getting_started/quickstart
 
 concepts/data_contract
 concepts/sitelab_handoff
+concepts/batch_segmentation
 ```
 
 ```{toctree}

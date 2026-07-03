@@ -6,7 +6,10 @@ API Reference
 
    paths
    schema
+   model_input
+   batch
    store
    sources
    trajectory
    sitelab
+   cellpose_runner

@@ -14,6 +14,20 @@ package in editable mode with the analysis and ND2 extras:
 python -m pip install -e ".[analysis,nd2,dev]"
 ```
 
+For a Cellpose batch-segmentation environment, install Cellpose in that
+environment first, then install the smallest `celltraj2` extras needed for the
+image source mode. The default SITE ROI cache uses H5 plus OME-Zarr:
+
+```bash
+python -m pip install -e ".[h5,zarr]"
+```
+
+If that worker must read directly from linked ND2 files, include ND2 support:
+
+```bash
+python -m pip install -e ".[h5,zarr,nd2]"
+```
+
 For lean environments that only need the typed metadata contracts and path
 helpers:
 

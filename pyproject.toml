@@ -13,22 +13,40 @@ authors = [
 ]
 dependencies = []
 
+[project.scripts]
+celltraj2-cellpose-segment = "celltraj2.runners.cellpose_segment:main"
+
 [project.urls]
 Homepage = "https://github.com/cancer-dynamics/celltraj2"
 Documentation = "https://cancerdynamics.org/docs/celltraj2/"
 Issues = "https://github.com/cancer-dynamics/celltraj2/issues"
 
 [project.optional-dependencies]
+h5 = [
+  "numpy>=1.24",
+  "h5py>=3.10",
+]
+zarr = [
+  "numpy>=1.24",
+  "zarr>=2.18",
+  "dask[array]>=2024",
+]
+tiff = [
+  "numpy>=1.24",
+  "tifffile>=2024",
+]
+nd2 = [
+  "numpy>=1.24",
+  "nd2>=0.10",
+  "dask[array]>=2024",
+  "xarray>=2024",
+]
 analysis = [
   "numpy>=1.24",
   "h5py>=3.10",
   "zarr>=2.18",
   "dask[array]>=2024",
   "tifffile>=2024",
-]
-nd2 = [
-  "nd2>=0.10",
-  "xarray>=2024",
 ]
 dev = [
   "pytest>=8",

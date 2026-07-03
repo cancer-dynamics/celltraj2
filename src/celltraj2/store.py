@@ -222,6 +222,51 @@ class TrajectoryStore:
         name = validate_name(mask_set, kind="mask set")
         return self._read_frame_dataset(f"/masks/{name}", frame)
 
+    def write_segmentation_run(
+        self,
+        run_id: str,
+        data: Mapping[str, Any],
+        *,
+        overwrite: bool = True,
+    ) -> str:
+        """Write top-level metadata for one segmentation run."""
+
+        name = validate_name(run_id, kind="segmentation run")
+        group = self._h5.require_group(f"runs/segmentation/{name}")
+        group.require_group("frames")
+        self.write_json(f"/runs/segmentation/{name}/run.json", dict(data), overwrite=overwrite)
+        return f"/runs/segmentation/{name}/run.json"
+
+    def read_segmentation_run(self, run_id: str) -> Any:
+        name = validate_name(run_id, kind="segmentation run")
+        return self.read_json(f"/runs/segmentation/{name}/run.json")
+
+    def write_segmentation_frame_result(
+        self,
+        run_id: str,
+        frame: int,
+        data: Mapping[str, Any],
+        *,
+        overwrite: bool = True,
+    ) -> str:
+        """Write metadata for one frame processed by a segmentation run."""
+
+        name = validate_name(run_id, kind="segmentation run")
+        self._h5.require_group(f"runs/segmentation/{name}/frames")
+        path = f"/runs/segmentation/{name}/frames/{frame_key(frame)}.json"
+        self.write_json(path, dict(data), overwrite=overwrite)
+        return path
+
+    def read_segmentation_frame_result(self, run_id: str, frame: int) -> Any:
+        name = validate_name(run_id, kind="segmentation run")
+        return self.read_json(f"/runs/segmentation/{name}/frames/{frame_key(frame)}.json")
+
+    def list_segmentation_runs(self) -> list[str]:
+        path = "runs/segmentation"
+        if path not in self._h5:
+            return []
+        return sorted(str(key) for key in self._h5[path].keys())
+
     def list_label_sets(self) -> list[str]:
         if "labels" not in self._h5:
             return []

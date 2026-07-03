@@ -74,19 +74,21 @@ The H5 stores both:
 /runs/
   segmentation/
     <run_id>/
-      config.json
-      provenance.json
-      status.json
+      run.json
+      frames/
+        frame_1.json
+        frame_2.json
 ```
 
 ## Named Label Sets
 
-Label sets are semantic names, not channel numbers:
+Label and mask sets are semantic names, not channel numbers:
 
 ```text
 /labels/epithelial/frame_1
 /labels/immune/frame_1
 /labels/nuclei/frame_1
+/masks/cyto_immune/frame_1
 ```
 
 This replaces legacy names such as `msk`, `fmsk`, and `cell_data_m0`.
@@ -131,6 +133,55 @@ Frame-based storage supports common partial workflows:
 - keep static snapshot imaging as `frame_1`.
 
 Missing frame datasets mean "not segmented yet", not "empty labels".
+
+## Segmentation Runs
+
+Batch segmentation writes run metadata in the same H5 as the labels or masks:
+
+```text
+/runs/segmentation/<run_id>/run.json
+/runs/segmentation/<run_id>/frames/frame_1.json
+```
+
+`run.json` stores the submitted job slice for that H5: output name, output
+kind (`labels` or `masks`), frame list, backend/model parameters, channel specs,
+overwrite policy, and run status. Each frame JSON stores status (`completed`,
+`skipped`, or `failed`), the output path written for completed frames, compact
+input/label summaries, backend metadata, and any error text.
+
+The output target is explicit for every file job:
+
+```text
+output_name = "cyto_epithelial"
+output_kind = "labels"   -> /labels/cyto_epithelial/frame_1
+output_kind = "masks"    -> /masks/cyto_epithelial/frame_1
+```
+
+`masks` output converts any positive label value to `True`. This supports both
+object-label segmentation and pixel/binary classifiers under the same workflow
+contract.
+
+`save_outputs=false` is a dry-run/test mode. The worker reads image data,
+composes model input, runs the segmenter, and emits progress events, but opens
+the H5 read-only and does not write labels, masks, or `/runs/segmentation`
+metadata. `preview_output_path` and `preview_output_dir` can be used in either
+test or saved runs to write temporary `.npz` bundles for visualization.
+
+If a frame target already exists and `overwrite=false`, the frame is skipped.
+If `overwrite=true`, the existing frame dataset is replaced.
+
+## Model Input Contract
+
+Model input is composed from stored channel specs rather than from ad hoc raw
+channel numbers. Each output channel spec can select one or more raw source
+channels, normalize them, and combine them into a backend input channel.
+
+Supported normalization modes are `raw`, `lut_full_uint16`, and `full_uint16`.
+Supported source-channel combinations are `single`, `mean`, and `max`.
+
+3D jobs emit `Z,Y,X` for one model-input channel or `Z,C,Y,X` for multiple
+channels. 2D jobs emit `Y,X` or `C,Y,X`. A 2D job reading from a Z stack needs
+a `z_index` unless the stack has only one Z plane.
 
 ## Coordinate Rules
 

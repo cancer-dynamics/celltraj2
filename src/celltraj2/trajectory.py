@@ -96,3 +96,19 @@ class Trajectory:
 
     def mask_sets(self) -> list[str]:
         return self.store.list_mask_sets()
+
+    def write_segmentation_run(self, run_id: str, data: dict[str, Any], *, overwrite: bool = True) -> str:
+        return self.store.write_segmentation_run(run_id, data, overwrite=overwrite)
+
+    def write_segmentation_frame_result(
+        self,
+        run_id: str,
+        frame: int,
+        data: dict[str, Any],
+        *,
+        overwrite: bool = True,
+    ) -> str:
+        return self.store.write_segmentation_frame_result(run_id, frame, data, overwrite=overwrite)
+
+    def segmentation_runs(self) -> list[str]:
+        return self.store.list_segmentation_runs()

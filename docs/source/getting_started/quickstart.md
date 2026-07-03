@@ -50,3 +50,57 @@ with Trajectory(path) as traj:
 ```
 
 Missing label or mask frame datasets mean "not processed yet", not "empty".
+
+## Run A Dry Batch Segmentation
+
+Batch execution can be driven by any callable. This is the same executor shape
+used by SITE before swapping in the Cellpose command-line runner:
+
+```python
+import numpy as np
+
+from celltraj2 import SegmentationResult, run_batch_segmentation
+
+
+def threshold_segmenter(model_input, file_job, frame):
+    image = np.asarray(model_input)
+    labels = (image > image.mean()).astype(np.int32)
+    return SegmentationResult(labels=labels, metadata={"engine": "threshold"})
+
+
+job = {
+    "job_id": "example_test",
+    "save_outputs": False,
+    "files": [
+        {
+            "h5_path": str(path),
+            "output_name": "example_mask",
+            "output_kind": "masks",
+            "frames": {"mode": "range", "frame_start": 1, "frame_stop": 1},
+            "model_input": {
+                "channel_specs": [
+                    {"channel_indices": [0], "combination": "single", "normalization": "full_uint16"}
+                ]
+            },
+        }
+    ],
+}
+
+summary = run_batch_segmentation(job, threshold_segmenter)
+print(summary)
+```
+
+Set `save_outputs=True` and `overwrite=True` when a saved run should write or
+replace `/labels/<name>/frame_<n>` or `/masks/<name>/frame_<n>` datasets.
+
+## Run The Cellpose Worker
+
+Inside a Cellpose environment that also has `celltraj2` installed:
+
+```bash
+python -m celltraj2.runners.cellpose_segment segmentation_job.json
+```
+
+The worker reads the job JSON, emits JSONL progress events on stdout, and writes
+segmentation outputs and `/runs/segmentation` provenance when `save_outputs` is
+enabled.
