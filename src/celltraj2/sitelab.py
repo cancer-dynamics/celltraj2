@@ -79,6 +79,15 @@ def frame_count_from_roi(roi: Mapping[str, Any], roi_set: Mapping[str, Any]) -> 
     return max(1, count)
 
 
+def roi_cache_axes_from_source(roi_set: Mapping[str, Any], axis_order: tuple[str, ...]) -> tuple[str, ...]:
+    """Return cache axes derived from SITE source axes, excluding position."""
+
+    source_axes = {str(axis).upper() for axis in roi_set.get("source_axes", ()) or ()}
+    if not source_axes:
+        return ()
+    return tuple(axis for axis in axis_order if axis in source_axes and axis != "P")
+
+
 def image_source_from_site_roi(
     *,
     roi_set: Mapping[str, Any],
@@ -104,7 +113,7 @@ def image_source_from_site_roi(
         return ImageSourceSpec(
             source_type="roi_ome_zarr",
             path=artifact_path,
-            axes=("T", "C", "Z", "Y", "X"),
+            axes=roi_cache_axes_from_source(roi_set, ("T", "C", "Z", "Y", "X")),
             roi=roi,
             metadata={"site_storage_mode": storage_mode},
         )
@@ -112,7 +121,7 @@ def image_source_from_site_roi(
         return ImageSourceSpec(
             source_type="roi_tiff",
             path=artifact_path,
-            axes=("T", "Z", "Y", "X", "C"),
+            axes=roi_cache_axes_from_source(roi_set, ("T", "Z", "Y", "X", "C")),
             roi=roi,
             metadata={"site_storage_mode": storage_mode},
         )
@@ -133,10 +142,13 @@ def create_metadata_from_site_roi(
     manifest: Mapping[str, Any] | None = None,
     roi_set: Mapping[str, Any] | None = None,
     project_root: str | Path | None = None,
+    source_path: str | Path | None = None,
 ) -> tuple[TrajectoryMetadata, dict[str, Any], dict[str, Any], Path, str]:
     """Return trajectory metadata plus source SITE payloads for one ROI."""
 
     roi_set_data = dict(roi_set or load_json(roi_json_path))
+    if source_path not in (None, ""):
+        roi_set_data["source_path"] = str(source_path)
     roi_record = find_roi_record(roi_set_data, roi_id)
     root = Path(project_root) if project_root is not None else infer_project_root_from_roi_json(roi_json_path)
     dataset_id = dataset_id_from_roi_json(roi_json_path, roi_set_data)
@@ -177,6 +189,7 @@ def create_analysis_h5_from_site_roi(
     manifest_path: str | Path | None = None,
     output_path: str | Path | None = None,
     project_root: str | Path | None = None,
+    source_path: str | Path | None = None,
     overwrite: bool = False,
 ) -> Path:
     """Create a frame-based celltraj2 H5 for one SITE ROI."""
@@ -187,13 +200,17 @@ def create_analysis_h5_from_site_roi(
         roi_id=roi_id,
         manifest=manifest,
         project_root=project_root,
+        source_path=source_path,
     )
     out = Path(output_path) if output_path is not None else default_cell_file_path(root, dataset_id, roi_id)
+    linked_nd2_path = resolve_site_path(roi_set.get("source_path"), project_root=root)
     source_links = {
         "roi_json_path": str(Path(roi_json_path)),
         "manifest_path": str(Path(manifest_path)) if manifest_path is not None else None,
         "project_root": str(root),
+        "source_path": roi_set.get("source_path"),
         "roi_set_source_path": roi_set.get("source_path"),
+        "linked_nd2_path": str(linked_nd2_path) if linked_nd2_path is not None else None,
     }
     with TrajectoryStore.create(
         out,

@@ -94,7 +94,18 @@ class TrajectoryStore:
         return self._h5
 
     def _init_groups(self) -> None:
-        for name in ("metadata", "sources", "images/raw", "labels", "masks", "cells", "features", "runs/segmentation"):
+        for name in (
+            "metadata",
+            "sources",
+            "images/raw",
+            "labels",
+            "masks",
+            "object_sets",
+            "cells",
+            "features",
+            "runs/segmentation",
+            "runs/object_indexing",
+        ):
             self._h5.require_group(name)
         self.write_json("/images/raw/metadata.json", {"storage": "frame_based", "frame_index_base": 1}, overwrite=True)
 
@@ -222,6 +233,135 @@ class TrajectoryStore:
         name = validate_name(mask_set, kind="mask set")
         return self._read_frame_dataset(f"/masks/{name}", frame)
 
+    def require_object_set(
+        self,
+        object_set: str,
+        *,
+        source_label_set: str | None = None,
+        metadata: Mapping[str, Any] | None = None,
+        overwrite_metadata: bool = False,
+    ) -> str:
+        """Ensure a named object-set analysis group exists."""
+
+        name = validate_name(object_set, kind="object set")
+        group_path = f"/object_sets/{name}"
+        group = self._h5.require_group(group_path.strip("/"))
+        group.require_group("lookup")
+        group.require_group("features")
+        group.require_group("tracks")
+        json_path = f"{group_path}/object_set.json"
+        if overwrite_metadata or json_path.strip("/") not in self._h5:
+            payload = {
+                "schema": "celltraj2.object_set.v1",
+                "object_set": name,
+                "source_label_set": source_label_set or name,
+                "observation_id_base": 1,
+                "row_alignment": "row_index_zero_based_maps_to_observation_id_minus_1",
+                "metadata": dict(metadata or {}),
+            }
+            self.write_json(json_path, payload, overwrite=True)
+        return group_path
+
+    def write_observations(
+        self,
+        object_set: str,
+        observations: Any,
+        schema: Mapping[str, Any],
+        *,
+        source_label_set: str | None = None,
+        overwrite: bool = False,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> str:
+        """Write the canonical observation table for one object set."""
+
+        name = validate_name(object_set, kind="object set")
+        group_path = self.require_object_set(
+            name,
+            source_label_set=source_label_set,
+            metadata=metadata,
+            overwrite_metadata=overwrite,
+        )
+        dataset_path = f"{group_path}/observations".strip("/")
+        if dataset_path in self._h5:
+            if not overwrite:
+                raise FileExistsError(f"/{dataset_path}")
+            del self._h5[dataset_path]
+        dataset = self._h5.create_dataset(dataset_path, data=observations, compression="gzip")
+        dataset.attrs["object_set"] = name
+        dataset.attrs["observation_id_base"] = 1
+        dataset.attrs["row_alignment"] = "row_index_zero_based_maps_to_observation_id_minus_1"
+        self.write_json(f"{group_path}/observations_schema.json", dict(schema), overwrite=True)
+        return f"/{dataset_path}"
+
+    def read_observations(self, object_set: str) -> Any:
+        name = validate_name(object_set, kind="object set")
+        return self._h5[f"object_sets/{name}/observations"][()]
+
+    def has_observations(self, object_set: str) -> bool:
+        name = validate_name(object_set, kind="object set")
+        return f"object_sets/{name}/observations" in self._h5
+
+    def observation_count(self, object_set: str) -> int:
+        if not self.has_observations(object_set):
+            return 0
+        name = validate_name(object_set, kind="object set")
+        return int(self._h5[f"object_sets/{name}/observations"].shape[0])
+
+    def read_observations_schema(self, object_set: str) -> Any:
+        name = validate_name(object_set, kind="object set")
+        return self.read_json(f"/object_sets/{name}/observations_schema.json")
+
+    def write_observation_lookup_frame(
+        self,
+        object_set: str,
+        frame: int,
+        lookup: Any,
+        *,
+        overwrite: bool = False,
+    ) -> str:
+        """Write a frame-local label-id to observation-id lookup array."""
+
+        name = validate_name(object_set, kind="object set")
+        group_path = f"/object_sets/{name}/lookup"
+        self.require_object_set(name)
+        return self._write_frame_dataset(
+            group_path,
+            frame,
+            lookup,
+            overwrite=overwrite,
+            attrs={"object_set": name, "lookup": "label_id_to_observation_id", "observation_id_base": 1},
+            compression="gzip",
+        )
+
+    def clear_observation_lookup_frames(self, object_set: str) -> None:
+        """Remove all per-frame observation lookup arrays for one object set."""
+
+        name = validate_name(object_set, kind="object set")
+        path = f"object_sets/{name}/lookup"
+        if path not in self._h5:
+            return
+        group = self._h5[path]
+        for key in list(group.keys()):
+            if str(key).startswith("frame_"):
+                del group[key]
+
+    def read_observation_lookup_frame(self, object_set: str, frame: int) -> Any:
+        name = validate_name(object_set, kind="object set")
+        return self._read_frame_dataset(f"/object_sets/{name}/lookup", frame)
+
+    def list_observation_lookup_frames(self, object_set: str) -> list[int]:
+        name = validate_name(object_set, kind="object set")
+        path = f"object_sets/{name}/lookup"
+        if path not in self._h5:
+            return []
+        keys = [key for key in self._h5[path].keys() if str(key).startswith("frame_")]
+        return [int(frame_sort_key(key)) for key in sorted(keys, key=frame_sort_key)]
+
+    def list_object_sets(self) -> list[str]:
+        if "object_sets" not in self._h5:
+            return []
+        return sorted(str(key) for key in self._h5["object_sets"].keys())
+
     def write_segmentation_run(
         self,
         run_id: str,
@@ -263,6 +403,51 @@ class TrajectoryStore:
 
     def list_segmentation_runs(self) -> list[str]:
         path = "runs/segmentation"
+        if path not in self._h5:
+            return []
+        return sorted(str(key) for key in self._h5[path].keys())
+
+    def write_object_indexing_run(
+        self,
+        run_id: str,
+        data: Mapping[str, Any],
+        *,
+        overwrite: bool = True,
+    ) -> str:
+        """Write top-level metadata for one object-indexing run."""
+
+        name = validate_name(run_id, kind="object-indexing run")
+        group = self._h5.require_group(f"runs/object_indexing/{name}")
+        group.require_group("frames")
+        self.write_json(f"/runs/object_indexing/{name}/run.json", dict(data), overwrite=overwrite)
+        return f"/runs/object_indexing/{name}/run.json"
+
+    def read_object_indexing_run(self, run_id: str) -> Any:
+        name = validate_name(run_id, kind="object-indexing run")
+        return self.read_json(f"/runs/object_indexing/{name}/run.json")
+
+    def write_object_indexing_frame_result(
+        self,
+        run_id: str,
+        frame: int,
+        data: Mapping[str, Any],
+        *,
+        overwrite: bool = True,
+    ) -> str:
+        """Write metadata for one frame indexed by an object-indexing run."""
+
+        name = validate_name(run_id, kind="object-indexing run")
+        self._h5.require_group(f"runs/object_indexing/{name}/frames")
+        path = f"/runs/object_indexing/{name}/frames/{frame_key(frame)}.json"
+        self.write_json(path, dict(data), overwrite=overwrite)
+        return path
+
+    def read_object_indexing_frame_result(self, run_id: str, frame: int) -> Any:
+        name = validate_name(run_id, kind="object-indexing run")
+        return self.read_json(f"/runs/object_indexing/{name}/frames/{frame_key(frame)}.json")
+
+    def list_object_indexing_runs(self) -> list[str]:
+        path = "runs/object_indexing"
         if path not in self._h5:
             return []
         return sorted(str(key) for key in self._h5[path].keys())

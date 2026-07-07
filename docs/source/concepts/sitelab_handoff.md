@@ -27,10 +27,21 @@ SITE should pass:
 
 - `/metadata/site_manifest.json`,
 - `/metadata/roi.json`,
+- `/metadata/source_links.json`,
 - `/sources/image_source.json`,
 - `/labels/<label_set>/frame_<n>` datasets,
 - `/masks/<mask_set>/frame_<n>` datasets,
+- `/object_sets/<object_set>/observations` after object indexing,
+- `/object_sets/<object_set>/lookup/frame_<n>` lookup arrays for ROI-viewer
+  selection,
 - segmentation run provenance under `/runs/segmentation/<run_id>/`.
+
+`/sources/image_source.json` is the executable pixel-access contract. If the
+source type is `linked_nd2`, its `path` should be the current ND2 path to open.
+If the source type is `roi_ome_zarr` or `roi_tiff`, its `path` should remain the
+ROI cache path; the original parent ND2 link lives in `/metadata/source_links.json`
+and the nested ROI `source_path` metadata. SITE's Data tab can relink existing
+H5 files when a local ND2 path changes.
 
 ## Batch Segmentation Shape
 
@@ -76,15 +87,24 @@ For each ROI/H5, the worker:
    `cell_files/<dataset>/<roi_id>.ct2.h5`.
 2. Open the H5 with `celltraj2.Trajectory`.
 3. Ask `celltraj2.Trajectory.get_image_data(frame=...)` for each frame.
-4. Compose Cellpose-ready model input from stored channel specs.
-5. Run the selected segmentation backend in the worker process.
-6. Write labels or boolean masks under the requested target:
+4. Ask `celltraj2.Trajectory.frame_axes(frame_data.ndim)` for the returned
+   frame axes.
+5. Compose Cellpose-ready model input from stored channel specs and the actual
+   frame axes.
+6. Run the selected segmentation backend in the worker process.
+7. Write labels or boolean masks under the requested target:
    `/labels/<output_name>/frame_<n>` or `/masks/<output_name>/frame_<n>`.
-7. Record run/frame provenance under:
+8. Record run/frame provenance under:
    `/runs/segmentation/<run_id>/`.
 
 SITE should not write H5 internals directly. It should use `celltraj2` APIs so
 the storage contract stays centralized.
+
+The `frame_axes()` call is required because source axes and returned frame axes
+are not always the same. SITE 3D ROI OME-Zarr caches are `T,C,Z,Y,X`; true 2D
+ROI OME-Zarr caches are `T,C,Y,X` and return frames as `Y,X,C`. Model-input
+preview and segmentation workers should therefore never infer the channel axis
+only from the stored H5 image-source spec.
 
 Minimal job shape:
 
@@ -131,6 +151,74 @@ def segmenter(model_input, file_job, frame):
 
 run_batch_segmentation(job_dict, segmenter)
 ```
+
+## Object Indexing Shape
+
+After a label-producing segmentation run, SITE can launch object indexing with
+the same local worker pattern:
+
+```bash
+python -m celltraj2.runners.index_objects object_index_job.json
+```
+
+Minimal job shape:
+
+```json
+{
+  "job_id": "obj_index_20260703_example",
+  "project_root": "project",
+  "save_outputs": true,
+  "overwrite": false,
+  "files": [
+    {
+      "h5_path": "cell_files/sample/sample_XY001_ROI001.ct2.h5",
+      "object_set": "cyto_epithelial",
+      "source_label_set": "cyto_epithelial",
+      "frames": {"mode": "all"}
+    }
+  ]
+}
+```
+
+The worker reads `/labels/<source_label_set>/frame_<n>`, assigns stable
+one-based `observation_id` values sorted by frame and label value, and writes:
+
+```text
+/object_sets/<object_set>/observations
+/object_sets/<object_set>/observations_schema.json
+/object_sets/<object_set>/lookup/frame_<n>
+/runs/object_indexing/<run_id>/
+```
+
+Once observations exist, rerunning without `"overwrite": true` refuses to
+replace the established index. This preserves row alignment for future feature
+tables, track assignments, exports, and ROI-viewer selections. With
+`"save_outputs": false`, the worker opens H5 files read-only and reports counts
+without writing object sets or run metadata.
+
+## SITE ROI Viewer Consumption
+
+SITE ROI viewers discover the per-ROI H5 next to the extracted ROI cache by
+project convention:
+
+```text
+roi_files/<dataset>/<roi_id>.ome.zarr
+cell_files/<dataset>/<roi_id>.ct2.h5
+```
+
+The `SITE object sets` panel reads `/labels/<label_set>/frame_<n>` and
+`/object_sets/<object_set>/object_set.json` to offer available label/object
+sets. It displays the current frame as a single-color overlay for the active
+object set, while retaining the original integer label array for selection.
+When the user clicks an object, SITE resolves:
+
+```text
+label_id -> lookup[label_id] -> observation_id -> observations[observation_id - 1]
+```
+
+and displays the observation row. This is the current integration point for
+single-object inspection and the planned growth point for feature coloring,
+lineage coloring, and trajectory highlighting.
 
 ## One-Based Frames
 

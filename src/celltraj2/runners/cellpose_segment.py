@@ -148,12 +148,17 @@ class CellposeSegmenter:
             "flow_threshold": float(params.get("flow_threshold", 0.4)),
             "cellprob_threshold": float(params.get("cellprob_threshold", 0.0)),
             "do_3D": do_3d,
-            "anisotropy": _optional_float(params.get("anisotropy")),
-            "flow3D_smooth": params.get("flow3D_smooth", 0.0),
-            "stitch_threshold": float(params.get("stitch_threshold", 0.0)),
             "min_size": int(params.get("min_size", 15)),
             "batch_size": int(params.get("batch_size", 8)),
         }
+        if do_3d:
+            eval_kwargs.update(
+                {
+                    "anisotropy": _optional_float(params.get("anisotropy")),
+                    "flow3D_smooth": params.get("flow3D_smooth", 0.0),
+                    "stitch_threshold": float(params.get("stitch_threshold", 0.0)),
+                }
+            )
         if version_major == 3:
             eval_kwargs["channels"] = [
                 int(params.get("cp3_segmentation_channel", 0)),
@@ -169,6 +174,13 @@ class CellposeSegmenter:
         output = model.eval(x, **clean_kwargs)
         masks = output[0] if isinstance(output, tuple) else output
         masks = np.asarray(masks).astype(np.int32, copy=False)
+        expected_mask_shape = _expected_mask_shape(x, do_3d)
+        if tuple(masks.shape) != expected_mask_shape:
+            raise ValueError(
+                "Cellpose returned masks with shape "
+                f"{tuple(masks.shape)} for input shape {tuple(x.shape)}; "
+                f"expected spatial label shape {expected_mask_shape}."
+            )
         metadata = {
             "cellpose_version": version,
             "version_major": version_major,
@@ -183,6 +195,21 @@ class CellposeSegmenter:
             "mask_max_label": int(np.max(masks)) if masks.size else 0,
         }
         return SegmentationResult(labels=masks, metadata=metadata)
+
+
+def _expected_mask_shape(image: Any, do_3d: bool) -> tuple[int, ...]:
+    shape = tuple(int(value) for value in getattr(image, "shape", ()))
+    if do_3d:
+        if len(shape) == 4:
+            return (shape[0], shape[2], shape[3])
+        if len(shape) == 3:
+            return shape
+    else:
+        if len(shape) == 3:
+            return (shape[1], shape[2])
+        if len(shape) == 2:
+            return shape
+    raise ValueError(f"Cannot infer expected mask shape for {'3D' if do_3d else '2D'} input shape {shape}")
 
 
 def main(argv: list[str] | None = None) -> int:

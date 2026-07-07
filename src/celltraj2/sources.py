@@ -86,6 +86,7 @@ class ImageSource:
 
     def __init__(self, spec: ImageSourceSpec) -> None:
         self.spec = spec
+        self._last_frame_axes: tuple[str, ...] | None = None
 
     def read_frame(
         self,
@@ -97,6 +98,21 @@ class ImageSource:
         x: slice | int | Sequence[int] | None = None,
     ) -> Any:
         raise NotImplementedError
+
+    def channel_index_map(self) -> dict[int, int] | None:
+        """Return raw source-channel index to local C-axis index mapping."""
+
+        return None
+
+    def frame_axes(self, ndim: int | None = None) -> tuple[str, ...]:
+        """Return axes for the most recently read frame."""
+
+        if self._last_frame_axes is not None and (ndim is None or len(self._last_frame_axes) == int(ndim)):
+            return self._last_frame_axes
+        axes = tuple(axis for axis in self.spec.axes if axis not in {"T", "P"})
+        if ndim is not None:
+            axes = _axes_for_array(int(ndim), axes)
+        return axes
 
 
 class InMemoryImageSource(ImageSource):
@@ -126,7 +142,8 @@ class InMemoryImageSource(ImageSource):
             y=y,
             x=x,
         )
-        ordered, _axes = _spatial_channel_order(selected, selected_axes)
+        ordered, axes = _spatial_channel_order(selected, selected_axes)
+        self._last_frame_axes = tuple(axes)
         return ordered
 
 
@@ -157,7 +174,8 @@ class EmbeddedH5ImageSource(ImageSource):
             y=y,
             x=x,
         )
-        ordered, _axes = _spatial_channel_order(selected, selected_axes)
+        ordered, axes = _spatial_channel_order(selected, selected_axes)
+        self._last_frame_axes = tuple(axes)
         return ordered
 
 
@@ -169,6 +187,7 @@ class OmeZarrRoiImageSource(ImageSource):
         self._root = None
         self._array = None
         self._axes: tuple[str, ...] | None = None
+        self._channel_index_map: dict[int, int] | None = None
 
     def _open(self) -> tuple[Any, tuple[str, ...]]:
         if self._array is not None and self._axes is not None:
@@ -182,11 +201,39 @@ class OmeZarrRoiImageSource(ImageSource):
             ) from exc
         if self.spec.path is None:
             raise ValueError("OME-Zarr image source requires a path")
-        self._root = zarr.open_group(str(self.spec.path), mode="r")
-        dataset_path = self.spec.dataset_path or _ome_zarr_dataset_path(self._root)
-        self._array = self._root[dataset_path]
-        self._axes = tuple(self.spec.axes or _ome_zarr_axes(self._root, len(self._array.shape)))
+        source_path = Path(self.spec.path)
+        if not source_path.exists():
+            raise FileNotFoundError(f"OME-Zarr image source path does not exist: {source_path}")
+        try:
+            self._root = _open_zarr_group_for_read(zarr, source_path)
+            dataset_path = self.spec.dataset_path or _ome_zarr_dataset_path(self._root)
+            self._array = self._root[dataset_path]
+            attrs_source = self._root
+        except Exception as group_exc:
+            try:
+                self._array = _open_zarr_array_for_read(zarr, source_path)
+                self._root = self._array
+                attrs_source = self._array
+            except Exception as array_exc:
+                raise RuntimeError(_ome_zarr_open_failure_message(source_path, group_exc, array_exc)) from group_exc
+        ndim = len(getattr(self._array, "shape", ()))
+        attrs_axes = _ome_zarr_axes_from_attrs(attrs_source, ndim)
+        self._axes = _axes_for_array(
+            ndim,
+            attrs_axes,
+            self.spec.axes,
+            _default_axes_for_ndim(ndim),
+        )
+        self._channel_index_map = _ome_zarr_channel_index_map(
+            attrs_source,
+            axes=self._axes,
+            shape=getattr(self._array, "shape", ()),
+        )
         return self._array, self._axes
+
+    def channel_index_map(self) -> dict[int, int] | None:
+        self._open()
+        return None if self._channel_index_map is None else dict(self._channel_index_map)
 
     def read_frame(
         self,
@@ -207,7 +254,8 @@ class OmeZarrRoiImageSource(ImageSource):
             y=y,
             x=x,
         )
-        ordered, _axes = _spatial_channel_order(selected, selected_axes)
+        ordered, axes = _spatial_channel_order(selected, selected_axes)
+        self._last_frame_axes = tuple(axes)
         return ordered
 
 
@@ -235,7 +283,12 @@ class TiffRoiImageSource(ImageSource):
             series = tif.series[0]
             self._data = series.asarray()
             axes = tuple(str(axis) for axis in getattr(series, "axes", "") or "")
-        self._axes = tuple(self.spec.axes or axes or _default_axes_for_ndim(self._data.ndim))
+        self._axes = _axes_for_array(
+            self._data.ndim,
+            axes,
+            self.spec.axes,
+            _default_axes_for_ndim(self._data.ndim),
+        )
         return self._data, self._axes
 
     def read_frame(
@@ -257,7 +310,8 @@ class TiffRoiImageSource(ImageSource):
             y=y,
             x=x,
         )
-        ordered, _axes = _spatial_channel_order(selected, selected_axes)
+        ordered, axes = _spatial_channel_order(selected, selected_axes)
+        self._last_frame_axes = tuple(axes)
         return ordered
 
 
@@ -321,6 +375,7 @@ class LinkedNd2RoiImageSource(ImageSource):
         data = getattr(selected, "data", selected)
         if hasattr(data, "compute"):
             data = data.compute()
+        self._last_frame_axes = tuple(axes)
         return np.asarray(data)
 
 
@@ -344,10 +399,43 @@ def _default_axes_for_ndim(ndim: int) -> tuple[str, ...]:
     defaults = {
         2: ("Y", "X"),
         3: ("Z", "Y", "X"),
-        4: ("T", "Z", "Y", "X"),
+        4: ("T", "C", "Y", "X"),
         5: ("T", "Z", "Y", "X", "C"),
     }
     return defaults.get(int(ndim), tuple(f"D{index}" for index in range(int(ndim))))
+
+
+def _normalize_axes(axes: Sequence[str] | None) -> tuple[str, ...]:
+    return tuple(str(axis).upper() for axis in (axes or ()) if str(axis))
+
+
+def _axes_for_array(ndim: int, *candidates: Sequence[str] | None) -> tuple[str, ...]:
+    """Return axes that match an array, repairing common stale 2D SITE specs."""
+
+    count = int(ndim)
+    normalized = [_normalize_axes(candidate) for candidate in candidates if candidate]
+    for axes in normalized:
+        if len(axes) == count:
+            return axes
+    for axes in normalized:
+        repaired = _drop_optional_axes_to_ndim(axes, count)
+        if repaired is not None:
+            return repaired
+    return _default_axes_for_ndim(count)
+
+
+def _drop_optional_axes_to_ndim(axes: Sequence[str], ndim: int) -> tuple[str, ...] | None:
+    current = list(_normalize_axes(axes))
+    if len(current) <= int(ndim):
+        return None
+    for optional_axis in ("Z", "T", "P"):
+        if len(current) == int(ndim):
+            break
+        if optional_axis in current:
+            current.remove(optional_axis)
+    if len(current) == int(ndim):
+        return tuple(current)
+    return None
 
 
 def _ome_zarr_dataset_path(root: Any) -> str:
@@ -364,7 +452,76 @@ def _ome_zarr_dataset_path(root: Any) -> str:
     return "0"
 
 
-def _ome_zarr_axes(root: Any, ndim: int) -> tuple[str, ...]:
+def _zarr_open_kwargs() -> tuple[dict[str, int], ...]:
+    return ({}, {"zarr_format": 2}, {"zarr_version": 2}, {"zarr_format": 3}, {"zarr_version": 3})
+
+
+def _open_zarr_group_for_read(zarr: Any, path: Path) -> Any:
+    errors = []
+    for kwargs in _zarr_open_kwargs():
+        try:
+            return zarr.open_group(str(path), mode="r", **kwargs)
+        except Exception as exc:
+            errors.append((kwargs, exc))
+    raise RuntimeError(_zarr_attempts_message("group", path, errors))
+
+
+def _open_zarr_array_for_read(zarr: Any, path: Path) -> Any:
+    open_array = getattr(zarr, "open_array", None)
+    if not callable(open_array):
+        raise RuntimeError("Installed zarr package does not provide open_array().")
+    errors = []
+    for kwargs in _zarr_open_kwargs():
+        try:
+            return open_array(str(path), mode="r", **kwargs)
+        except Exception as exc:
+            errors.append((kwargs, exc))
+    raise RuntimeError(_zarr_attempts_message("array", path, errors))
+
+
+def _zarr_attempts_message(kind: str, path: Path, errors: Sequence[tuple[dict[str, int], Exception]]) -> str:
+    lines = [f"Could not open OME-Zarr {kind} at {path}."]
+    for kwargs, exc in errors:
+        label = ", ".join(f"{key}={value}" for key, value in kwargs.items()) or "default"
+        lines.append(f"- {label}: {type(exc).__name__}: {exc}")
+    return "\n".join(lines)
+
+
+def _ome_zarr_open_failure_message(path: Path, group_exc: Exception, array_exc: Exception) -> str:
+    message = [
+        f"Could not open OME-Zarr ROI cache at {path} as either a group or root array.",
+        "",
+        "Group open attempts:",
+        str(group_exc),
+        "",
+        "Root-array open attempts:",
+        str(array_exc),
+    ]
+    hint = _ome_zarr_layout_hint(path)
+    if hint:
+        message.extend(["", hint])
+    return "\n".join(message)
+
+
+def _ome_zarr_layout_hint(path: Path) -> str | None:
+    if not path.exists():
+        return f"Hint: the path does not exist from this Python environment: {path}"
+    if (path / "zarr.json").exists() and not (path / ".zgroup").exists() and not (path / ".zarray").exists():
+        return (
+            "Hint: this looks like a Zarr v3 store. A worker environment with zarr 2.x "
+            "cannot read it. Install zarr 3.x in the worker environment or re-extract "
+            "the ROI cache with the updated SITE writer, which requests a v2-compatible "
+            "OME-Zarr layout."
+        )
+    if path.is_dir() and not (path / ".zgroup").exists() and not (path / ".zarray").exists():
+        return (
+            "Hint: the path exists but does not contain .zgroup or .zarray metadata. "
+            "Confirm the ROI artifact path points at the .ome.zarr directory itself."
+        )
+    return None
+
+
+def _ome_zarr_axes_from_attrs(root: Any, ndim: int) -> tuple[str, ...] | None:
     attrs = dict(getattr(root, "attrs", {}) or {})
     site = attrs.get("site") if isinstance(attrs.get("site"), dict) else {}
     site_axes = site.get("axes") if isinstance(site, dict) else None
@@ -379,7 +536,31 @@ def _ome_zarr_axes(root: Any, ndim: int) -> tuple[str, ...]:
             names = [axis.get("name") if isinstance(axis, dict) else axis for axis in axes]
             if all(name is not None for name in names):
                 return tuple(str(name) for name in names)
-    return _default_axes_for_ndim(ndim)
+    return None
+
+
+def _ome_zarr_axes(root: Any, ndim: int) -> tuple[str, ...]:
+    return _ome_zarr_axes_from_attrs(root, ndim) or _default_axes_for_ndim(ndim)
+
+
+def _ome_zarr_channel_index_map(root: Any, *, axes: Sequence[str], shape: Sequence[int]) -> dict[int, int] | None:
+    current_axes = tuple(str(axis).upper() for axis in axes)
+    if "C" not in current_axes:
+        return None
+    attrs = dict(getattr(root, "attrs", {}) or {})
+    site = attrs.get("site") if isinstance(attrs.get("site"), dict) else {}
+    values = site.get("channel_indices") if isinstance(site, dict) else None
+    if not isinstance(values, Sequence) or isinstance(values, (str, bytes)):
+        return None
+    c_axis = current_axes.index("C")
+    c_size = int(shape[c_axis]) if len(shape) > c_axis else len(values)
+    raw_indices = [int(value) for value in values]
+    if len(raw_indices) != c_size:
+        raise ValueError(
+            "OME-Zarr site.channel_indices length "
+            f"{len(raw_indices)} does not match C axis size {c_size}"
+        )
+    return {raw_index: local_index for local_index, raw_index in enumerate(raw_indices)}
 
 
 def _combine_slice(base: slice, local: slice | int | Sequence[int] | None) -> Any:

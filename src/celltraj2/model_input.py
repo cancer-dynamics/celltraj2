@@ -62,6 +62,7 @@ def compose_model_input(
     do_3d: bool = True,
     z_index: int | None = None,
     channel_luts: Mapping[int, Any] | None = None,
+    channel_index_map: Mapping[int, int] | None = None,
 ) -> Any:
     """Compose Cellpose-ready input from a trajectory frame.
 
@@ -84,6 +85,7 @@ def compose_model_input(
             do_3d=bool(do_3d),
             z_index=z_index,
             channel_luts=channel_luts,
+            channel_index_map=channel_index_map,
             np=np,
         )
         for spec in specs
@@ -161,6 +163,7 @@ def _compose_one_channel(
     do_3d: bool,
     z_index: int | None,
     channel_luts: Mapping[int, Any] | None,
+    channel_index_map: Mapping[int, int] | None,
     np: Any,
 ) -> Any:
     combination = str(spec.get("combination", spec.get("channel_projection", "mean")))
@@ -179,7 +182,8 @@ def _compose_one_channel(
         selected_channels = [0]
     outputs = []
     for raw_index in selected_channels:
-        channel = _take_axis(arr, axes, "C", int(raw_index), np=np)
+        storage_index = _storage_channel_index(int(raw_index), channel_index_map)
+        channel = _take_axis(arr, axes, "C", storage_index, np=np)
         channel_axes = tuple(axis for axis in axes if axis != "C")
         image = _spatial_data(channel, channel_axes, do_3d=do_3d, z_index=z_index, np=np)
         if normalization == "raw":
@@ -202,6 +206,16 @@ def _compose_one_channel(
     if combination == "max":
         return np.max(stack, axis=0).astype(outputs[0].dtype, copy=False)
     raise ValueError(f"Unsupported channel combination: {combination}")
+
+
+def _storage_channel_index(raw_index: int, channel_index_map: Mapping[int, int] | None) -> int:
+    if channel_index_map is None:
+        return int(raw_index)
+    mapping = {int(key): int(value) for key, value in dict(channel_index_map).items()}
+    if int(raw_index) not in mapping:
+        available = ", ".join(str(key) for key in sorted(mapping))
+        raise IndexError(f"Raw channel index {raw_index} is not present in this image source; available raw channels: {available}")
+    return int(mapping[int(raw_index)])
 
 
 def _spatial_data(arr: Any, axes: Sequence[str], *, do_3d: bool, z_index: int | None, np: Any) -> Any:

@@ -65,3 +65,21 @@ def raw_frame_path(frame: int) -> str:
     """Return the H5 path for one embedded raw image frame."""
 
     return f"/images/raw/{frame_key(frame)}"
+
+
+def object_set_path(object_set: str) -> str:
+    """Return the H5 path for one object set."""
+
+    return f"/object_sets/{validate_name(object_set, kind='object set')}"
+
+
+def observations_path(object_set: str) -> str:
+    """Return the H5 path for one object set's canonical observations."""
+
+    return f"{object_set_path(object_set)}/observations"
+
+
+def observation_lookup_frame_path(object_set: str, frame: int) -> str:
+    """Return the H5 path for one label-id to observation-id lookup frame."""
+
+    return f"{object_set_path(object_set)}/lookup/{frame_key(frame)}"

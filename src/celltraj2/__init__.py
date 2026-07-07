@@ -8,6 +8,13 @@ from celltraj2.batch import (
     SegmentationResult,
     run_batch_segmentation,
 )
+from celltraj2.object_indexing import (
+    BatchObjectIndexSummary,
+    ObjectIndexBatchJob,
+    ObjectIndexFileJob,
+    run_batch_object_indexing,
+)
+from celltraj2.objects import ObjectIndexResult, index_object_set
 from celltraj2.schema import (
     ChannelSpec,
     ImageSourceSpec,
@@ -21,9 +28,13 @@ from celltraj2.trajectory import Trajectory
 
 __all__ = [
     "BatchSegmentationSummary",
+    "BatchObjectIndexSummary",
     "ChannelSpec",
     "ImageSourceSpec",
     "JsonlReporter",
+    "ObjectIndexBatchJob",
+    "ObjectIndexFileJob",
+    "ObjectIndexResult",
     "RoiBounds",
     "RoiSpec",
     "SegmentationBatchJob",
@@ -33,6 +44,8 @@ __all__ = [
     "Trajectory",
     "TrajectoryMetadata",
     "TrajectoryStore",
+    "index_object_set",
+    "run_batch_object_indexing",
     "run_batch_segmentation",
 ]
 

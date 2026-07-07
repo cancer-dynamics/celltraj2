@@ -132,6 +132,25 @@ return `Z,C,Y,X`. For 2D jobs, one output channel returns `Y,X` and multiple
 output channels return `C,Y,X`. A 2D job reading from a Z stack must provide
 `z_index` unless the stack has exactly one Z plane.
 
+The batch worker must derive model-input axes from the actual frame it just
+read, not blindly from `/sources/image_source.json`. In practice this means:
+
+1. `frame_data = trajectory.get_image_data(frame=frame)`
+2. `frame_axes = trajectory.frame_axes(frame_data.ndim)`
+3. `compose_model_input(frame_data, axes=frame_axes, ...)`
+
+This matters for SITE ROI caches because 3D OME-Zarr ROIs are `T,C,Z,Y,X`,
+while 2D OME-Zarr ROIs are `T,C,Y,X` and become `Y,X,C` after a frame is read.
+Using stale 3D source axes for a 2D frame shifts the channel axis and causes the
+wrong channel to be segmented.
+
+If a job requests 3D mode but the returned frame has no `Z` axis, `celltraj2`
+runs that frame as effective 2D and records both `requested_do_3D` and
+`effective_do_3D` in the frame event. This protects older configs and backend
+defaults from sending true 2D images to Cellpose as singleton-Z volumes.
+Cellpose-specific 3D parameters such as anisotropy, flow3D smoothing, and
+stitching are only passed when the effective mode is 3D.
+
 ## Image Source Modes
 
 The worker reads raw pixels through the image source stored in the H5:
@@ -145,7 +164,11 @@ linked_nd2       original ND2 plus stored ROI coordinates
 
 The default SITE direction is `roi_ome_zarr` because it supports repeated
 timepoint/channel/spatial access without repeatedly slicing the parent ND2.
-`linked_nd2` remains available for storage-limited projects.
+`linked_nd2` remains available for storage-limited projects. Current SITE ROI
+extraction requests a Zarr v2-compatible OME-Zarr group layout so workers with
+Zarr 2.x can read caches. If a cache was already written as Zarr v3, use a
+worker environment with Zarr 3.x or re-extract the ROI cache with the updated
+SITE writer.
 
 ## Progress Events
 

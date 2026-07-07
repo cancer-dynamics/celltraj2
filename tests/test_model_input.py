@@ -53,6 +53,50 @@ class ModelInputTests(unittest.TestCase):
         self.assertEqual(int(output[0, 0, 0]), 0)
         self.assertEqual(int(output[0, 1, 2]), 65535)
 
+    def test_raw_channel_indices_can_map_to_compact_cache_axis(self):
+        data = self.np.zeros((1, 2, 3, 2), dtype=self.np.float32)
+        data[..., 0] = 2.0
+        data[..., 1] = 9.0
+
+        output = compose_model_input(
+            data,
+            axes=("Z", "Y", "X", "C"),
+            do_3d=True,
+            channel_specs=[{"channel_indices": [5], "normalization": "raw", "combination": "single"}],
+            channel_index_map={2: 0, 5: 1},
+        )
+
+        self.assertEqual(output.shape, (1, 2, 3))
+        self.assertTrue(self.np.all(output == 9.0))
+
+    def test_raw_channel_indices_can_select_2d_yxc_cache_axis(self):
+        data = self.np.zeros((2, 3, 2), dtype=self.np.float32)
+        data[..., 0] = 2.0
+        data[..., 1] = 9.0
+
+        output = compose_model_input(
+            data,
+            axes=("Y", "X", "C"),
+            do_3d=False,
+            channel_specs=[{"channel_indices": [5], "normalization": "raw", "combination": "single"}],
+            channel_index_map={2: 0, 5: 1},
+        )
+
+        self.assertEqual(output.shape, (2, 3))
+        self.assertTrue(self.np.all(output == 9.0))
+
+    def test_raw_channel_mapping_rejects_missing_cache_channel(self):
+        data = self.np.zeros((1, 2, 3, 2), dtype=self.np.float32)
+
+        with self.assertRaisesRegex(IndexError, "Raw channel index 4"):
+            compose_model_input(
+                data,
+                axes=("Z", "Y", "X", "C"),
+                do_3d=True,
+                channel_specs=[{"channel_indices": [4], "normalization": "raw", "combination": "single"}],
+                channel_index_map={2: 0, 5: 1},
+            )
+
     def test_2d_model_input_requires_z_index_for_stack(self):
         data = self.np.zeros((2, 3, 4, 1), dtype=self.np.uint16)
 

@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import sys
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import asdict, dataclass, field, is_dataclass
+from dataclasses import asdict, dataclass, field, is_dataclass, replace
 from pathlib import Path
 from typing import Any, TextIO
 
@@ -314,7 +314,6 @@ def _run_file_job(
         frame_count = int(trajectory.metadata.frame_count or 1)
         frames = file_job.frame_numbers(frame_count)
         summary.frames += len(frames)
-        axes = trajectory.metadata.image_source.axes if trajectory.metadata.image_source is not None else ()
         run_record = {
             "schema": "celltraj2.segmentation_run.v1",
             "run_id": batch_job.job_id,
@@ -338,7 +337,7 @@ def _run_file_job(
             trajectory.write_segmentation_run(batch_job.job_id, run_record, overwrite=True)
         failed_before = int(summary.failed)
         for frame in frames:
-            _run_frame(batch_job, file_job, trajectory, frame, axes, segmenter, summary, emit)
+            _run_frame(batch_job, file_job, trajectory, frame, segmenter, summary, emit)
         run_record["status"] = "completed_with_errors" if summary.failed > failed_before else "completed"
         run_record["completed_at"] = utc_now_iso()
         if save_outputs:
@@ -350,7 +349,6 @@ def _run_frame(
     file_job: SegmentationFileJob,
     trajectory: Trajectory,
     frame: int,
-    axes: Sequence[str],
     segmenter: Segmenter,
     summary: BatchSegmentationSummary,
     emit: Reporter,
@@ -374,15 +372,19 @@ def _run_frame(
 
     try:
         frame_data = trajectory.get_image_data(frame=frame)
+        frame_axes = normalized_frame_axes(trajectory.frame_axes(getattr(frame_data, "ndim", 0)), getattr(frame_data, "ndim", 0))
+        effective_do_3d = _effective_do_3d_for_frame(file_job, frame_axes)
+        effective_file_job = _file_job_with_effective_do_3d(file_job, effective_do_3d)
         model_input = compose_model_input(
             frame_data,
-            channel_specs=file_job.channel_specs,
-            axes=normalized_frame_axes(axes, getattr(frame_data, "ndim", 0)),
-            do_3d=file_job.do_3d,
-            z_index=file_job.z_index,
+            channel_specs=effective_file_job.channel_specs,
+            axes=frame_axes,
+            do_3d=effective_file_job.do_3d,
+            z_index=effective_file_job.z_index,
+            channel_index_map=trajectory.channel_index_map(),
         )
-        channel_axis = 1 if file_job.do_3d and getattr(model_input, "ndim", 0) == 4 else 0 if (not file_job.do_3d and getattr(model_input, "ndim", 0) == 3) else None
-        result = _coerce_segmentation_result(segmenter(model_input, file_job, frame))
+        channel_axis = 1 if effective_file_job.do_3d and getattr(model_input, "ndim", 0) == 4 else 0 if (not effective_file_job.do_3d and getattr(model_input, "ndim", 0) == 3) else None
+        result = _coerce_segmentation_result(segmenter(model_input, effective_file_job, frame))
         output_path = None
         if save_outputs:
             output_path = _write_output_frame(trajectory, file_job, frame, result.labels, overwrite=overwrite, batch_job=batch_job)
@@ -392,9 +394,14 @@ def _run_frame(
                 preview_output_path,
                 model_input=model_input,
                 labels=result.labels,
-                file_job=file_job,
+                file_job=effective_file_job,
                 frame=frame,
-                metadata=result.metadata,
+                metadata={
+                    **dict(result.metadata or {}),
+                    "frame_axes": list(frame_axes),
+                    "requested_do_3D": bool(file_job.do_3d),
+                    "effective_do_3D": bool(effective_file_job.do_3d),
+                },
             )
         summary.completed += 1
         record = {
@@ -409,6 +416,9 @@ def _run_frame(
             "input_summary": model_input_summary(model_input, channel_axis=channel_axis),
             "label_summary": _label_summary(result.labels),
             "backend_metadata": result.metadata,
+            "frame_axes": list(frame_axes),
+            "requested_do_3D": bool(file_job.do_3d),
+            "effective_do_3D": bool(effective_file_job.do_3d),
         }
         if save_outputs:
             trajectory.write_segmentation_frame_result(batch_job.job_id, frame, record, overwrite=True)
@@ -438,6 +448,31 @@ def _coerce_segmentation_result(value: Any) -> SegmentationResult:
         labels, metadata = value
         return SegmentationResult(labels=labels, metadata=dict(metadata or {}))
     return SegmentationResult(labels=value, metadata={})
+
+
+def _effective_do_3d_for_frame(file_job: SegmentationFileJob, frame_axes: Sequence[str]) -> bool:
+    """Return the executable dimensionality for a frame.
+
+    A true 2D source has no Z axis after ``get_image_data``. Treating it as a
+    3D Cellpose volume adds a synthetic singleton Z plane and can make Cellpose
+    return channel-shaped labels, so 3D requests are downgraded for such frames.
+    """
+
+    axes = {str(axis).upper() for axis in frame_axes}
+    return bool(file_job.do_3d and "Z" in axes)
+
+
+def _file_job_with_effective_do_3d(file_job: SegmentationFileJob, do_3d: bool) -> SegmentationFileJob:
+    backend = dict(file_job.backend or {})
+    parameters = dict(backend.get("parameters") or {})
+    parameters["do_3D"] = bool(do_3d)
+    if not do_3d:
+        parameters.pop("anisotropy", None)
+        parameters.pop("flow3D_smooth", None)
+        parameters.pop("stitch_threshold", None)
+    backend["parameters"] = parameters
+    model_input = {**dict(file_job.model_input or {}), "do_3D": bool(do_3d)}
+    return replace(file_job, backend=backend, model_input=model_input)
 
 
 def _has_output_frame(trajectory: Trajectory, file_job: SegmentationFileJob, frame: int) -> bool:
@@ -500,6 +535,8 @@ def _write_preview_npz(
         labels=label_data,
         mask=label_data > 0,
         frame=np.asarray([int(frame)], dtype=np.int64),
+        do_3D=np.asarray([bool(file_job.do_3d)]),
+        frame_axes=np.asarray([str(axis) for axis in dict(metadata).get("frame_axes", [])]),
         output_name=np.asarray(file_job.output_name),
         output_kind=np.asarray(file_job.output_group),
         output_h5_path=np.asarray(file_job.output_h5_path),

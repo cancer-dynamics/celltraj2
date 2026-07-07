@@ -15,6 +15,7 @@ dependencies = []
 
 [project.scripts]
 celltraj2-cellpose-segment = "celltraj2.runners.cellpose_segment:main"
+celltraj2-index-objects = "celltraj2.runners.index_objects:main"
 
 [project.urls]
 Homepage = "https://github.com/cancer-dynamics/celltraj2"

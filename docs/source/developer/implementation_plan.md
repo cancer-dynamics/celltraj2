@@ -37,6 +37,10 @@ be used without importing SITE or Pydantic.
 - ROI TIFF fallback source.
 - Linked ND2 source.
 - In-memory source for tests and notebooks.
+- Frame-axis reporting via `Trajectory.frame_axes()` so callers interpret the
+  actual array returned by `get_image_data()`. SITE 3D ROI caches read as
+  `Z,Y,X,C` per frame, while true 2D ROI caches read as `Y,X,C`; stale 2D H5
+  source specs with an extra `Z` are repaired at read time.
 
 ## Completed Phase 5: Trajectory Facade
 
@@ -56,6 +60,8 @@ be used without importing SITE or Pydantic.
 ## Completed Phase 7: SITE-Controlled Batch Segmentation
 
 - Dependency-light model-input composition from stored channel specs.
+- Model-input composition uses actual frame axes after image read, preserving
+  correct channel selection for both 2D and 3D SITE ROI caches.
 - JSON batch job schema for H5 paths, frame selections, backend parameters,
   output names/kinds, save/test behavior, preview bundles, and overwrite
   policy.
@@ -68,16 +74,33 @@ be used without importing SITE or Pydantic.
   `/masks/<name>/frame_<n>`.
 - JSONL progress events for SITE job monitoring.
 
-## Next Phase: Interactive Analysis And Object Tables
+## Completed Phase 8: Object Observation Indexing
+
+- Canonical object-set namespace under `/object_sets/<object_set>/`.
+- Stable observation tables under `/object_sets/<object_set>/observations`.
+- One-based `observation_id` values with row alignment:
+  `row_index == observation_id - 1`.
+- Per-frame lookup arrays under
+  `/object_sets/<object_set>/lookup/frame_<n>` mapping
+  `label_id -> observation_id`.
+- `Trajectory.object_set(...).index_observations(...)` facade for notebooks and
+  backend users.
+- Batch object-indexing executor with dry-run behavior and JSONL events.
+- Optional runner:
+  `python -m celltraj2.runners.index_objects job.json`.
+- Per-run and per-frame provenance under `/runs/object_indexing/<run_id>/`.
+
+## Next Phase: Interactive Analysis, Features, And Tracks
 
 The next layer should build on saved H5 files rather than redesign storage:
 
 - load active H5 sets from SITE or directly from Python;
 - inspect metadata/source links, labels, masks, segmentation runs, and image
   access behavior;
-- index label frames into object-observation tables under `/cells/<label_set>/`;
-- compute first feature tables under `/features/<label_set>/<feature_set>/`;
-- design tracking IDs and frame-to-frame lineage tables;
+- compute first feature tables under
+  `/object_sets/<object_set>/features/<feature_set>/`;
+- design tracking IDs and frame-to-frame lineage tables under
+  `/object_sets/<object_set>/tracks/<track_set>/`;
 - launch exploratory notebooks or marimo environments with active H5s,
   treatment groups, and replicate metadata preloaded;
 - keep a clean backend API that works in notebooks without importing SITE.

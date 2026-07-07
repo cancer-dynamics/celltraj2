@@ -60,18 +60,34 @@ The H5 stores both:
     frame_1              bool or uint8 masks, usually Z,Y,X
     frame_2
 
-/cells/
-  <label_set>/
-    observations         table-like records, added after object indexing
-    schema.json
+/object_sets/
+  <object_set>/
+    object_set.json
+    observations         canonical table, one row per observed object
+    observations_schema.json
+    lookup/
+      frame_1            label_id -> observation_id lookup for UI/analysis
+      frame_2
+    features/
+      <feature_set>/
+        values
+        schema.json
+    tracks/
+      <track_set>/
+        assignments
+        links
+        schema.json
 
-/features/
-  <label_set>/
-    <feature_set>/
-      values
-      schema.json
+/cells/                  reserved compatibility group, not canonical
+/features/               reserved compatibility group, not canonical
 
 /runs/
+  object_indexing/
+    <run_id>/
+      run.json
+      frames/
+        frame_1.json
+        frame_2.json
   segmentation/
     <run_id>/
       run.json
@@ -80,7 +96,7 @@ The H5 stores both:
         frame_2.json
 ```
 
-## Named Label Sets
+## Named Object Sets
 
 Label and mask sets are semantic names, not channel numbers:
 
@@ -92,21 +108,79 @@ Label and mask sets are semantic names, not channel numbers:
 ```
 
 This replaces legacy names such as `msk`, `fmsk`, and `cell_data_m0`.
-Downstream cell observations are grouped by the label set they were indexed
-from:
+
+Pixel labels live under `/labels`. Indexed object information derived from
+those labels lives under `/object_sets`:
 
 ```text
-/cells/epithelial/observations
-/cells/immune/observations
+/labels/tumor_epithelial/frame_1
+/object_sets/tumor_epithelial/observations
+/object_sets/tumor_epithelial/lookup/frame_1
+/object_sets/tumor_epithelial/features/
+/object_sets/tumor_epithelial/tracks/
 ```
 
-The first object table convention will include at least:
+An `object_set` is a named population or layer of observed objects. An
+`observation` is one object instance in one frame. Object sets usually share
+the same name as their source label set, but `object_set.json` records the
+`source_label_set` explicitly so a derived object set can still point back to
+the image labels it came from.
 
+The observation table is the stable row spine for downstream analysis. Rows are
+sorted by frame and then by positive label value. Public ids are one-based:
+
+```text
+row 0 -> observation_id 1
+row 1 -> observation_id 2
+row i -> observation_id i + 1
+```
+
+There is no observation `0`; lookup arrays use `0` for background or "not
+indexed". Feature tables and track assignment tables are row-aligned to
+`/object_sets/<object_set>/observations`.
+
+The first observation table convention includes at least:
+
+- `observation_id`: stable one-based row id within the object set,
 - `frame`: one-based local frame number,
 - `parent_time_index`: zero-based parent acquisition T index when available,
 - `label_id`: integer label value within that frame,
-- `cell_id`: stable id after tracking or local id before tracking,
-- `bbox_z0`, `bbox_z1`, `bbox_y0`, `bbox_y1`, `bbox_x0`, `bbox_x1`.
+- `z_min`, `z_max`, `y_min`, `y_max`, `x_min`, `x_max`: local ROI half-open
+  bounding box coordinates,
+- `centroid_z`, `centroid_y`, `centroid_x`: local ROI centroid coordinates,
+- `voxel_count`: object size in voxels/pixels,
+- `quality_flags`: reserved bit field for curation or indexing issues.
+
+For direct visualization, each indexed frame has a lookup array:
+
+```text
+/object_sets/<object_set>/lookup/frame_1
+```
+
+where `lookup[label_id] == observation_id`. This lets the SITE ROI viewer map a
+clicked label value to the stable observation row without scanning the full
+table.
+
+```text
+frame + clicked label_id -> observation_id -> observations[observation_id - 1]
+```
+
+Features and tracks will build on that same row alignment:
+
+```text
+observation_id -> feature row
+observation_id -> track assignment
+track_id -> linked observations across frames
+```
+
+The SITE ROI viewer uses this contract without changing the stored label
+frames. For display it may render a binary foreground overlay, so all objects
+in the active object set share one chosen color instead of napari assigning a
+different color to every integer label. The original `/labels/<label_set>`
+array remains the selection source: click position gives `label_id`, the lookup
+array gives `observation_id`, and the observation row provides the side-panel
+object information. Future feature and lineage coloring should keep this same
+row spine and only change the display overlay.
 
 ## Raw Image Sources
 
@@ -123,6 +197,37 @@ The default SITE workflow is `roi_ome_zarr`. The H5 stores the image source
 specification in `/sources/image_source.json` and enough SITE metadata in
 `/metadata/` to understand the file without opening the SITE project.
 
+When the parent ND2 path changes, update the H5 according to source type.
+`linked_nd2` files should update `/sources/image_source.json:path` because that
+is where raw pixels are read. `roi_ome_zarr` and `roi_tiff` files should keep
+their cache path as the image source and update only the original-source link
+metadata in `/metadata/source_links.json`, `/metadata/roi.json`, and the nested
+ROI/image-source records in `/metadata/celltraj2.json`.
+
+## Image Axis Contract
+
+Image-source axes describe the backing source or cache. Frame axes describe the
+array returned by `Trajectory.get_image_data(frame=...)`. Code that composes
+model input or does image analysis should read the frame first, then ask
+`Trajectory.frame_axes(frame_data.ndim)` how to interpret the returned array.
+
+`get_image_data(frame=n)` applies the one-based local frame selection and drops
+time/position axes. Remaining axes are normalized to spatial/channel order:
+
+```text
+3D multichannel frame   Z,Y,X,C
+3D single-channel frame Z,Y,X
+2D multichannel frame   Y,X,C
+2D single-channel frame Y,X
+```
+
+SITE ROI OME-Zarr caches are written in `T,C,Z,Y,X` order when Z exists and in
+`T,C,Y,X` order for true 2D acquisitions. Do not synthesize a fake `Z` axis for
+2D caches. Older H5 files may contain stale source specs such as
+`T,C,Z,Y,X` for a 2D cache; the image source repairs this at read time from the
+actual OME-Zarr attrs/array dimensionality, but new H5 creation should store
+the 2D source axes correctly.
+
 ## Partial Segmentation
 
 Frame-based storage supports common partial workflows:
@@ -133,6 +238,24 @@ Frame-based storage supports common partial workflows:
 - keep static snapshot imaging as `frame_1`.
 
 Missing frame datasets mean "not segmented yet", not "empty labels".
+
+## Object Indexing Runs
+
+Object indexing writes run metadata in the same H5 as the observations:
+
+```text
+/runs/object_indexing/<run_id>/run.json
+/runs/object_indexing/<run_id>/frames/frame_1.json
+```
+
+Indexing is deterministic for a fixed set of label frames. Once
+`/object_sets/<object_set>/observations` exists, re-indexing refuses to replace
+it unless `overwrite=true` is explicit. This protects the row alignment used by
+features, tracks, exports, and ROI-viewer selections.
+
+`save_outputs=false` is a dry-run/test mode. The worker reads labels and emits
+counts but opens H5 files read-only and does not write object sets, lookup
+arrays, or run metadata.
 
 ## Segmentation Runs
 

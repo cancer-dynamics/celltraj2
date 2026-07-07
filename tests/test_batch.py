@@ -68,6 +68,57 @@ class BatchSegmentationTests(unittest.TestCase):
                 self.assertEqual(frame_record["backend_metadata"]["engine"], "fake")
             self.assertIn("job_completed", [event.get("event") for event in events])
 
+    def test_batch_segmentation_downgrades_2d_source_from_requested_3d(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "sample_2d.ct2.h5"
+            metadata = TrajectoryMetadata(
+                roi_id="sample_XY001_ROI001",
+                dataset_id="sample",
+                frame_count=1,
+                image_source=ImageSourceSpec(source_type="embedded_h5", axes=("Y", "X", "C")),
+            )
+            with TrajectoryStore.create(path, metadata=metadata) as store:
+                frame = self.np.zeros((3, 4, 2), dtype=self.np.uint16)
+                frame[..., 0] = 2
+                frame[..., 1] = 9
+                store.write_raw_frame(1, frame)
+
+            def fake_segmenter(image, file_job, frame):
+                self.assertFalse(file_job.do_3d)
+                self.assertEqual(image.shape, (2, 3, 4))
+                labels = self.np.ones((3, 4), dtype=self.np.uint16)
+                return SegmentationResult(labels=labels, metadata={"engine": "fake", "do_3D": file_job.do_3d})
+
+            events = []
+            summary = run_batch_segmentation(
+                {
+                    "job_id": "seg_2d",
+                    "files": [
+                        {
+                            "h5_path": str(path),
+                            "label_set": "cyto",
+                            "overwrite": True,
+                            "frames": {"mode": "all"},
+                            "backend": {"backend_id": "fake", "parameters": {"do_3D": True, "anisotropy": 1.5}},
+                            "model_input": {
+                                "channel_specs": [
+                                    {"channel_indices": [0], "normalization": "raw", "combination": "single"},
+                                    {"channel_indices": [1], "normalization": "raw", "combination": "single"},
+                                ]
+                            },
+                        }
+                    ],
+                },
+                fake_segmenter,
+                reporter=lambda event: events.append(dict(event)),
+            )
+
+            self.assertEqual(summary.completed, 1)
+            frame_event = next(event for event in events if event.get("event") == "frame_completed")
+            self.assertTrue(frame_event["requested_do_3D"])
+            self.assertFalse(frame_event["effective_do_3D"])
+            self.assertEqual(frame_event["frame_axes"], ["Y", "X", "C"])
+
     def test_batch_segmentation_skips_existing_labels_without_overwrite(self):
         with TemporaryDirectory() as tmp:
             path = Path(tmp) / "sample.ct2.h5"
