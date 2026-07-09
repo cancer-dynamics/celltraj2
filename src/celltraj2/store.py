@@ -105,6 +105,7 @@ class TrajectoryStore:
             "features",
             "runs/segmentation",
             "runs/object_indexing",
+            "runs/feature_extraction",
         ):
             self._h5.require_group(name)
         self.write_json("/images/raw/metadata.json", {"storage": "frame_based", "frame_index_base": 1}, overwrite=True)
@@ -362,6 +363,58 @@ class TrajectoryStore:
             return []
         return sorted(str(key) for key in self._h5["object_sets"].keys())
 
+    def write_feature_set(
+        self,
+        object_set: str,
+        feature_set: str,
+        values: Any,
+        schema: Mapping[str, Any],
+        *,
+        overwrite: bool = False,
+        qc: Mapping[str, Any] | None = None,
+    ) -> str:
+        """Write one row-aligned feature table for an object set."""
+
+        object_name = validate_name(object_set, kind="object set")
+        feature_name = validate_name(feature_set, kind="feature set")
+        self.require_object_set(object_name)
+        group_path = f"object_sets/{object_name}/features/{feature_name}"
+        if group_path in self._h5:
+            if not overwrite:
+                raise FileExistsError(f"/{group_path}")
+            del self._h5[group_path]
+        group = self._h5.require_group(group_path)
+        dataset = group.create_dataset("values", data=values, compression="gzip")
+        dataset.attrs["object_set"] = object_name
+        dataset.attrs["feature_set"] = feature_name
+        dataset.attrs["row_alignment"] = f"/object_sets/{object_name}/observations"
+        self.write_json(f"/{group_path}/schema.json", dict(schema), overwrite=True)
+        if qc is not None:
+            self.write_json(f"/{group_path}/qc.json", dict(qc), overwrite=True)
+        return f"/{group_path}/values"
+
+    def read_feature_values(self, object_set: str, feature_set: str) -> Any:
+        object_name = validate_name(object_set, kind="object set")
+        feature_name = validate_name(feature_set, kind="feature set")
+        return self._h5[f"object_sets/{object_name}/features/{feature_name}/values"][()]
+
+    def read_feature_schema(self, object_set: str, feature_set: str) -> Any:
+        object_name = validate_name(object_set, kind="object set")
+        feature_name = validate_name(feature_set, kind="feature set")
+        return self.read_json(f"/object_sets/{object_name}/features/{feature_name}/schema.json")
+
+    def has_feature_set(self, object_set: str, feature_set: str) -> bool:
+        object_name = validate_name(object_set, kind="object set")
+        feature_name = validate_name(feature_set, kind="feature set")
+        return f"object_sets/{object_name}/features/{feature_name}/values" in self._h5
+
+    def list_feature_sets(self, object_set: str) -> list[str]:
+        object_name = validate_name(object_set, kind="object set")
+        path = f"object_sets/{object_name}/features"
+        if path not in self._h5:
+            return []
+        return sorted(str(key) for key in self._h5[path].keys())
+
     def write_segmentation_run(
         self,
         run_id: str,
@@ -448,6 +501,51 @@ class TrajectoryStore:
 
     def list_object_indexing_runs(self) -> list[str]:
         path = "runs/object_indexing"
+        if path not in self._h5:
+            return []
+        return sorted(str(key) for key in self._h5[path].keys())
+
+    def write_feature_extraction_run(
+        self,
+        run_id: str,
+        data: Mapping[str, Any],
+        *,
+        overwrite: bool = True,
+    ) -> str:
+        """Write top-level metadata for one feature-extraction run."""
+
+        name = validate_name(run_id, kind="feature-extraction run")
+        group = self._h5.require_group(f"runs/feature_extraction/{name}")
+        group.require_group("frames")
+        self.write_json(f"/runs/feature_extraction/{name}/run.json", dict(data), overwrite=overwrite)
+        return f"/runs/feature_extraction/{name}/run.json"
+
+    def read_feature_extraction_run(self, run_id: str) -> Any:
+        name = validate_name(run_id, kind="feature-extraction run")
+        return self.read_json(f"/runs/feature_extraction/{name}/run.json")
+
+    def write_feature_extraction_frame_result(
+        self,
+        run_id: str,
+        frame: int,
+        data: Mapping[str, Any],
+        *,
+        overwrite: bool = True,
+    ) -> str:
+        """Write metadata for one frame processed by a feature-extraction run."""
+
+        name = validate_name(run_id, kind="feature-extraction run")
+        self._h5.require_group(f"runs/feature_extraction/{name}/frames")
+        path = f"/runs/feature_extraction/{name}/frames/{frame_key(frame)}.json"
+        self.write_json(path, dict(data), overwrite=overwrite)
+        return path
+
+    def read_feature_extraction_frame_result(self, run_id: str, frame: int) -> Any:
+        name = validate_name(run_id, kind="feature-extraction run")
+        return self.read_json(f"/runs/feature_extraction/{name}/frames/{frame_key(frame)}.json")
+
+    def list_feature_extraction_runs(self) -> list[str]:
+        path = "runs/feature_extraction"
         if path not in self._h5:
             return []
         return sorted(str(key) for key in self._h5[path].keys())

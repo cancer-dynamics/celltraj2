@@ -42,7 +42,7 @@ python -m pip install -e ".[analysis,nd2,dev]"
 Cellpose batch workers can install only the I/O pieces they need, for example:
 
 ```bash
-python -m pip install -e ".[h5,zarr]"
+python -m pip install -e ".[analysis,nd2]"
 python -m celltraj2.runners.cellpose_segment segmentation_job.json
 ```
 

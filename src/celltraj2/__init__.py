@@ -8,6 +8,19 @@ from celltraj2.batch import (
     SegmentationResult,
     run_batch_segmentation,
 )
+from celltraj2.feature_extraction import (
+    BatchFeatureExtractionSummary,
+    FeatureExtractionBatchJob,
+    FeatureExtractionFileJob,
+    run_batch_feature_extraction,
+)
+from celltraj2.features import (
+    FeatureExtractionResult,
+    FeatureSetSpec,
+    extract_feature_set,
+    regionprops_v1_spec,
+    site_signaling_v1_spec,
+)
 from celltraj2.object_indexing import (
     BatchObjectIndexSummary,
     ObjectIndexBatchJob,
@@ -28,8 +41,13 @@ from celltraj2.trajectory import Trajectory
 
 __all__ = [
     "BatchSegmentationSummary",
+    "BatchFeatureExtractionSummary",
     "BatchObjectIndexSummary",
     "ChannelSpec",
+    "FeatureExtractionBatchJob",
+    "FeatureExtractionFileJob",
+    "FeatureExtractionResult",
+    "FeatureSetSpec",
     "ImageSourceSpec",
     "JsonlReporter",
     "ObjectIndexBatchJob",
@@ -44,9 +62,13 @@ __all__ = [
     "Trajectory",
     "TrajectoryMetadata",
     "TrajectoryStore",
+    "extract_feature_set",
     "index_object_set",
+    "regionprops_v1_spec",
     "run_batch_object_indexing",
+    "run_batch_feature_extraction",
     "run_batch_segmentation",
+    "site_signaling_v1_spec",
 ]
 
 __version__ = "0.1.0"

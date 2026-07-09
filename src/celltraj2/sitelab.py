@@ -20,6 +20,9 @@ from celltraj2.schema import (
 from celltraj2.store import TrajectoryStore
 
 
+PROJECT_PATH_ANCHORS = ("roi_files", "rois", "cell_files", "segmentation", "analysis", "outputs", "manifests")
+
+
 def load_json(path: str | Path) -> dict[str, Any]:
     return json.loads(Path(path).read_text(encoding="utf-8"))
 
@@ -64,6 +67,34 @@ def resolve_site_path(path: str | Path | None, *, project_root: str | Path) -> P
     return value if value.is_absolute() else Path(project_root) / value
 
 
+def _project_relative_suffix(path: str | Path) -> Path | None:
+    parts = Path(path).parts
+    for index, part in enumerate(parts):
+        if part in PROJECT_PATH_ANCHORS:
+            return Path(*parts[index:])
+    return None
+
+
+def stored_site_path(path: str | Path | None, *, project_root: str | Path) -> Path | None:
+    """Return a portable stored path for SITE project-owned artifacts."""
+
+    if path in (None, ""):
+        return None
+    value = Path(path)
+    if not value.is_absolute():
+        if value.root:
+            suffix = _project_relative_suffix(value)
+            if suffix is not None:
+                return suffix
+        return value
+    root = Path(project_root).resolve(strict=False)
+    resolved = value.resolve(strict=False)
+    try:
+        return resolved.relative_to(root)
+    except ValueError:
+        return resolved
+
+
 def frame_count_from_roi(roi: Mapping[str, Any], roi_set: Mapping[str, Any]) -> int:
     """Return local frame count for one ROI, treating snapshots as one frame."""
 
@@ -104,8 +135,8 @@ def image_source_from_site_roi(
         }
     )
     storage_mode = str(roi_record.get("storage_mode") or "linked_nd2")
-    artifact_path = resolve_site_path(roi_record.get("artifact_path"), project_root=project_root)
-    source_path = resolve_site_path(roi_set.get("source_path"), project_root=project_root)
+    artifact_path = stored_site_path(roi_record.get("artifact_path"), project_root=project_root)
+    source_path = stored_site_path(roi_set.get("source_path"), project_root=project_root)
     axes = tuple(str(axis) for axis in roi_set.get("source_axes", ()) or ())
     sizes = {str(key): int(value) for key, value in dict(roi_set.get("source_sizes", {}) or {}).items()}
 
@@ -147,10 +178,10 @@ def create_metadata_from_site_roi(
     """Return trajectory metadata plus source SITE payloads for one ROI."""
 
     roi_set_data = dict(roi_set or load_json(roi_json_path))
-    if source_path not in (None, ""):
-        roi_set_data["source_path"] = str(source_path)
-    roi_record = find_roi_record(roi_set_data, roi_id)
     root = Path(project_root) if project_root is not None else infer_project_root_from_roi_json(roi_json_path)
+    if source_path not in (None, ""):
+        roi_set_data["source_path"] = str(stored_site_path(source_path, project_root=root))
+    roi_record = find_roi_record(roi_set_data, roi_id)
     dataset_id = dataset_id_from_roi_json(roi_json_path, roi_set_data)
     image_source = image_source_from_site_roi(roi_set=roi_set_data, roi_record=roi_record, project_root=root)
 
@@ -208,6 +239,7 @@ def create_analysis_h5_from_site_roi(
         "roi_json_path": str(Path(roi_json_path)),
         "manifest_path": str(Path(manifest_path)) if manifest_path is not None else None,
         "project_root": str(root),
+        "creation_project_root": str(root),
         "source_path": roi_set.get("source_path"),
         "roi_set_source_path": roi_set.get("source_path"),
         "linked_nd2_path": str(linked_nd2_path) if linked_nd2_path is not None else None,

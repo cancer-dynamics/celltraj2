@@ -197,6 +197,15 @@ The default SITE workflow is `roi_ome_zarr`. The H5 stores the image source
 specification in `/sources/image_source.json` and enough SITE metadata in
 `/metadata/` to understand the file without opening the SITE project.
 
+H5 files may store ROI cache paths as project-relative paths such as
+`roi_files/<dataset>/<roi_id>.ome.zarr`. This keeps SITE local/shared projects
+portable while preserving standalone `celltraj2` use. When opening an H5,
+`celltraj2` resolves relative image-source paths from the standard
+`cell_files/<dataset>/` layout, the H5 parent folder, copied source-link project
+roots, and the current working directory. Stale absolute ROI cache paths from
+another machine can also be recovered when their `roi_files/...` suffix exists
+beside the current project.
+
 When the parent ND2 path changes, update the H5 according to source type.
 `linked_nd2` files should update `/sources/image_source.json:path` because that
 is where raw pixels are read. `roi_ome_zarr` and `roi_tiff` files should keep

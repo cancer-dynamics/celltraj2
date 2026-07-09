@@ -7,8 +7,11 @@ from celltraj2.sources import (
     _axes_for_array,
     _ome_zarr_channel_index_map,
     _ome_zarr_layout_hint,
+    _project_relative_suffix,
+    _project_root_from_h5_path,
     _open_zarr_array_for_read,
     _open_zarr_group_for_read,
+    resolve_image_source_path,
 )
 
 
@@ -126,6 +129,48 @@ class SourceTests(unittest.TestCase):
         axes = _axes_for_array(4, ("T", "C", "Y", "X"), ("T", "C", "Z", "Y", "X"))
 
         self.assertEqual(axes, ("T", "C", "Y", "X"))
+
+    def test_project_root_is_inferred_from_standard_cell_file_path(self):
+        root = _project_root_from_h5_path(Path("/project/cell_files/sample/roi.ct2.h5"))
+
+        self.assertEqual(root, Path("/project"))
+
+    def test_project_relative_suffix_recovers_roi_files_portion(self):
+        suffix = _project_relative_suffix(Path("/old/project/roi_files/sample/roi.ome.zarr"))
+
+        self.assertEqual(suffix, Path("roi_files/sample/roi.ome.zarr"))
+
+    def test_relative_image_source_resolves_against_h5_project_root(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            cache = root / "roi_files" / "sample" / "roi.ome.zarr"
+            cache.mkdir(parents=True)
+
+            class Store:
+                path = root / "cell_files" / "sample" / "roi.ct2.h5"
+
+                def read_json(self, path):
+                    return {}
+
+            resolved = resolve_image_source_path("roi_files/sample/roi.ome.zarr", store=Store())
+
+        self.assertEqual(resolved, cache)
+
+    def test_stale_absolute_roi_cache_resolves_by_project_suffix(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            cache = root / "roi_files" / "sample" / "roi.ome.zarr"
+            cache.mkdir(parents=True)
+
+            class Store:
+                path = root / "cell_files" / "sample" / "roi.ct2.h5"
+
+                def read_json(self, path):
+                    return {}
+
+            resolved = resolve_image_source_path("/old/project/roi_files/sample/roi.ome.zarr", store=Store())
+
+        self.assertEqual(resolved, cache)
 
 
 if __name__ == "__main__":

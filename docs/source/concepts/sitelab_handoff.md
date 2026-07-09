@@ -39,9 +39,16 @@ SITE should pass:
 `/sources/image_source.json` is the executable pixel-access contract. If the
 source type is `linked_nd2`, its `path` should be the current ND2 path to open.
 If the source type is `roi_ome_zarr` or `roi_tiff`, its `path` should remain the
-ROI cache path; the original parent ND2 link lives in `/metadata/source_links.json`
-and the nested ROI `source_path` metadata. SITE's Data tab can relink existing
-H5 files when a local ND2 path changes.
+ROI cache path, preferably stored relative to the SITE project root as
+`roi_files/<dataset>/<roi_id>.ome.zarr` or `.tif`. The original parent ND2 link
+lives in `/metadata/source_links.json` and the nested ROI `source_path`
+metadata. SITE's Data tab can check and repair existing H5 files when a local
+ND2 path changes or when an older H5 contains a stale absolute ROI cache path.
+
+This does not make `celltraj2` depend on an open SITE project. Workers and
+notebooks still accept absolute H5 paths, and relative image-source paths are
+resolved from the H5's current location, standard `cell_files/<dataset>/`
+layout, copied source-link metadata, or current working directory.
 
 ## Batch Segmentation Shape
 

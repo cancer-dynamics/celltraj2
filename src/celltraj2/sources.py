@@ -9,6 +9,9 @@ from celltraj2.paths import frame_key
 from celltraj2.schema import ImageSourceSpec
 
 
+PROJECT_PATH_ANCHORS = ("roi_files", "rois", "cell_files", "segmentation", "analysis", "outputs", "manifests")
+
+
 def _require_numpy() -> Any:
     try:
         import numpy as np
@@ -386,6 +389,7 @@ def image_source_from_spec(spec: ImageSourceSpec, *, store: Any | None = None) -
         if store is None:
             raise ValueError("embedded_h5 image source requires a TrajectoryStore")
         return EmbeddedH5ImageSource(store, spec)
+    spec = _spec_with_resolved_path(spec, store=store)
     if spec.source_type == "roi_ome_zarr":
         return OmeZarrRoiImageSource(spec)
     if spec.source_type == "roi_tiff":
@@ -393,6 +397,100 @@ def image_source_from_spec(spec: ImageSourceSpec, *, store: Any | None = None) -
     if spec.source_type == "linked_nd2":
         return LinkedNd2RoiImageSource(spec)
     raise ValueError(f"Unsupported image source type: {spec.source_type}")
+
+
+def _spec_with_resolved_path(spec: ImageSourceSpec, *, store: Any | None = None) -> ImageSourceSpec:
+    if spec.path is None:
+        return spec
+    resolved = resolve_image_source_path(spec.path, store=store, source_type=spec.source_type)
+    if resolved == spec.path:
+        return spec
+    payload = spec.to_dict()
+    payload["path"] = str(resolved)
+    return ImageSourceSpec.from_dict(payload)
+
+
+def resolve_image_source_path(
+    path: str | Path,
+    *,
+    store: Any | None = None,
+    source_type: str | None = None,
+) -> Path:
+    """Resolve a stored image-source path without breaking standalone H5 use.
+
+    Relative project paths are resolved against the inferred SITE project root
+    when the H5 is still in ``cell_files/<dataset>/``. If the H5 is exported
+    elsewhere, the H5 parent and current working directory are also tried.
+    Legacy absolute ROI-cache paths that no longer exist are remapped by their
+    ``roi_files/...`` suffix when that suffix exists beside the current H5.
+    """
+
+    value = Path(path)
+    bases = _candidate_base_dirs(store)
+    if value.is_absolute() or value.root:
+        if value.exists():
+            return value
+        suffix = _project_relative_suffix(value)
+        if suffix is not None:
+            for base in bases:
+                candidate = base / suffix
+                if candidate.exists():
+                    return candidate
+        return value
+    for base in bases:
+        candidate = base / value
+        if candidate.exists():
+            return candidate
+    if bases:
+        return bases[0] / value
+    return value
+
+
+def _candidate_base_dirs(store: Any | None = None) -> list[Path]:
+    candidates: list[Path] = []
+    store_path = Path(getattr(store, "path", "")) if store is not None and getattr(store, "path", None) is not None else None
+    if store_path is not None:
+        inferred = _project_root_from_h5_path(store_path)
+        if inferred is not None:
+            candidates.append(inferred)
+        candidates.append(store_path.parent)
+    if store is not None:
+        try:
+            links = store.read_json("/metadata/source_links.json")
+        except Exception:
+            links = {}
+        if isinstance(links, dict):
+            for key in ("project_root", "creation_project_root"):
+                value = links.get(key)
+                if value not in (None, ""):
+                    candidates.append(Path(str(value)))
+    candidates.append(Path.cwd())
+    out: list[Path] = []
+    seen: set[Path] = set()
+    for candidate in candidates:
+        resolved = candidate.expanduser().resolve(strict=False)
+        if resolved in seen:
+            continue
+        out.append(candidate)
+        seen.add(resolved)
+    return out
+
+
+def _project_root_from_h5_path(path: str | Path) -> Path | None:
+    value = Path(path)
+    parts = value.parts
+    for index, part in enumerate(parts):
+        if part == "cell_files" and index > 0:
+            return Path(*parts[:index])
+    return None
+
+
+def _project_relative_suffix(path: str | Path) -> Path | None:
+    parts = Path(path).parts
+    for index, part in enumerate(parts):
+        if part in PROJECT_PATH_ANCHORS:
+            return Path(*parts[index:])
+    return None
 
 
 def _default_axes_for_ndim(ndim: int) -> tuple[str, ...]:

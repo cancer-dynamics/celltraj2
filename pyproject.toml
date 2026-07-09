@@ -16,6 +16,7 @@ dependencies = []
 [project.scripts]
 celltraj2-cellpose-segment = "celltraj2.runners.cellpose_segment:main"
 celltraj2-index-objects = "celltraj2.runners.index_objects:main"
+celltraj2-extract-features = "celltraj2.runners.extract_features:main"
 
 [project.urls]
 Homepage = "https://github.com/cancer-dynamics/celltraj2"
@@ -45,8 +46,10 @@ nd2 = [
 analysis = [
   "numpy>=1.24",
   "h5py>=3.10",
+  "scikit-image>=0.22",
   "zarr>=2.18",
   "dask[array]>=2024",
+  "xarray>=2024",
   "tifffile>=2024",
 ]
 dev = [

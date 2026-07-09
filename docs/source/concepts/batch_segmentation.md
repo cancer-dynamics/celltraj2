@@ -63,8 +63,11 @@ A batch job contains global execution settings and one file job per H5:
 ```
 
 `SegmentationBatchJob` accepts either absolute H5 paths or paths relative to
-`project_root`. `SegmentationFileJob` supports frame selections by `all`,
-`range`, explicit `frame_list`, or an explicit `frames` array.
+`project_root`. SITE-submitted jobs should prefer relative paths such as
+`cell_files/<dataset>/<roi_id>.ct2.h5` so queued job JSON can move with a
+shared/local project copy. Standalone scripts may still submit absolute H5
+paths. `SegmentationFileJob` supports frame selections by `all`, `range`,
+explicit `frame_list`, or an explicit `frames` array.
 
 ## Output Targets
 

@@ -8,6 +8,7 @@ from celltraj2.sitelab import (
     frame_count_from_roi,
     image_source_from_site_roi,
     roi_cache_axes_from_source,
+    stored_site_path,
 )
 
 
@@ -45,8 +46,16 @@ class SitelabHandoffTests(unittest.TestCase):
         spec = image_source_from_site_roi(roi_set=roi_set, roi_record=roi, project_root=Path("/project"))
 
         self.assertEqual(spec.source_type, "roi_ome_zarr")
-        self.assertEqual(spec.path, Path("/project/roi_files/sample/sample_XY001_ROI001.ome.zarr"))
+        self.assertEqual(spec.path, Path("roi_files/sample/sample_XY001_ROI001.ome.zarr"))
         self.assertEqual(spec.axes, ("T", "C", "Z", "Y", "X"))
+
+    def test_stored_site_path_makes_project_internal_absolute_paths_relative(self):
+        stored = stored_site_path(
+            Path("/project/roi_files/sample/sample_XY001_ROI001.ome.zarr"),
+            project_root=Path("/project"),
+        )
+
+        self.assertEqual(stored, Path("roi_files/sample/sample_XY001_ROI001.ome.zarr"))
 
     def test_image_source_from_2d_roi_ome_zarr_omits_z_axis(self):
         roi_set = {

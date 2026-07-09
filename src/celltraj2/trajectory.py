@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -75,6 +76,49 @@ class ObjectSet:
         if value < 0 or value >= int(lookup.shape[0]):
             return 0
         return int(lookup[value])
+
+    def extract_features(
+        self,
+        spec: Any,
+        *,
+        frames: Sequence[int] | None = None,
+        overwrite: bool = False,
+        save_outputs: bool = True,
+        run_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> Any:
+        """Extract and optionally save a row-aligned feature set for this object set."""
+
+        from celltraj2.features import FeatureSetSpec, extract_feature_set
+
+        if isinstance(spec, Mapping):
+            payload = dict(spec)
+            payload.setdefault("object_set", self.name)
+            feature_spec = FeatureSetSpec.from_dict(payload)
+        elif isinstance(spec, FeatureSetSpec):
+            feature_spec = spec
+            if feature_spec.object_set != self.name:
+                raise ValueError(f"Feature spec object_set {feature_spec.object_set!r} does not match {self.name!r}")
+        else:
+            raise TypeError("spec must be a FeatureSetSpec or mapping")
+        return extract_feature_set(
+            self.trajectory,
+            feature_spec,
+            frames=frames,
+            overwrite=overwrite,
+            save_outputs=save_outputs,
+            run_id=run_id,
+            metadata=metadata,
+        )
+
+    def read_features(self, feature_set: str) -> Any:
+        return self.trajectory.store.read_feature_values(self.name, feature_set)
+
+    def read_feature_schema(self, feature_set: str) -> Any:
+        return self.trajectory.store.read_feature_schema(self.name, feature_set)
+
+    def feature_sets(self) -> list[str]:
+        return self.trajectory.store.list_feature_sets(self.name)
 
 
 class Trajectory:
@@ -238,3 +282,52 @@ class Trajectory:
 
     def object_indexing_runs(self) -> list[str]:
         return self.store.list_object_indexing_runs()
+
+    def write_feature_set(
+        self,
+        object_set: str,
+        feature_set: str,
+        values: Any,
+        schema: dict[str, Any],
+        *,
+        overwrite: bool = False,
+        qc: dict[str, Any] | None = None,
+    ) -> str:
+        return self.store.write_feature_set(object_set, feature_set, values, schema, overwrite=overwrite, qc=qc)
+
+    def read_features(self, object_set: str, feature_set: str) -> Any:
+        return self.store.read_feature_values(object_set, feature_set)
+
+    def read_feature_schema(self, object_set: str, feature_set: str) -> Any:
+        return self.store.read_feature_schema(object_set, feature_set)
+
+    def feature_sets(self, object_set: str) -> list[str]:
+        return self.store.list_feature_sets(object_set)
+
+    def extract_features(
+        self,
+        spec: Any,
+        *,
+        frames: Sequence[int] | None = None,
+        overwrite: bool = False,
+        save_outputs: bool = True,
+        run_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> Any:
+        from celltraj2.features import extract_feature_set
+
+        return extract_feature_set(
+            self,
+            spec,
+            frames=frames,
+            overwrite=overwrite,
+            save_outputs=save_outputs,
+            run_id=run_id,
+            metadata=metadata,
+        )
+
+    def write_feature_extraction_run(self, run_id: str, data: dict[str, Any], *, overwrite: bool = True) -> str:
+        return self.store.write_feature_extraction_run(run_id, data, overwrite=overwrite)
+
+    def feature_extraction_runs(self) -> list[str]:
+        return self.store.list_feature_extraction_runs()
