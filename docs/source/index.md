@@ -2,9 +2,9 @@
 
 `celltraj2` is the frame-based microscopy trajectory-analysis backend for SITE
 and standalone Python analysis. It owns per-ROI `.ct2.h5` analysis files,
-source-image metadata, segmentation labels and masks, object tables, and the
-trajectory facade that higher-level tools use to read images and write analysis
-results.
+source-image metadata, segmentation labels and masks, object tables,
+row-aligned feature tables, and the trajectory facade that higher-level tools
+use to read images and write analysis results.
 
 The package is intentionally split from `sitelab`: `sitelab` remains the GUI
 and acquisition/project workflow, while `celltraj2` owns the analysis data

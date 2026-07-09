@@ -72,6 +72,7 @@ The H5 stores both:
       <feature_set>/
         values
         schema.json
+        qc.json
     tracks/
       <track_set>/
         assignments
@@ -89,6 +90,12 @@ The H5 stores both:
         frame_1.json
         frame_2.json
   segmentation/
+    <run_id>/
+      run.json
+      frames/
+        frame_1.json
+        frame_2.json
+  feature_extraction/
     <run_id>/
       run.json
       frames/
@@ -165,7 +172,7 @@ table.
 frame + clicked label_id -> observation_id -> observations[observation_id - 1]
 ```
 
-Features and tracks will build on that same row alignment:
+Feature tables and track assignment tables use that same row alignment:
 
 ```text
 observation_id -> feature row
@@ -179,8 +186,82 @@ in the active object set share one chosen color instead of napari assigning a
 different color to every integer label. The original `/labels/<label_set>`
 array remains the selection source: click position gives `label_id`, the lookup
 array gives `observation_id`, and the observation row provides the side-panel
-object information. Future feature and lineage coloring should keep this same
-row spine and only change the display overlay.
+object information. Feature coloring keeps the same selection source, reads a
+stored feature column for each `observation_id`, and replaces only the display
+overlay with a feature-valued image. Lineage coloring should keep the same row
+spine when track tables are added.
+
+## Feature Sets
+
+Feature extraction writes row-aligned tables under the active object set:
+
+```text
+/object_sets/<object_set>/features/<feature_set>/values
+/object_sets/<object_set>/features/<feature_set>/schema.json
+/object_sets/<object_set>/features/<feature_set>/qc.json
+```
+
+`values` is an HDF5 compound dataset with one row per
+`/object_sets/<object_set>/observations` row. The first field is
+`observation_id`; every other field is a float feature column. Values that were
+not computed or not available are stored as `NaN`. `schema.json` records the
+submitted `FeatureSetSpec`, row alignment, source label set, frame list, and a
+schema entry for each feature column. `qc.json` stores missing-value counts and
+per-frame warning summaries.
+
+Feature set names group related quantities. Current defaults are:
+
+- `site_v1`: SITE intracellular signaling measurements. The SITE launcher
+  defaults the feature name to `site`, which expands to `site_cyto`,
+  `site_nuc`, and `site_ratio`.
+- `regionprops_v1`: scikit-image `regionprops_table`-style object morphology
+  columns, currently using a `regionprops_<property>` naming pattern.
+
+Additional feature blocks can write intensity, compartment ratio, channel
+correlation, or regionprops-style columns into the same feature set. Output
+column names must be unique within a feature set. When a future feature returns
+multiple ordered values, use one compound-dataset column per component, with
+the stable suffix convention `<feature_name>-1`, `<feature_name>-2`,
+`<feature_name>-3`, and so on. The full feature details remain in
+`schema.json`, so column names should stay readable but compact.
+
+Compartments are described with stored label or mask sources rather than raw H5
+paths. A compartment can start from the object set's source labels and then
+optionally include or exclude another label/mask source:
+
+```json
+{
+  "label_set": "cells",
+  "include_mask_set": "nuclei",
+  "exclude_label_set": "mitotic_nuclei",
+  "name": "nuc"
+}
+```
+
+This lets any stored `/masks/<name>/frame_<n>` or binarized
+`/labels/<name>/frame_<n>` dataset define a nuclear, cytoplasmic, or custom
+intracellular compartment. SITE's default signaling ratio uses distinct
+compartments by excluding the nuclear source from the cytoplasm. Custom ratios
+can also exclude the denominator source from the numerator.
+
+Background subtraction is optional on intensity and compartment-ratio features.
+The canonical background mapping selects a stored mask or label source and
+chooses either the source region itself or its inverse:
+
+```json
+{
+  "enabled": true,
+  "source_kind": "mask",
+  "source_name": "background",
+  "region": "inverse",
+  "mode": "mean"
+}
+```
+
+`mode` is usually `mean`; percentile mode is retained for legacy wrappers. The
+worker computes the background baseline for each frame, subtracts it from the
+image used by the feature, and records the background mapping in each affected
+column schema.
 
 ## Raw Image Sources
 
@@ -301,6 +382,27 @@ test or saved runs to write temporary `.npz` bundles for visualization.
 
 If a frame target already exists and `overwrite=false`, the frame is skipped.
 If `overwrite=true`, the existing frame dataset is replaced.
+
+## Feature Extraction Runs
+
+Batch feature extraction writes run metadata in the same H5 as the feature
+table:
+
+```text
+/runs/feature_extraction/<run_id>/run.json
+/runs/feature_extraction/<run_id>/frames/frame_1.json
+```
+
+`run.json` stores the submitted feature spec, object set, source label set,
+frame list, overwrite policy, save/test mode, and final feature count. Each
+frame JSON stores status, the feature columns computed for that frame, warnings,
+object counts, and `feature_summaries` with mean finite value, finite count,
+NaN count, and object count per returned feature column.
+
+If a feature set already exists and `overwrite=false`, saved runs refuse to
+replace it. `save_outputs=false` is a dry-run/test mode: the worker reads image,
+label, mask, and object-set data, streams summaries, and leaves feature tables
+and `/runs/feature_extraction` metadata untouched.
 
 ## Model Input Contract
 

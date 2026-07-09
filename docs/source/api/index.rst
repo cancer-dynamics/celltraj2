@@ -8,6 +8,8 @@ API Reference
    schema
    model_input
    batch
+   features
+   feature_extraction
    store
    sources
    trajectory

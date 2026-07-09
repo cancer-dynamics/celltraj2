@@ -90,17 +90,32 @@ be used without importing SITE or Pydantic.
   `python -m celltraj2.runners.index_objects job.json`.
 - Per-run and per-frame provenance under `/runs/object_indexing/<run_id>/`.
 
-## Next Phase: Interactive Analysis, Features, And Tracks
+## Completed Phase 9: Single-Object Feature Tables
+
+- `FeatureSetSpec` for row-aligned object feature calculation.
+- Regionprops, intensity, compartment-ratio, channel-correlation, and SITE
+  signaling feature blocks.
+- Default SITE signaling feature set `site_v1`, expanding a compact feature name
+  such as `site` into `site_cyto`, `site_nuc`, and `site_ratio`.
+- Stored mask/label source references for compartment inclusion and exclusion.
+- Optional per-frame background subtraction from a stored mask/label source or
+  its inverse.
+- Compound HDF5 feature tables under
+  `/object_sets/<object_set>/features/<feature_set>/values`, with
+  `schema.json` and `qc.json` sidecars.
+- Per-run and per-frame provenance under `/runs/feature_extraction/<run_id>/`.
+- JSONL `feature_frame_summary` events for SITE progress output.
+- Optional runner:
+  `python -m celltraj2.runners.extract_features job.json`.
+
+## Next Phase: Tracks And Interactive Analysis
 
 The next layer should build on saved H5 files rather than redesign storage:
 
-- load active H5 sets from SITE or directly from Python;
-- inspect metadata/source links, labels, masks, segmentation runs, and image
-  access behavior;
-- compute first feature tables under
-  `/object_sets/<object_set>/features/<feature_set>/`;
 - design tracking IDs and frame-to-frame lineage tables under
   `/object_sets/<object_set>/tracks/<track_set>/`;
+- add lineage/trajectory coloring that uses the same
+  `label_id -> observation_id -> row` lookup as feature coloring;
 - launch exploratory notebooks or marimo environments with active H5s,
-  treatment groups, and replicate metadata preloaded;
+  treatment groups, feature tables, and replicate metadata preloaded;
 - keep a clean backend API that works in notebooks without importing SITE.

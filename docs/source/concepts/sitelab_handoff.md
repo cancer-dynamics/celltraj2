@@ -34,6 +34,9 @@ SITE should pass:
 - `/object_sets/<object_set>/observations` after object indexing,
 - `/object_sets/<object_set>/lookup/frame_<n>` lookup arrays for ROI-viewer
   selection,
+- `/object_sets/<object_set>/features/<feature_set>/values` feature tables,
+- `/object_sets/<object_set>/features/<feature_set>/schema.json` feature
+  provenance,
 - segmentation run provenance under `/runs/segmentation/<run_id>/`.
 
 `/sources/image_source.json` is the executable pixel-access contract. If the
@@ -198,10 +201,86 @@ one-based `observation_id` values sorted by frame and label value, and writes:
 ```
 
 Once observations exist, rerunning without `"overwrite": true` refuses to
-replace the established index. This preserves row alignment for future feature
-tables, track assignments, exports, and ROI-viewer selections. With
-`"save_outputs": false`, the worker opens H5 files read-only and reports counts
-without writing object sets or run metadata.
+replace the established index. This preserves row alignment for feature tables,
+track assignments, exports, and ROI-viewer selections. With `"save_outputs":
+false`, the worker opens H5 files read-only and reports counts without writing
+object sets or run metadata.
+
+## Feature Extraction Shape
+
+After object indexing, SITE can launch feature extraction with the same worker
+shape:
+
+```bash
+python -m celltraj2.runners.extract_features feature_job.json
+```
+
+Minimal job shape:
+
+```json
+{
+  "job_id": "features_20260703_example",
+  "project_root": "project",
+  "save_outputs": true,
+  "overwrite": false,
+  "files": [
+    {
+      "h5_path": "cell_files/sample/sample_XY001_ROI001.ct2.h5",
+      "feature_spec": {
+        "feature_set": "site_v1",
+        "object_set": "cyto_epithelial",
+        "source_label_set": "cyto_epithelial",
+        "frames": {"mode": "all"},
+        "features": [
+          {
+            "kind": "intensity",
+            "name": "site_cyto",
+            "channel": {"raw_index": 3},
+            "stats": ["mean"],
+            "compartment": {
+              "label_set": "cyto_epithelial",
+              "exclude_mask_set": "nuclei",
+              "name": "cyto_excluding_nuc"
+            },
+            "background": {
+              "enabled": true,
+              "source_kind": "mask",
+              "source_name": "background",
+              "region": "inverse",
+              "mode": "mean"
+            }
+          }
+        ]
+      }
+    }
+  ]
+}
+```
+
+Each file job contains one `FeatureSetSpec`. A spec writes one row-aligned
+feature table under:
+
+```text
+/object_sets/<object_set>/features/<feature_set>/values
+/object_sets/<object_set>/features/<feature_set>/schema.json
+/object_sets/<object_set>/features/<feature_set>/qc.json
+/runs/feature_extraction/<run_id>/
+```
+
+Supported feature block kinds are `regionprops`, `intensity`,
+`compartment_ratio`, and `channel_correlation`. The SITE launcher also exposes a
+`SITE Signaling` block that expands to compact `site_cyto`, `site_nuc`, and
+`site_ratio` columns inside the default `site_v1` feature set.
+
+Mask and label inputs are referenced by source name and kind, not by H5 path.
+The worker resolves those names to `/masks/<name>/frame_<n>` or
+`/labels/<name>/frame_<n>` for the active frame. The same source selection is
+used for compartment inclusion/exclusion and optional background subtraction.
+
+The worker streams JSONL events for SITE. In addition to file/frame lifecycle
+events, `feature_frame_summary` events report the file, frame, feature column,
+mean finite value, object count, finite count, and NaN count, which lets the SITE
+run window show live per-feature progress.
 
 ## SITE ROI Viewer Consumption
 
@@ -213,19 +292,27 @@ roi_files/<dataset>/<roi_id>.ome.zarr
 cell_files/<dataset>/<roi_id>.ct2.h5
 ```
 
-The `SITE object sets` panel reads `/labels/<label_set>/frame_<n>` and
-`/object_sets/<object_set>/object_set.json` to offer available label/object
-sets. It displays the current frame as a single-color overlay for the active
-object set, while retaining the original integer label array for selection.
-When the user clicks an object, SITE resolves:
+The `SITE object sets` panel reads `/labels/<label_set>/frame_<n>`,
+`/masks/<mask_set>/frame_<n>`, `/object_sets/<object_set>/object_set.json`, and
+stored feature schemas to offer available H5 labels, masks, indexed object
+sets, and feature columns. Standalone labels and masks can be loaded directly
+with napari's default Labels/Image-layer display. Indexed object sets display
+the current frame as a single-color overlay by default, while retaining the
+original integer label array for selection. When the user clicks an indexed
+object, SITE resolves:
 
 ```text
 label_id -> lookup[label_id] -> observation_id -> observations[observation_id - 1]
 ```
 
-and displays the observation row. This is the current integration point for
-single-object inspection and the planned growth point for feature coloring,
-lineage coloring, and trajectory highlighting.
+and displays the observation row plus any stored feature values for that
+`observation_id`, grouped by feature set. `Color by...` can render the object
+set as one color, by continuous object id, or by a selected feature column. For
+feature coloring, SITE creates a feature-valued display image for the current
+frame; pixels outside indexed objects are `NaN`, and the integer label frame
+remains the click-selection source. Lineage coloring and trajectory
+highlighting should use the same lookup/observation row spine when tracking is
+added.
 
 ## One-Based Frames
 
