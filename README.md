@@ -16,6 +16,10 @@ Current core capabilities:
   fallback caches, or linked ND2 files plus stored ROI coordinates;
 - store named frame-based labels and masks under one-based `frame_<n>` paths;
 - index object observations and row-aligned lookup tables for ROI viewers;
+- track observations by minimum centroid distance and store lineage topology as
+  a parent-to-child CSR sparse matrix with row-aligned lineage/tracklet caches;
+- query parents, children, histories, descendants, lineages, and maximal
+  root-to-leaf trajectories, including scipy sparse trajectory membership;
 - compute row-aligned single-object feature tables, including regionprops,
   intensity, compartment ratios, channel correlations, and SITE signaling;
 - compose segmentation model input from stored channel specs;
@@ -50,6 +54,7 @@ Cellpose batch workers can install only the I/O pieces they need, for example:
 python -m pip install -e ".[analysis,nd2]"
 python -m celltraj2.runners.cellpose_segment segmentation_job.json
 python -m celltraj2.runners.extract_features feature_extraction_job.json
+python -m celltraj2.runners.track_centroids tracking_job.json
 ```
 
 Lean environments can still import the package and use the typed metadata

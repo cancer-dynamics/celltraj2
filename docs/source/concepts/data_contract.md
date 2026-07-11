@@ -75,6 +75,10 @@ The H5 stores both:
         qc.json
     tracks/
       <track_set>/
+        adjacency/
+          indptr
+          indices
+          data
         assignments
         links
         schema.json
@@ -96,6 +100,12 @@ The H5 stores both:
         frame_1.json
         frame_2.json
   feature_extraction/
+    <run_id>/
+      run.json
+      frames/
+        frame_1.json
+        frame_2.json
+  tracking/
     <run_id>/
       run.json
       frames/
@@ -180,6 +190,69 @@ observation_id -> track assignment
 track_id -> linked observations across frames
 ```
 
+## Sparse Lineage Graphs
+
+Tracking topology is stored under
+`/object_sets/<object_set>/tracks/<track_set>/adjacency/` as a square CSR sparse
+matrix over observation rows. A nonzero at row `parent_observation_id - 1`,
+column `child_observation_id - 1` means that the parent is linked to the child.
+CSR `indices` are zero-based observation rows; `data` contains the one-based
+`link_id` that addresses the matching row of `links`.
+
+The core lineage invariant is:
+
+- a child has zero or one parent;
+- a parent has zero or more children;
+- links connect observations in immediately consecutive local frames;
+- the directed graph is acyclic.
+
+`links` is a compound edge-metadata table containing parent/child observation
+ids, source/target frames, centroid distance, tracker cost, confidence, and
+quality flags. It does not replace the sparse matrix as the canonical topology.
+
+`assignments` is a derived, row-aligned display/query cache with one row per
+observation. It contains `parent_observation_id`, `lineage_id`, `tracklet_id`,
+`generation`, `depth`, and `n_children`. The terms are deliberately distinct:
+
+- **lineage**: one rooted, potentially branching family; every observation has
+  exactly one lineage id;
+- **tracklet**: one maximal non-branching segment; every observation has exactly
+  one tracklet id;
+- **trajectory**: a root-to-observation history or maximal root-to-leaf path;
+  branch ancestors may participate in multiple trajectories, so trajectory ids
+  are not a one-value-per-observation assignment.
+
+The sparse graph is sufficient to regenerate `assignments`, obtain children
+from CSR rows, obtain the unique parent from the assignment cache or a CSC
+view, compute lineage components, trace histories, enumerate maximal
+root-to-leaf trajectories, and find the ancestors/descendants of a SITE viewer
+selection. `Trajectory.read_tracks(...)` returns the dependency-light graph;
+`graph.adjacency.to_scipy()` returns a scipy CSR matrix when scipy is installed.
+`graph.maximal_trajectory_matrix()` uses sparse matrix products to return a
+leaf-by-observation boolean membership matrix for all maximal root-to-leaf
+trajectories; the dependency-light list fallback remains available as
+`graph.maximal_trajectories()`.
+
+The first tracker, `track_minimum_centroid_distance`, preserves the legacy
+`get_lineage_mindist` behavior: each child independently chooses the nearest
+centroid in exactly the preceding frame when its scaled distance is strictly
+below `max_distance`. Independent child choices intentionally allow divisions,
+over-segmentation, and ambiguous forward branches. A future optimal-transport
+boundary tracker will write the same graph contract and populate OT cost in
+the edge metadata.
+
+Batch tracking uses the same dry-run and JSONL worker conventions as object
+indexing and feature extraction:
+
+```bash
+python -m celltraj2.runners.track_centroids tracking_job.json
+```
+
+Saved runs record `/runs/tracking/<run_id>/run.json` and one frame summary per
+stored observation frame. Test jobs set `save_outputs=false`, calculate the
+same graph and linked/unlinked counts, and leave the H5 unchanged. Saved jobs
+refuse to replace an existing track set unless `overwrite=true`.
+
 The SITE ROI viewer uses this contract without changing the stored label
 frames. For display it may render a binary foreground overlay, so all objects
 in the active object set share one chosen color instead of napari assigning a
@@ -188,8 +261,8 @@ array remains the selection source: click position gives `label_id`, the lookup
 array gives `observation_id`, and the observation row provides the side-panel
 object information. Feature coloring keeps the same selection source, reads a
 stored feature column for each `observation_id`, and replaces only the display
-overlay with a feature-valued image. Lineage coloring should keep the same row
-spine when track tables are added.
+overlay with a feature-valued image. Lineage coloring and persistent branch
+selection use that same row spine plus the selected track graph.
 
 ## Feature Sets
 

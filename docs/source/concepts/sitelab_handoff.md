@@ -282,6 +282,39 @@ events, `feature_frame_summary` events report the file, frame, feature column,
 mean finite value, object count, finite count, and NaN count, which lets the SITE
 run window show live per-feature progress.
 
+## Tracking Shape
+
+After choosing an active indexed object set, SITE launches minimum-centroid
+tracking through:
+
+```bash
+python -m celltraj2.runners.track_centroids tracking_job.json
+```
+
+Minimal job shape:
+
+```json
+{
+  "job_id": "track_20260710_example",
+  "project_root": "project",
+  "save_outputs": true,
+  "files": [
+    {
+      "h5_path": "cell_files/sample/sample_XY001_ROI001.ct2.h5",
+      "object_set": "cyto_epithelial",
+      "track_set": "centroid_mindist",
+      "method": "minimum_centroid_distance",
+      "max_distance": 5.0,
+      "coordinate_scale": [1.0, 1.0, 1.0]
+    }
+  ]
+}
+```
+
+The coordinate scale is ordered Z/Y/X. The worker emits per-frame object,
+linked, and unlinked counts. Saved runs write the sparse graph under the object
+set and provenance under `/runs/tracking/<run_id>/`; dry runs do neither.
+
 ## SITE ROI Viewer Consumption
 
 SITE ROI viewers discover the per-ROI H5 next to the extracted ROI cache by
@@ -292,14 +325,17 @@ roi_files/<dataset>/<roi_id>.ome.zarr
 cell_files/<dataset>/<roi_id>.ct2.h5
 ```
 
-The `SITE object sets` panel reads `/labels/<label_set>/frame_<n>`,
+The `SITE objects` panel reads `/labels/<label_set>/frame_<n>`,
 `/masks/<mask_set>/frame_<n>`, `/object_sets/<object_set>/object_set.json`, and
 stored feature schemas to offer available H5 labels, masks, indexed object
 sets, and feature columns. Standalone labels and masks can be loaded directly
-with napari's default Labels/Image-layer display. Indexed object sets display
-the current frame as a single-color overlay by default, while retaining the
-original integer label array for selection. When the user clicks an indexed
-object, SITE resolves:
+with napari's default Labels/Image-layer display. `Add to view` keeps multiple
+selected H5 sources as separate layers named from their stored H5 names, and all
+added layers refresh on frame changes. Selecting one of those managed napari
+layers makes it the current panel target. Indexed object sets display the
+current frame as a single-color overlay by default, while retaining the original
+integer label array for selection. When the user clicks an indexed object, SITE
+resolves:
 
 ```text
 label_id -> lookup[label_id] -> observation_id -> observations[observation_id - 1]
@@ -310,9 +346,24 @@ and displays the observation row plus any stored feature values for that
 set as one color, by continuous object id, or by a selected feature column. For
 feature coloring, SITE creates a feature-valued display image for the current
 frame; pixels outside indexed objects are `NaN`, and the integer label frame
-remains the click-selection source. Lineage coloring and trajectory
-highlighting should use the same lookup/observation row spine when tracking is
-added.
+remains the click-selection source. Stored track sets now use the same
+lookup/observation row spine: SITE colors by row-aligned `lineage_id` and uses
+the CSR graph plus unique-parent cache to retain an observation's ancestors and
+descendants as frames change. Tracklet assignments can also be converted to
+napari-ready track rows and split-graph metadata.
+
+The SITE Plot workflow is another read-only consumer of this contract. Object
+count uses the number of `/object_sets/<object_set>/observations` rows per
+frame. Feature-mean traces group the row-aligned
+`features/<feature_set>/values` column by the observation table's `frame`
+column. Missing lookup frames remain missing instead of being treated as zero,
+and acquisition `time_interval_s` from copied metadata is used for an hours
+axis when it is consistent across selected H5 files. SITE also reads
+single-object feature distributions from the same row-aligned feature tables:
+selected frames are filtered through the observation table's `frame` column,
+then finite feature values are pooled by treatment for violin plots. Plot
+images and reproducibility sidecars live in SITE outputs, not inside celltraj2
+H5 files.
 
 ## One-Based Frames
 

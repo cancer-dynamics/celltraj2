@@ -120,6 +120,39 @@ class ObjectSet:
     def feature_sets(self) -> list[str]:
         return self.trajectory.store.list_feature_sets(self.name)
 
+    def track_minimum_centroid_distance(
+        self,
+        *,
+        max_distance: float,
+        track_set: str = "centroid_mindist",
+        coordinate_scale: Sequence[float] | None = None,
+        overwrite: bool = False,
+        save_outputs: bool = True,
+        run_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> Any:
+        """Track observations with the legacy-compatible nearest-centroid rule."""
+
+        from celltraj2.tracking import track_minimum_centroid_distance
+
+        return track_minimum_centroid_distance(
+            self.trajectory,
+            self.name,
+            max_distance=max_distance,
+            track_set=track_set,
+            coordinate_scale=coordinate_scale,
+            overwrite=overwrite,
+            save_outputs=save_outputs,
+            run_id=run_id,
+            metadata=metadata,
+        )
+
+    def track_sets(self) -> list[str]:
+        return self.trajectory.store.list_track_sets(self.name)
+
+    def read_tracks(self, track_set: str) -> Any:
+        return self.trajectory.store.read_track_graph(self.name, track_set)
+
 
 class Trajectory:
     """Open and interact with one celltraj2 per-ROI analysis H5."""
@@ -303,6 +336,37 @@ class Trajectory:
 
     def feature_sets(self, object_set: str) -> list[str]:
         return self.store.list_feature_sets(object_set)
+
+    def track_minimum_centroid_distance(
+        self,
+        object_set: str,
+        *,
+        max_distance: float,
+        track_set: str = "centroid_mindist",
+        coordinate_scale: Sequence[float] | None = None,
+        overwrite: bool = False,
+        save_outputs: bool = True,
+        run_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> Any:
+        return self.object_set(object_set).track_minimum_centroid_distance(
+            max_distance=max_distance,
+            track_set=track_set,
+            coordinate_scale=coordinate_scale,
+            overwrite=overwrite,
+            save_outputs=save_outputs,
+            run_id=run_id,
+            metadata=metadata,
+        )
+
+    def track_sets(self, object_set: str) -> list[str]:
+        return self.store.list_track_sets(object_set)
+
+    def read_tracks(self, object_set: str, track_set: str) -> Any:
+        return self.store.read_track_graph(object_set, track_set)
+
+    def tracking_runs(self) -> list[str]:
+        return self.store.list_tracking_runs()
 
     def extract_features(
         self,

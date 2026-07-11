@@ -106,6 +106,7 @@ class TrajectoryStore:
             "runs/segmentation",
             "runs/object_indexing",
             "runs/feature_extraction",
+            "runs/tracking",
         ):
             self._h5.require_group(name)
         self.write_json("/images/raw/metadata.json", {"storage": "frame_based", "frame_index_base": 1}, overwrite=True)
@@ -362,6 +363,124 @@ class TrajectoryStore:
         if "object_sets" not in self._h5:
             return []
         return sorted(str(key) for key in self._h5["object_sets"].keys())
+
+    def write_track_graph(
+        self,
+        object_set: str,
+        track_set: str,
+        *,
+        adjacency: Any,
+        links: Any,
+        assignments: Any,
+        schema: Mapping[str, Any],
+        overwrite: bool = False,
+    ) -> str:
+        """Write a canonical CSR lineage graph and its derived caches."""
+
+        object_name = validate_name(object_set, kind="object set")
+        track_name = validate_name(track_set, kind="track set")
+        self.require_object_set(object_name)
+        group_path = f"object_sets/{object_name}/tracks/{track_name}"
+        if group_path in self._h5:
+            if not overwrite:
+                raise FileExistsError(f"/{group_path}")
+            del self._h5[group_path]
+        group = self._h5.require_group(group_path)
+        adjacency_group = group.require_group("adjacency")
+        adjacency_group.attrs["format"] = "csr"
+        adjacency_group.attrs["orientation"] = "row_parent_column_child"
+        adjacency_group.attrs["index_base"] = 0
+        adjacency_group.attrs["shape"] = tuple(int(value) for value in adjacency.shape)
+        adjacency_group.create_dataset("indptr", data=adjacency.indptr, compression="gzip")
+        adjacency_group.create_dataset("indices", data=adjacency.indices, compression="gzip")
+        adjacency_group.create_dataset("data", data=adjacency.data, compression="gzip")
+        links_dataset = group.create_dataset("links", data=links, compression="gzip")
+        links_dataset.attrs["observation_id_base"] = 1
+        assignments_dataset = group.create_dataset("assignments", data=assignments, compression="gzip")
+        assignments_dataset.attrs["row_alignment"] = f"/object_sets/{object_name}/observations"
+        self.write_json(f"/{group_path}/schema.json", dict(schema), overwrite=True)
+        return f"/{group_path}"
+
+    def read_track_graph(self, object_set: str, track_set: str) -> Any:
+        """Load one stored lineage graph without requiring scipy."""
+
+        from celltraj2.tracking import SparseAdjacency, TrackGraph
+
+        object_name = validate_name(object_set, kind="object set")
+        track_name = validate_name(track_set, kind="track set")
+        group_path = f"object_sets/{object_name}/tracks/{track_name}"
+        group = self._h5[group_path]
+        adjacency_group = group["adjacency"]
+        shape = tuple(int(value) for value in adjacency_group.attrs["shape"])
+        adjacency = SparseAdjacency(
+            indptr=adjacency_group["indptr"][()],
+            indices=adjacency_group["indices"][()],
+            data=adjacency_group["data"][()],
+            shape=(shape[0], shape[1]),
+        )
+        return TrackGraph(
+            adjacency=adjacency,
+            links=group["links"][()],
+            assignments=group["assignments"][()],
+            schema=self.read_json(f"/{group_path}/schema.json"),
+        )
+
+    def list_track_sets(self, object_set: str) -> list[str]:
+        object_name = validate_name(object_set, kind="object set")
+        path = f"object_sets/{object_name}/tracks"
+        if path not in self._h5:
+            return []
+        return sorted(str(key) for key in self._h5[path].keys())
+
+    def has_track_set(self, object_set: str, track_set: str) -> bool:
+        object_name = validate_name(object_set, kind="object set")
+        track_name = validate_name(track_set, kind="track set")
+        return f"object_sets/{object_name}/tracks/{track_name}/adjacency/indptr" in self._h5
+
+    def write_tracking_run(
+        self,
+        run_id: str,
+        data: Mapping[str, Any],
+        *,
+        overwrite: bool = True,
+    ) -> str:
+        """Write top-level metadata for one tracking run."""
+
+        name = validate_name(run_id, kind="tracking run")
+        group = self._h5.require_group(f"runs/tracking/{name}")
+        group.require_group("frames")
+        self.write_json(f"/runs/tracking/{name}/run.json", dict(data), overwrite=overwrite)
+        return f"/runs/tracking/{name}/run.json"
+
+    def read_tracking_run(self, run_id: str) -> Any:
+        name = validate_name(run_id, kind="tracking run")
+        return self.read_json(f"/runs/tracking/{name}/run.json")
+
+    def write_tracking_frame_result(
+        self,
+        run_id: str,
+        frame: int,
+        data: Mapping[str, Any],
+        *,
+        overwrite: bool = True,
+    ) -> str:
+        """Write tracking summary metadata for one target frame."""
+
+        name = validate_name(run_id, kind="tracking run")
+        self._h5.require_group(f"runs/tracking/{name}/frames")
+        path = f"/runs/tracking/{name}/frames/{frame_key(frame)}.json"
+        self.write_json(path, dict(data), overwrite=overwrite)
+        return path
+
+    def read_tracking_frame_result(self, run_id: str, frame: int) -> Any:
+        name = validate_name(run_id, kind="tracking run")
+        return self.read_json(f"/runs/tracking/{name}/frames/{frame_key(frame)}.json")
+
+    def list_tracking_runs(self) -> list[str]:
+        path = "runs/tracking"
+        if path not in self._h5:
+            return []
+        return sorted(str(key) for key in self._h5[path].keys())
 
     def write_feature_set(
         self,

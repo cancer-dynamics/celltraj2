@@ -108,14 +108,25 @@ be used without importing SITE or Pydantic.
 - Optional runner:
   `python -m celltraj2.runners.extract_features job.json`.
 
-## Next Phase: Tracks And Interactive Analysis
+## In Progress Phase 10: Tracks And Interactive Analysis
 
-The next layer should build on saved H5 files rather than redesign storage:
+The first tracking layer builds on the saved observation row spine:
 
-- design tracking IDs and frame-to-frame lineage tables under
-  `/object_sets/<object_set>/tracks/<track_set>/`;
-- add lineage/trajectory coloring that uses the same
+- canonical parent-to-child CSR adjacency storage under
+  `/object_sets/<object_set>/tracks/<track_set>/adjacency/`;
+- edge metadata in `links` and row-aligned lineage/tracklet caches in
+  `assignments`;
+- dependency-light ancestry, descendants, lineage, selection-tree, and maximal
+  root-to-leaf trajectory queries;
+- legacy-compatible minimum-centroid-distance tracking with optional Z/Y/X
+  coordinate scaling;
+- JSON batch worker, dry-run output, overwrite protection, JSONL events, and
+  `/runs/tracking/` provenance;
+- SITE lineage coloring and cross-frame selection consume the same
   `label_id -> observation_id -> row` lookup as feature coloring;
+- SITE Test/Run/Queue launcher, track-set selection, and napari tracklet
+  rendering;
+- next: optimal-transport boundary tracking writing the same sparse graph;
 - launch exploratory notebooks or marimo environments with active H5s,
   treatment groups, feature tables, and replicate metadata preloaded;
 - keep a clean backend API that works in notebooks without importing SITE.
