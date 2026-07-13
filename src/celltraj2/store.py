@@ -72,6 +72,9 @@ class TrajectoryStore:
         store.write_json("/metadata/treatments.json", metadata.treatments, overwrite=True)
         if metadata.image_source is not None:
             store.write_image_source(metadata.image_source)
+        from celltraj2.registration import initialize_identity_registration
+
+        initialize_identity_registration(store, metadata)
         return store
 
     @classmethod
@@ -100,12 +103,14 @@ class TrajectoryStore:
             "images/raw",
             "labels",
             "masks",
+            "registrations",
             "object_sets",
             "cells",
             "features",
             "runs/segmentation",
             "runs/object_indexing",
             "runs/feature_extraction",
+            "runs/registration",
             "runs/tracking",
         ):
             self._h5.require_group(name)
@@ -436,6 +441,134 @@ class TrajectoryStore:
         object_name = validate_name(object_set, kind="object set")
         track_name = validate_name(track_set, kind="track set")
         return f"object_sets/{object_name}/tracks/{track_name}/adjacency/indptr" in self._h5
+
+    def write_registration_set(self, registration: Any, *, overwrite: bool = False) -> str:
+        """Write one ROI-level native-to-registered transform set."""
+
+        name = validate_name(registration.name, kind="registration set")
+        group_path = f"registrations/{name}"
+        if group_path in self._h5:
+            if not overwrite:
+                raise FileExistsError(f"/{group_path}")
+            del self._h5[group_path]
+        group = self._h5.require_group(group_path)
+        frames = group.create_dataset("frames", data=registration.frames, compression="gzip")
+        frames.attrs["frame_index_base"] = 1
+        transforms = group.create_dataset("transforms", data=registration.transforms, compression="gzip")
+        transforms.attrs["direction"] = "native_roi_physical_to_registered_roi_physical"
+        transforms.attrs["matrix_convention"] = "homogeneous_column_vector"
+        group.create_dataset("frame_status", data=registration.frame_status, compression="gzip")
+        group.create_dataset("pairwise_results", data=registration.pairwise_results, compression="gzip")
+        self.write_json(f"/{group_path}/schema.json", dict(registration.schema), overwrite=True)
+        self.write_json(f"/{group_path}/canvas.json", dict(registration.canvas), overwrite=True)
+        return f"/{group_path}"
+
+    def read_registration_set(self, registration_set: str) -> Any:
+        """Read one stored registration set."""
+
+        from celltraj2.registration import RegistrationSet
+
+        name = validate_name(registration_set, kind="registration set")
+        group_path = f"registrations/{name}"
+        group = self._h5[group_path]
+        return RegistrationSet(
+            name=name,
+            frames=group["frames"][()],
+            transforms=group["transforms"][()],
+            frame_status=group["frame_status"][()],
+            pairwise_results=group["pairwise_results"][()],
+            schema=self.read_json(f"/{group_path}/schema.json"),
+            canvas=self.read_json(f"/{group_path}/canvas.json"),
+        )
+
+    def list_registration_sets(self) -> list[str]:
+        path = "registrations"
+        if path not in self._h5:
+            return []
+        return sorted(str(key) for key in self._h5[path].keys() if str(key) != "active.json")
+
+    def has_registration_set(self, registration_set: str) -> bool:
+        name = validate_name(registration_set, kind="registration set")
+        return f"registrations/{name}/transforms" in self._h5
+
+    def set_active_registration(
+        self,
+        registration_set: str,
+        *,
+        reason: str | None = None,
+        run_id: str | None = None,
+    ) -> str:
+        """Select the registration used by default for viewing and analysis."""
+
+        name = validate_name(registration_set, kind="registration set")
+        if not self.has_registration_set(name):
+            raise FileNotFoundError(f"/registrations/{name}")
+        payload = {"registration_set": name}
+        if reason:
+            payload["reason"] = str(reason)
+        if run_id:
+            payload["run_id"] = str(run_id)
+        self.write_json("/registrations/active.json", payload, overwrite=True)
+        return "/registrations/active.json"
+
+    def active_registration_name(self) -> str | None:
+        path = "registrations/active.json"
+        if path not in self._h5:
+            return "identity" if self.has_registration_set("identity") else None
+        value = self.read_json(f"/{path}")
+        name = str(value.get("registration_set") or "") if isinstance(value, Mapping) else ""
+        return name or None
+
+    def read_active_registration(self) -> Any:
+        name = self.active_registration_name()
+        if name is None:
+            raise FileNotFoundError("No active registration set is stored")
+        return self.read_registration_set(name)
+
+    def write_registration_run(
+        self,
+        run_id: str,
+        data: Mapping[str, Any],
+        *,
+        overwrite: bool = True,
+    ) -> str:
+        """Write top-level provenance for one registration run."""
+
+        name = validate_name(run_id, kind="registration run")
+        group = self._h5.require_group(f"runs/registration/{name}")
+        group.require_group("frames")
+        self.write_json(f"/runs/registration/{name}/run.json", dict(data), overwrite=overwrite)
+        return f"/runs/registration/{name}/run.json"
+
+    def read_registration_run(self, run_id: str) -> Any:
+        name = validate_name(run_id, kind="registration run")
+        return self.read_json(f"/runs/registration/{name}/run.json")
+
+    def write_registration_frame_result(
+        self,
+        run_id: str,
+        frame: int,
+        data: Mapping[str, Any],
+        *,
+        overwrite: bool = True,
+    ) -> str:
+        """Write one frame's registration status and absolute shift."""
+
+        name = validate_name(run_id, kind="registration run")
+        self._h5.require_group(f"runs/registration/{name}/frames")
+        path = f"/runs/registration/{name}/frames/{frame_key(frame)}.json"
+        self.write_json(path, dict(data), overwrite=overwrite)
+        return path
+
+    def read_registration_frame_result(self, run_id: str, frame: int) -> Any:
+        name = validate_name(run_id, kind="registration run")
+        return self.read_json(f"/runs/registration/{name}/frames/{frame_key(frame)}.json")
+
+    def list_registration_runs(self) -> list[str]:
+        path = "runs/registration"
+        if path not in self._h5:
+            return []
+        return sorted(str(key) for key in self._h5[path].keys())
 
     def write_tracking_run(
         self,

@@ -10,6 +10,10 @@ API Reference
    batch
    features
    feature_extraction
+   registration
+   registration_batch
+   tracking
+   tracking_batch
    store
    sources
    trajectory

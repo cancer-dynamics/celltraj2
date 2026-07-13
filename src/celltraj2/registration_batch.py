@@ -1,4 +1,4 @@
-"""Headless batch centroid tracking for celltraj2 files."""
+"""Headless batch global registration for celltraj2 files."""
 
 from __future__ import annotations
 
@@ -9,8 +9,8 @@ from pathlib import Path
 from typing import Any
 
 from celltraj2.object_indexing import JsonlReporter
+from celltraj2.registration import default_registration_run_id, register_global_translation
 from celltraj2.schema import utc_now_iso
-from celltraj2.tracking import default_tracking_run_id, track_minimum_centroid_distance
 from celltraj2.trajectory import Trajectory
 
 
@@ -29,58 +29,65 @@ def _json_safe(value: Any) -> Any:
 
 
 @dataclass(frozen=True)
-class TrackingFileJob:
-    """Centroid-tracking work for one trajectory H5."""
+class RegistrationFileJob:
+    """Global-registration work for one trajectory H5."""
 
     h5_path: Path
     object_set: str
-    track_set: str = "centroid_mindist"
-    method: str = "minimum_centroid_distance"
-    max_distance: float = 5.0
+    registration_set: str = "global_registration"
+    method: str = "pairwise_symmetric_nearest_neighbor_translation"
+    max_shift_per_frame: float = 10.0
+    grid_step: float = 1.0
     coordinate_scale: tuple[float, float, float] = (1.0, 1.0, 1.0)
-    registration_set: str | None = None
+    distance_unit: str = "pixel"
+    contact_transform: bool = False
+    contact_r0: float = 100.0
+    contact_d0: float = 100.0
     enabled: bool = True
     overwrite: bool = False
     save_outputs: bool = True
+    set_active: bool = True
     metadata: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
-    def from_dict(cls, data: Mapping[str, Any]) -> "TrackingFileJob":
+    def from_dict(cls, data: Mapping[str, Any]) -> "RegistrationFileJob":
         payload = dict(data)
         path_value = payload.get("h5_path", payload.get("path", payload.get("cell_file")))
         if path_value in (None, ""):
-            raise ValueError("Tracking file job requires h5_path")
+            raise ValueError("Registration file job requires h5_path")
         object_set = str(payload.get("object_set") or "")
         if not object_set:
-            raise ValueError("Tracking file job requires object_set")
-        method = str(payload.get("method") or "minimum_centroid_distance").lower()
+            raise ValueError("Registration file job requires object_set")
+        method = str(payload.get("method") or "pairwise_symmetric_nearest_neighbor_translation").lower()
         aliases = {
-            "centroid": "minimum_centroid_distance",
-            "mindist": "minimum_centroid_distance",
-            "centroid_mindist": "minimum_centroid_distance",
+            "global_translation": "pairwise_symmetric_nearest_neighbor_translation",
+            "pairwise_distance": "pairwise_symmetric_nearest_neighbor_translation",
         }
         method = aliases.get(method, method)
-        if method != "minimum_centroid_distance":
-            raise ValueError(f"Unsupported tracking method {method!r}")
+        if method != "pairwise_symmetric_nearest_neighbor_translation":
+            raise ValueError(f"Unsupported registration method {method!r}")
         scale_value = payload.get("coordinate_scale", (1.0, 1.0, 1.0))
         if not isinstance(scale_value, Sequence) or isinstance(scale_value, (str, bytes)) or len(scale_value) != 3:
             raise ValueError("coordinate_scale must contain Z,Y,X values")
         scale = tuple(float(value) for value in scale_value)
-        max_distance = float(payload.get("max_distance", payload.get("distcut", 5.0)))
+        metadata = dict(payload.get("metadata") or {})
         return cls(
             h5_path=Path(path_value),
             object_set=object_set,
-            track_set=str(payload.get("track_set") or "centroid_mindist"),
+            registration_set=str(payload.get("registration_set") or "global_registration"),
             method=method,
-            max_distance=max_distance,
+            max_shift_per_frame=float(payload.get("max_shift_per_frame", payload.get("max_shift", 10.0))),
+            grid_step=float(payload.get("grid_step", 1.0)),
             coordinate_scale=(scale[0], scale[1], scale[2]),
-            registration_set=(
-                None if payload.get("registration_set") in (None, "") else str(payload.get("registration_set"))
-            ),
+            distance_unit=str(payload.get("distance_unit") or metadata.get("distance_unit") or "pixel"),
+            contact_transform=bool(payload.get("contact_transform", False)),
+            contact_r0=float(payload.get("contact_r0", 100.0)),
+            contact_d0=float(payload.get("contact_d0", 100.0)),
             enabled=bool(payload.get("enabled", True)),
             overwrite=bool(payload.get("overwrite", False)),
             save_outputs=bool(payload.get("save_outputs", not bool(payload.get("dry_run", False)))),
-            metadata=dict(payload.get("metadata") or {}),
+            set_active=bool(payload.get("set_active", True)),
+            metadata=metadata,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -88,11 +95,11 @@ class TrackingFileJob:
 
 
 @dataclass(frozen=True)
-class TrackingBatchJob:
-    """A complete SITE-controlled centroid-tracking job."""
+class RegistrationBatchJob:
+    """A complete SITE-controlled global-registration job."""
 
-    job_id: str = field(default_factory=default_tracking_run_id)
-    files: list[TrackingFileJob] = field(default_factory=list)
+    job_id: str = field(default_factory=default_registration_run_id)
+    files: list[RegistrationFileJob] = field(default_factory=list)
     project_root: Path | None = None
     overwrite: bool = False
     save_outputs: bool = True
@@ -101,15 +108,15 @@ class TrackingBatchJob:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
-    def from_dict(cls, data: Mapping[str, Any]) -> "TrackingBatchJob":
+    def from_dict(cls, data: Mapping[str, Any]) -> "RegistrationBatchJob":
         payload = dict(data)
         files = [
-            item if isinstance(item, TrackingFileJob) else TrackingFileJob.from_dict(item)
+            item if isinstance(item, RegistrationFileJob) else RegistrationFileJob.from_dict(item)
             for item in payload.get("files", [])
         ]
         root = payload.get("project_root", payload.get("root"))
         return cls(
-            job_id=str(payload.get("job_id") or default_tracking_run_id()),
+            job_id=str(payload.get("job_id") or default_registration_run_id()),
             files=files,
             project_root=None if root in (None, "") else Path(root),
             overwrite=bool(payload.get("overwrite", False)),
@@ -120,10 +127,10 @@ class TrackingBatchJob:
         )
 
     @classmethod
-    def load(cls, path: str | Path) -> "TrackingBatchJob":
+    def load(cls, path: str | Path) -> "RegistrationBatchJob":
         return cls.from_dict(json.loads(Path(path).read_text(encoding="utf-8")))
 
-    def resolved_path(self, file_job: TrackingFileJob) -> Path:
+    def resolved_path(self, file_job: RegistrationFileJob) -> Path:
         path = Path(file_job.h5_path)
         if path.is_absolute():
             return path
@@ -136,16 +143,14 @@ class TrackingBatchJob:
 
 
 @dataclass
-class BatchTrackingSummary:
-    """Counts accumulated during a batch tracking run."""
-
+class BatchRegistrationSummary:
     job_id: str
     files: int = 0
     completed: int = 0
     skipped: int = 0
     failed: int = 0
-    observations: int = 0
-    links: int = 0
+    frames: int = 0
+    estimated_frames: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return _json_safe(self)
@@ -154,20 +159,20 @@ class BatchTrackingSummary:
 Reporter = Callable[[Mapping[str, Any]], None]
 
 
-def load_tracking_job(path: str | Path) -> TrackingBatchJob:
-    return TrackingBatchJob.load(path)
+def load_registration_job(path: str | Path) -> RegistrationBatchJob:
+    return RegistrationBatchJob.load(path)
 
 
-def run_batch_tracking(
-    job: TrackingBatchJob | Mapping[str, Any],
+def run_batch_registration(
+    job: RegistrationBatchJob | Mapping[str, Any],
     *,
     reporter: Reporter | None = None,
-) -> BatchTrackingSummary:
-    """Run a batch minimum-centroid-distance tracking job."""
+) -> BatchRegistrationSummary:
+    """Run a batch pairwise-centroid global-registration job."""
 
-    batch_job = job if isinstance(job, TrackingBatchJob) else TrackingBatchJob.from_dict(job)
+    batch_job = job if isinstance(job, RegistrationBatchJob) else RegistrationBatchJob.from_dict(job)
     emit = reporter or (lambda _event: None)
-    summary = BatchTrackingSummary(job_id=batch_job.job_id)
+    summary = BatchRegistrationSummary(job_id=batch_job.job_id)
     emit({"event": "job_started", "job_id": batch_job.job_id, "files": len(batch_job.files)})
     for file_job in batch_job.files:
         if not file_job.enabled:
@@ -182,12 +187,12 @@ def run_batch_tracking(
                 "job_id": batch_job.job_id,
                 "h5_path": str(h5_path),
                 "object_set": file_job.object_set,
-                "track_set": file_job.track_set,
-                "method": file_job.method,
-                "max_distance": file_job.max_distance,
-                "coordinate_scale": list(file_job.coordinate_scale),
-                "distance_unit": str(file_job.metadata.get("distance_unit") or "scaled_coordinate_unit"),
                 "registration_set": file_job.registration_set,
+                "method": file_job.method,
+                "max_shift_per_frame": file_job.max_shift_per_frame,
+                "grid_step": file_job.grid_step,
+                "coordinate_scale": list(file_job.coordinate_scale),
+                "distance_unit": file_job.distance_unit,
                 "save_outputs": save_outputs,
             }
         )
@@ -203,10 +208,10 @@ def run_batch_tracking(
 
 
 def _run_file_job(
-    batch_job: TrackingBatchJob,
-    file_job: TrackingFileJob,
+    batch_job: RegistrationBatchJob,
+    file_job: RegistrationFileJob,
     h5_path: Path,
-    summary: BatchTrackingSummary,
+    summary: BatchRegistrationSummary,
     emit: Reporter,
 ) -> None:
     save_outputs = bool(batch_job.save_outputs and file_job.save_outputs)
@@ -215,55 +220,60 @@ def _run_file_job(
     with Trajectory(h5_path, mode=mode) as trajectory:
         if not trajectory.object_set(file_job.object_set).has_observations():
             raise FileNotFoundError(f"/object_sets/{file_job.object_set}/observations")
-        if save_outputs and trajectory.store.has_track_set(file_job.object_set, file_job.track_set) and not overwrite:
+        if save_outputs and trajectory.store.has_registration_set(file_job.registration_set) and not overwrite:
             summary.skipped += 1
             emit(
                 {
                     "event": "file_skipped",
                     "job_id": batch_job.job_id,
                     "h5_path": str(h5_path),
-                    "object_set": file_job.object_set,
-                    "track_set": file_job.track_set,
-                    "reason": "track set already exists",
+                    "registration_set": file_job.registration_set,
+                    "reason": "registration set already exists",
                 }
             )
             return
-        result = track_minimum_centroid_distance(
+        result = register_global_translation(
             trajectory,
             file_job.object_set,
-            max_distance=file_job.max_distance,
-            track_set=file_job.track_set,
-            coordinate_scale=file_job.coordinate_scale,
             registration_set=file_job.registration_set,
+            max_shift_per_frame=file_job.max_shift_per_frame,
+            grid_step=file_job.grid_step,
+            coordinate_scale=file_job.coordinate_scale,
+            distance_unit=file_job.distance_unit,
+            contact_transform=file_job.contact_transform,
+            contact_r0=file_job.contact_r0,
+            contact_d0=file_job.contact_d0,
             overwrite=overwrite,
             save_outputs=save_outputs,
+            set_active=file_job.set_active,
             run_id=batch_job.job_id,
             metadata={**batch_job.metadata, **file_job.metadata},
         )
+        payload = result.to_dict()
         summary.completed += 1
-        summary.observations += result.graph.observation_count
-        summary.links += result.link_count
-        for frame, counts in result.frame_counts.items():
+        summary.frames += int(payload["frame_count"])
+        summary.estimated_frames += int(payload["estimated_frame_count"])
+        for frame in result.registration.frames.tolist():
             emit(
                 {
-                    "event": "tracking_frame_summary",
+                    "event": "registration_frame_summary",
                     "job_id": batch_job.job_id,
                     "h5_path": str(h5_path),
-                    "object_set": result.object_set,
-                    "track_set": result.track_set,
+                    "registration_set": result.registration.name,
                     "frame": int(frame),
+                    "status": result.registration.status_for_frame(frame),
+                    "translation_zyx": result.registration.translation_zyx(frame).tolist(),
                     "saved": save_outputs,
-                    **counts,
                 }
             )
-        emit({"event": "file_completed", "job_id": batch_job.job_id, "h5_path": str(h5_path), **result.to_dict()})
+        emit({"event": "file_completed", "job_id": batch_job.job_id, "h5_path": str(h5_path), **payload})
 
 
 __all__ = [
-    "BatchTrackingSummary",
+    "BatchRegistrationSummary",
     "JsonlReporter",
-    "TrackingBatchJob",
-    "TrackingFileJob",
-    "load_tracking_job",
-    "run_batch_tracking",
+    "RegistrationBatchJob",
+    "RegistrationFileJob",
+    "load_registration_job",
+    "run_batch_registration",
 ]

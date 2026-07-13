@@ -132,12 +132,39 @@ The first tracking layer builds on the saved observation row spine:
 - completed first-pass scope: sparse storage/query, minimum-distance worker,
   SITE launcher, lineage coloring, tracklets, and persistent branch selection.
 
+## Completed Phase 11: Global Frame Registration
+
+- Every new H5 receives a stored identity registration and active pointer.
+- ROI-level registration sets store native-to-registered homogeneous matrices,
+  per-frame status, pairwise estimator results, an uncropped display canvas,
+  method/calibration metadata, and a stable digest.
+- The first estimator matches legacy cell-position registration: symmetric
+  nearest-neighbor distance minimization over a bounded brute-force grid,
+  followed by continuous scipy refinement.
+- Registration is calibrated automatically in microns, including axial voxel
+  spacing for 3D data, with a clearly recorded pixel fallback.
+- Missing object frames inherit the last known absolute transform and remain
+  visibly marked as inherited rather than being treated as estimated.
+- JSON Test/Run/Queue workers write `/runs/registration/` provenance when
+  saving.
+- Minimum-centroid tracking applies the selected/active registration before
+  measuring link distance and records the registration name and digest.
+- SITE applies active transforms to raw images, labels, masks, object overlays,
+  selection overlays, and tracklet coordinates without resampling stored
+  arrays; the navigator exposes the active set and current frame shift.
+
+Future between-frame feature calculations, including motility, must consume
+the same registration set and record the same name/digest dependency. More
+general affine/non-rigid methods may extend the stored matrix contract later;
+they must not create a separate coordinate convention.
+
 ## Deferred Next Tracking Pass
 
 - Establish the boundary-analysis/library machinery first.
 - Implement optimal-transport boundary tracking using the same sparse graph,
-  assignments, run provenance, distance-unit convention, and SITE viewer
-  representation; do not introduce a parallel trajectory storage shape.
+  assignments, run provenance, distance-unit convention, registration
+  dependency, and SITE viewer representation; do not introduce a parallel
+  trajectory storage shape.
 - Populate OT cost/confidence/quality edge metadata while retaining the unique
   backward parent and forward branching invariants.
 

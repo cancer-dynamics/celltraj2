@@ -60,6 +60,18 @@ The H5 stores both:
     frame_1              bool or uint8 masks, usually Z,Y,X
     frame_2
 
+/registrations/
+  active.json             selected transform set for default consumers
+  identity/
+    frames
+    transforms
+    frame_status
+    pairwise_results
+    schema.json
+    canvas.json
+  <registration_set>/
+    ...
+
 /object_sets/
   <object_set>/
     object_set.json
@@ -100,6 +112,12 @@ The H5 stores both:
         frame_1.json
         frame_2.json
   feature_extraction/
+    <run_id>/
+      run.json
+      frames/
+        frame_1.json
+        frame_2.json
+  registration/
     <run_id>/
       run.json
       frames/
@@ -190,6 +208,68 @@ observation_id -> track assignment
 track_id -> linked observations across frames
 ```
 
+## Global Registration
+
+Global frame transforms are ROI-level data under `/registrations/`; they are
+not owned by a particular track set. Every newly created celltraj2 H5 contains
+`/registrations/identity` and selects it in `/registrations/active.json`, so
+viewing and downstream analysis always have an explicit coordinate transform.
+Existing files without that group are interpreted as identity until a set is
+stored.
+
+One registration set contains:
+
+- `frames`: one-based local frame ids;
+- `transforms`: one homogeneous matrix per frame;
+- `frame_status`: row-aligned status codes such as `reference`, `estimated`,
+  `identity`, `inherited`, or `failed`;
+- `pairwise_results`: source/target frames, object counts, coarse/refined
+  objective values, relative Z/Y/X shift, optimizer status, and quality flags;
+- `schema.json`: method, units, axes, calibration, parameters, transform
+  direction, completeness, and a stable registration digest;
+- `canvas.json`: native/output shape, registered origin, and the additional
+  display offset needed to show every transformed frame without cropping.
+
+The canonical matrix direction is:
+
+```text
+native ROI physical coordinate -> registered ROI physical coordinate
+```
+
+Matrices use homogeneous column-vector notation. A true 2D file stores `Y,X`
+3-by-3 matrices; a 3D file stores `Z,Y,X` 4-by-4 matrices. Translation values
+are physical microns when `micron_per_pixel` is present. Z uses stored voxel
+spacing or `micron_per_pixel * zscale`. Missing physical calibration is an
+explicit pixel fallback. The `canvas_offset` is a rendering aid and is kept
+separate from the canonical transform so analytical coordinates are not
+silently re-originated.
+
+The first computed method is
+`pairwise_symmetric_nearest_neighbor_translation`. It uses the indexed object
+centroids from consecutive available frames, scales them into physical space,
+performs a bounded brute-force translation grid search, and then continuously
+refines the best point with scipy optimization. The default objective is the
+sum of nearest-neighbor distances in both directions; the legacy-style smooth
+contact transform is also available. Relative estimates accumulate into
+absolute transforms with the first available object frame as reference.
+Unindexed/missing frames between valid anchors inherit the previous absolute
+transform and retain an explicit `inherited` status; this permits partial
+segmentation while making uncertainty visible. A computed run with no object
+observations is rejected.
+
+Registration runs write provenance under `/runs/registration/<run_id>/`.
+Test jobs calculate the same matrices and canvas with `save_outputs=false` but
+do not change the H5. Saved jobs may make their result active. Consumers should
+resolve an explicit registration set first and otherwise use the active set.
+
+Stored raw images, labels, masks, bounding boxes, and centroids remain on their
+native grids. Viewers apply the active transform at display time, and
+between-frame analyses apply it to coordinates before measuring displacement,
+distance, or motility. This preserves editable/native segmentation data and
+avoids interpolation loss. Any derived result that depends on a registration
+must record both `registration_set` and `registration_digest`; a consumer must
+not silently co-render it under a different active digest.
+
 ## Sparse Lineage Graphs
 
 Tracking topology is stored under
@@ -241,12 +321,16 @@ over-segmentation, and ambiguous forward branches. A future optimal-transport
 boundary tracker will write the same graph contract and populate OT cost in
 the edge metadata.
 
-`schema.json` and `/runs/tracking/<run_id>/run.json` record `max_distance`,
-`distance_unit`, the Z/Y/X `coordinate_scale`, and coordinate order. Link
-`distance` values use that recorded unit. SITE supplies physical calibration
-automatically from H5 acquisition metadata: with valid `micron_per_pixel`, X/Y
-scales are microns per pixel and Z uses stored voxel spacing or
-`micron_per_pixel * zscale`, giving `distance_unit=um`. If
+Before comparing centroids, tracking applies the selected registration set in
+physical space. An omitted `registration_set` means the H5 active set. Both
+`schema.json` and `/runs/tracking/<run_id>/run.json` record a
+`registration_dependency` containing the registration name, digest, and
+method, in addition to `max_distance`, `distance_unit`, Z/Y/X
+`coordinate_scale`, and coordinate order. Link `distance` values therefore
+refer to registered coordinates in the recorded unit. SITE supplies physical
+calibration automatically from H5 acquisition metadata: with valid
+`micron_per_pixel`, X/Y scales are microns per pixel and Z uses stored voxel
+spacing or `micron_per_pixel * zscale`, giving `distance_unit=um`. If
 `micron_per_pixel` is missing, SITE explicitly uses the pixel fallback
 `coordinate_scale=[1, 1, 1]` and `distance_unit=pixel`. Coordinate scaling
 remains a backend argument for reproducibility and non-SITE callers, but is not

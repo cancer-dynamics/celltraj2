@@ -126,6 +126,7 @@ class ObjectSet:
         max_distance: float,
         track_set: str = "centroid_mindist",
         coordinate_scale: Sequence[float] | None = None,
+        registration_set: str | None = None,
         overwrite: bool = False,
         save_outputs: bool = True,
         run_id: str | None = None,
@@ -141,6 +142,7 @@ class ObjectSet:
             max_distance=max_distance,
             track_set=track_set,
             coordinate_scale=coordinate_scale,
+            registration_set=registration_set,
             overwrite=overwrite,
             save_outputs=save_outputs,
             run_id=run_id,
@@ -251,6 +253,60 @@ class Trajectory:
     def mask_sets(self) -> list[str]:
         return self.store.list_mask_sets()
 
+    def register_global_translation(
+        self,
+        object_set: str,
+        *,
+        registration_set: str = "global_registration",
+        max_shift_per_frame: Sequence[float] | float = 10.0,
+        grid_step: Sequence[float] | float = 1.0,
+        coordinate_scale: Sequence[float] | None = None,
+        distance_unit: str | None = None,
+        contact_transform: bool = False,
+        overwrite: bool = False,
+        save_outputs: bool = True,
+        set_active: bool = True,
+        run_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> Any:
+        """Register ROI frames from one indexed object's centroid point clouds."""
+
+        from celltraj2.registration import register_global_translation
+
+        return register_global_translation(
+            self,
+            object_set,
+            registration_set=registration_set,
+            max_shift_per_frame=max_shift_per_frame,
+            grid_step=grid_step,
+            coordinate_scale=coordinate_scale,
+            distance_unit=distance_unit,
+            contact_transform=contact_transform,
+            overwrite=overwrite,
+            save_outputs=save_outputs,
+            set_active=set_active,
+            run_id=run_id,
+            metadata=metadata,
+        )
+
+    def registration_sets(self) -> list[str]:
+        return self.store.list_registration_sets()
+
+    def read_registration(self, registration_set: str) -> Any:
+        return self.store.read_registration_set(registration_set)
+
+    def active_registration_name(self) -> str | None:
+        return self.store.active_registration_name()
+
+    def active_registration(self) -> Any:
+        return self.store.read_active_registration()
+
+    def set_active_registration(self, registration_set: str) -> str:
+        return self.store.set_active_registration(registration_set, reason="trajectory_api")
+
+    def registration_runs(self) -> list[str]:
+        return self.store.list_registration_runs()
+
     def object_set(self, object_set: str) -> ObjectSet:
         return ObjectSet(self, object_set)
 
@@ -344,6 +400,7 @@ class Trajectory:
         max_distance: float,
         track_set: str = "centroid_mindist",
         coordinate_scale: Sequence[float] | None = None,
+        registration_set: str | None = None,
         overwrite: bool = False,
         save_outputs: bool = True,
         run_id: str | None = None,
@@ -353,6 +410,7 @@ class Trajectory:
             max_distance=max_distance,
             track_set=track_set,
             coordinate_scale=coordinate_scale,
+            registration_set=registration_set,
             overwrite=overwrite,
             save_outputs=save_outputs,
             run_id=run_id,

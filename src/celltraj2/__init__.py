@@ -28,6 +28,18 @@ from celltraj2.object_indexing import (
     run_batch_object_indexing,
 )
 from celltraj2.objects import ObjectIndexResult, index_object_set
+from celltraj2.registration import (
+    RegistrationResult,
+    RegistrationSet,
+    estimate_pair_translation,
+    register_global_translation,
+)
+from celltraj2.registration_batch import (
+    BatchRegistrationSummary,
+    RegistrationBatchJob,
+    RegistrationFileJob,
+    run_batch_registration,
+)
 from celltraj2.schema import (
     ChannelSpec,
     ImageSourceSpec,
@@ -56,6 +68,7 @@ __all__ = [
     "BatchTrackingSummary",
     "BatchFeatureExtractionSummary",
     "BatchObjectIndexSummary",
+    "BatchRegistrationSummary",
     "ChannelSpec",
     "FeatureExtractionBatchJob",
     "FeatureExtractionFileJob",
@@ -68,6 +81,10 @@ __all__ = [
     "ObjectIndexResult",
     "RoiBounds",
     "RoiSpec",
+    "RegistrationBatchJob",
+    "RegistrationFileJob",
+    "RegistrationResult",
+    "RegistrationSet",
     "SegmentationBatchJob",
     "SegmentationFileJob",
     "SegmentationResult",
@@ -81,8 +98,11 @@ __all__ = [
     "TrajectoryMetadata",
     "TrajectoryStore",
     "extract_feature_set",
+    "estimate_pair_translation",
     "index_object_set",
     "regionprops_v1_spec",
+    "register_global_translation",
+    "run_batch_registration",
     "run_batch_object_indexing",
     "run_batch_feature_extraction",
     "run_batch_segmentation",

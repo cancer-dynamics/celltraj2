@@ -288,6 +288,7 @@ def track_minimum_centroid_distance(
     max_distance: float,
     track_set: str = "centroid_mindist",
     coordinate_scale: Sequence[float] | None = None,
+    registration_set: str | None = None,
     overwrite: bool = False,
     save_outputs: bool = True,
     run_id: str | None = None,
@@ -325,6 +326,38 @@ def track_minimum_centroid_distance(
         [observations["centroid_z"], observations["centroid_y"], observations["centroid_x"]]
     ).astype(float)
     centroids *= scale[np.newaxis, :]
+    registration = None
+    selected_registration = registration_set
+    store = getattr(trajectory, "store", None)
+    if store is not None and hasattr(store, "read_registration_set"):
+        if selected_registration is None and hasattr(store, "active_registration_name"):
+            selected_registration = store.active_registration_name()
+        if selected_registration:
+            try:
+                registration = store.read_registration_set(selected_registration)
+            except (FileNotFoundError, KeyError):
+                if registration_set is not None:
+                    raise
+    if registration is not None:
+        stored_scale = np.asarray(registration.schema.get("coordinate_scale_zyx", scale), dtype=float)
+        if (
+            str(registration.schema.get("method")) != "identity"
+            and (stored_scale.shape != (3,) or not np.allclose(stored_scale, scale, rtol=1e-7, atol=1e-10))
+        ):
+            raise ValueError(
+                f"Registration set {registration.name!r} uses coordinate_scale_zyx "
+                f"{stored_scale.tolist()}, not tracker scale {scale.tolist()}."
+            )
+        centroids = registration.apply_zyx(centroids, frames)
+    registration_dependency = (
+        None
+        if registration is None
+        else {
+            "registration_set": registration.name,
+            "registration_digest": registration.digest,
+            "registration_method": str(registration.schema.get("method") or ""),
+        }
+    )
     edge_records: list[tuple[Any, ...]] = []
     link_id = 1
     for frame in sorted(int(value) for value in np.unique(frames)):
@@ -371,6 +404,7 @@ def track_minimum_centroid_distance(
         "distance_unit": distance_unit,
         "coordinate_order": ["z", "y", "x"],
         "coordinate_scale": scale.tolist(),
+        "registration_dependency": registration_dependency,
         "frame_linkage": "immediately_previous_local_frame_only",
         "parent_invariant": "at_most_one_parent_per_child",
         "child_cardinality": "zero_or_more_children_per_parent",
@@ -426,6 +460,7 @@ def track_minimum_centroid_distance(
             "max_distance": cutoff,
             "distance_unit": distance_unit,
             "coordinate_scale": scale.tolist(),
+            "registration_dependency": registration_dependency,
             "observation_count": n,
             "link_count": int(links.shape[0]),
             "track_path": track_path,

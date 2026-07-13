@@ -16,10 +16,13 @@ Current core capabilities:
   fallback caches, or linked ND2 files plus stored ROI coordinates;
 - store named frame-based labels and masks under one-based `frame_<n>` paths;
 - index object observations and row-aligned lookup tables for ROI viewers;
+- store explicit per-frame global transforms, including a default identity
+  set, and estimate drift from object-centroid point clouds with grid plus
+  continuous optimization;
 - track observations by minimum centroid distance and store lineage topology as
   a parent-to-child CSR sparse matrix with row-aligned lineage/tracklet caches;
-- preserve tracking cutoff units and Z/Y/X coordinate calibration in graph and
-  run provenance, with SITE supplying physical micron scales automatically;
+- apply active registration before tracking distances and preserve registration
+  digest, cutoff units, and Z/Y/X calibration in graph/run provenance;
 - query parents, children, histories, descendants, lineages, and maximal
   root-to-leaf trajectories, including scipy sparse trajectory membership;
 - compute row-aligned single-object feature tables, including regionprops,
@@ -56,6 +59,7 @@ Cellpose batch workers can install only the I/O pieces they need, for example:
 python -m pip install -e ".[analysis,nd2]"
 python -m celltraj2.runners.cellpose_segment segmentation_job.json
 python -m celltraj2.runners.extract_features feature_extraction_job.json
+python -m celltraj2.runners.register_global registration_job.json
 python -m celltraj2.runners.track_centroids tracking_job.json
 ```
 

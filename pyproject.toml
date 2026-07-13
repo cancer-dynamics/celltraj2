@@ -17,6 +17,7 @@ dependencies = []
 celltraj2-cellpose-segment = "celltraj2.runners.cellpose_segment:main"
 celltraj2-index-objects = "celltraj2.runners.index_objects:main"
 celltraj2-extract-features = "celltraj2.runners.extract_features:main"
+celltraj2-register-global = "celltraj2.runners.register_global:main"
 celltraj2-track-centroids = "celltraj2.runners.track_centroids:main"
 
 [project.urls]
@@ -47,6 +48,7 @@ nd2 = [
 analysis = [
   "numpy>=1.24",
   "h5py>=3.10",
+  "scipy>=1.10",
   "scikit-image>=0.22",
   "zarr>=2.18",
   "dask[array]>=2024",

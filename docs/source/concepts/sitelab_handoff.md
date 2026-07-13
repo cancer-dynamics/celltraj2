@@ -282,7 +282,32 @@ events, `feature_frame_summary` events report the file, frame, feature column,
 mean finite value, object count, finite count, and NaN count, which lets the SITE
 run window show live per-feature progress.
 
-## Tracking Shape
+## Registration And Tracking Shape
+
+The SITE `Track` workflow is ordered as two tabs: `1. Global Registration`
+then `2. Cell Tracking`. Registration requires the active indexed object set
+because the first method aligns framewise centroid point clouds. SITE launches:
+
+```bash
+python -m celltraj2.runners.register_global registration_job.json
+```
+
+The registration job names an output set (default `global_registration`), uses
+per-frame maximum drift and grid spacing in microns when physical metadata is
+available, and falls back explicitly to pixels otherwise. `Test` calculates
+the transforms without writing. `Run` stores
+`/registrations/<registration_set>/`, `/runs/registration/<run_id>/`, and,
+when requested, updates `/registrations/active.json`. Queue submission creates
+one file-level registration job per H5.
+
+The worker estimates each available frame pair by bounded grid search followed
+by continuous minimization of the symmetric nearest-neighbor distance sum.
+Its matrices map native ROI physical coordinates into registered ROI physical
+coordinates. Missing object frames inherit the preceding absolute transform
+with an explicit status. A separate canvas offset permits uncropped display;
+it is not folded into analytical coordinates. New celltraj2 H5 files already
+contain an active `identity` set so every consumer has defined behavior before
+a computed run.
 
 After choosing an active indexed object set, SITE launches minimum-centroid
 tracking through:
@@ -303,6 +328,7 @@ Minimal job shape:
       "h5_path": "cell_files/sample/sample_XY001_ROI001.ct2.h5",
       "object_set": "cyto_epithelial",
       "track_set": "centroid_mindist",
+      "registration_set": "global_registration",
       "method": "minimum_centroid_distance",
       "max_distance": 5.0,
       "coordinate_scale": [3.0, 0.325, 0.325],
@@ -325,6 +351,10 @@ microns; Z automatically uses stored Z voxel spacing or
 labeled pixel fallback with `[1, 1, 1]`. The worker emits per-frame object,
 linked, and unlinked counts. Saved runs write the sparse graph under the object
 set and provenance under `/runs/tracking/<run_id>/`; dry runs do neither.
+Tracking transforms centroids with the requested registration (or the active
+set when omitted) before computing distances. The track graph and run
+provenance record the registration set, digest, and method so SITE can reject a
+tracklet overlay when a different registration is active.
 
 SITE's general interaction rule is the same outside tracking: user-facing
 spatial measurements and thresholds should use physical microns whenever
@@ -367,6 +397,16 @@ lookup/observation row spine: SITE colors by row-aligned `lineage_id` and uses
 the CSR graph plus unique-parent cache to retain an observation's ancestors and
 descendants as frames change. Tracklet assignments can also be converted to
 napari-ready track rows and split-graph metadata.
+
+The ROI navigator reports the active registration set, method, reference
+frame, current-frame Z/Y/X translation and status, and registered canvas size.
+`Registered view` is on by default and can be toggled for comparison. Raw image
+channels, standalone labels/masks, indexed-object overlays, selection
+boundaries, training labels, and tracklets are co-rendered in the same
+registered world coordinates. SITE changes napari data-to-world transforms (or
+track point coordinates) and does not resample or rewrite the native arrays.
+Changing T reapplies the matching frame transform. `Refresh registration`
+reloads an active-set change made while the viewer is open.
 
 The SITE Plot workflow is another read-only consumer of this contract. Object
 count uses the number of `/object_sets/<object_set>/observations` rows per
