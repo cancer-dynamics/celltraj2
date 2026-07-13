@@ -305,15 +305,31 @@ Minimal job shape:
       "track_set": "centroid_mindist",
       "method": "minimum_centroid_distance",
       "max_distance": 5.0,
-      "coordinate_scale": [1.0, 1.0, 1.0]
+      "coordinate_scale": [3.0, 0.325, 0.325],
+      "metadata": {
+        "distance_unit": "um",
+        "distance_calibration_source": "h5_acquisition_metadata",
+        "micron_per_pixel": 0.325,
+        "zscale": 9.23076923076923
+      }
     }
   ]
 }
 ```
 
-The coordinate scale is ordered Z/Y/X. The worker emits per-frame object,
+The coordinate scale is ordered Z/Y/X and is derived by SITE per file, not
+entered by the user. When `/metadata/acquisition.json` has
+`micron_per_pixel`, the maximum distance and link distances are reported in
+microns; Z automatically uses stored Z voxel spacing or
+`micron_per_pixel * zscale`. Missing `micron_per_pixel` triggers an explicitly
+labeled pixel fallback with `[1, 1, 1]`. The worker emits per-frame object,
 linked, and unlinked counts. Saved runs write the sparse graph under the object
 set and provenance under `/runs/tracking/<run_id>/`; dry runs do neither.
+
+SITE's general interaction rule is the same outside tracking: user-facing
+spatial measurements and thresholds should use physical microns whenever
+`micron_per_pixel` is available, and report pixels only as a clearly marked
+fallback. Native array coordinates may remain pixels/voxels in storage.
 
 ## SITE ROI Viewer Consumption
 

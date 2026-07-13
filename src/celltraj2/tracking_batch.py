@@ -182,6 +182,7 @@ def run_batch_tracking(
                 "method": file_job.method,
                 "max_distance": file_job.max_distance,
                 "coordinate_scale": list(file_job.coordinate_scale),
+                "distance_unit": str(file_job.metadata.get("distance_unit") or "scaled_coordinate_unit"),
                 "save_outputs": save_outputs,
             }
         )

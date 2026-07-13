@@ -18,6 +18,8 @@ Current core capabilities:
 - index object observations and row-aligned lookup tables for ROI viewers;
 - track observations by minimum centroid distance and store lineage topology as
   a parent-to-child CSR sparse matrix with row-aligned lineage/tracklet caches;
+- preserve tracking cutoff units and Z/Y/X coordinate calibration in graph and
+  run provenance, with SITE supplying physical micron scales automatically;
 - query parents, children, histories, descendants, lineages, and maximal
   root-to-leaf trajectories, including scipy sparse trajectory membership;
 - compute row-aligned single-object feature tables, including regionprops,
@@ -25,8 +27,8 @@ Current core capabilities:
 - compose segmentation model input from stored channel specs;
 - run dry or saved batch segmentation through an injectable Python callable or
   the Cellpose worker command;
-- record segmentation and feature-extraction run/per-frame provenance in the
-  H5.
+- record segmentation, feature-extraction, and tracking run/per-frame
+  provenance in the H5.
 
 Hosted documentation:
 

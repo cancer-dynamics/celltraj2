@@ -61,6 +61,7 @@ class SparseTrackingTests(unittest.TestCase):
                 graph = result.graph
 
                 self.assertEqual(result.link_count, 5)
+                self.assertEqual(result.graph.schema["distance_unit"], "pixel")
                 self.assertEqual(graph.parent(3), 1)
                 self.assertEqual(graph.parent(4), 1)
                 self.assertIsNone(graph.parent(6))
@@ -108,6 +109,7 @@ class SparseTrackingTests(unittest.TestCase):
                     save_outputs=False,
                 )
                 self.assertEqual(result.link_count, 1)
+                self.assertEqual(result.graph.schema["distance_unit"], "scaled_coordinate_unit")
                 self.assertFalse(result.saved)
 
     def test_tracker_graph_queries_without_h5_or_scipy(self):
@@ -133,9 +135,15 @@ class SparseTrackingTests(unittest.TestCase):
             store = FakeStore()
 
         result = track_minimum_centroid_distance(
-            FakeTrajectory(), "cells", max_distance=2.0, save_outputs=False
+            FakeTrajectory(),
+            "cells",
+            max_distance=2.0,
+            coordinate_scale=(1.0, 1.0, 1.0),
+            metadata={"distance_unit": "um"},
+            save_outputs=False,
         )
         graph = result.graph
+        self.assertEqual(graph.schema["distance_unit"], "um")
         self.assertEqual(graph.children(1).tolist(), [3, 4])
         self.assertEqual(graph.parent(5), 4)
         self.assertEqual(graph.history(5).tolist(), [1, 4, 5])
@@ -155,6 +163,7 @@ class SparseTrackingTests(unittest.TestCase):
                         "method": "mindist",
                         "distcut": 7.5,
                         "coordinate_scale": [2, 1, 1],
+                        "metadata": {"distance_unit": "um"},
                     }
                 ],
             }
@@ -163,6 +172,7 @@ class SparseTrackingTests(unittest.TestCase):
         self.assertEqual(job.files[0].method, "minimum_centroid_distance")
         self.assertEqual(job.files[0].max_distance, 7.5)
         self.assertEqual(job.files[0].coordinate_scale, (2.0, 1.0, 1.0))
+        self.assertEqual(job.files[0].metadata["distance_unit"], "um")
         with self.assertRaises(ValueError):
             TrackingFileJob.from_dict(
                 {"h5_path": "sample.h5", "object_set": "cells", "method": "optimal_transport"}

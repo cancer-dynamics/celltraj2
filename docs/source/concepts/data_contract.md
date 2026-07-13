@@ -241,6 +241,17 @@ over-segmentation, and ambiguous forward branches. A future optimal-transport
 boundary tracker will write the same graph contract and populate OT cost in
 the edge metadata.
 
+`schema.json` and `/runs/tracking/<run_id>/run.json` record `max_distance`,
+`distance_unit`, the Z/Y/X `coordinate_scale`, and coordinate order. Link
+`distance` values use that recorded unit. SITE supplies physical calibration
+automatically from H5 acquisition metadata: with valid `micron_per_pixel`, X/Y
+scales are microns per pixel and Z uses stored voxel spacing or
+`micron_per_pixel * zscale`, giving `distance_unit=um`. If
+`micron_per_pixel` is missing, SITE explicitly uses the pixel fallback
+`coordinate_scale=[1, 1, 1]` and `distance_unit=pixel`. Coordinate scaling
+remains a backend argument for reproducibility and non-SITE callers, but is not
+a SITE user control.
+
 Batch tracking uses the same dry-run and JSONL worker conventions as object
 indexing and feature extraction:
 

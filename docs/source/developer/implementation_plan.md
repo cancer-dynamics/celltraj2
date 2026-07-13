@@ -108,7 +108,7 @@ be used without importing SITE or Pydantic.
 - Optional runner:
   `python -m celltraj2.runners.extract_features job.json`.
 
-## In Progress Phase 10: Tracks And Interactive Analysis
+## Completed Phase 10: First-Pass Tracks And Interactive Analysis
 
 The first tracking layer builds on the saved observation row spine:
 
@@ -118,7 +118,7 @@ The first tracking layer builds on the saved observation row spine:
   `assignments`;
 - dependency-light ancestry, descendants, lineage, selection-tree, and maximal
   root-to-leaf trajectory queries;
-- legacy-compatible minimum-centroid-distance tracking with optional Z/Y/X
+- legacy-compatible minimum-centroid-distance tracking with recorded Z/Y/X
   coordinate scaling;
 - JSON batch worker, dry-run output, overwrite protection, JSONL events, and
   `/runs/tracking/` provenance;
@@ -126,7 +126,23 @@ The first tracking layer builds on the saved observation row spine:
   `label_id -> observation_id -> row` lookup as feature coloring;
 - SITE Test/Run/Queue launcher, track-set selection, and napari tracklet
   rendering;
-- next: optimal-transport boundary tracking writing the same sparse graph;
+- SITE derives physical micron calibration automatically from stored
+  `micron_per_pixel`, voxel spacing, and `zscale`, with an explicit pixel
+  fallback and no user-facing coordinate-scale controls;
+- completed first-pass scope: sparse storage/query, minimum-distance worker,
+  SITE launcher, lineage coloring, tracklets, and persistent branch selection.
+
+## Deferred Next Tracking Pass
+
+- Establish the boundary-analysis/library machinery first.
+- Implement optimal-transport boundary tracking using the same sparse graph,
+  assignments, run provenance, distance-unit convention, and SITE viewer
+  representation; do not introduce a parallel trajectory storage shape.
+- Populate OT cost/confidence/quality edge metadata while retaining the unique
+  backward parent and forward branching invariants.
+
+Additional interactive-analysis work remains separate from this tracking pass:
+
 - launch exploratory notebooks or marimo environments with active H5s,
   treatment groups, feature tables, and replicate metadata preloaded;
 - keep a clean backend API that works in notebooks without importing SITE.

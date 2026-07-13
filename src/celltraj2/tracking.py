@@ -315,6 +315,11 @@ def track_minimum_centroid_distance(
     scale = np.asarray(coordinate_scale if coordinate_scale is not None else (1.0, 1.0, 1.0), dtype=float)
     if scale.shape != (3,) or not np.all(np.isfinite(scale)) or np.any(scale <= 0):
         raise ValueError("coordinate_scale must contain three finite positive values in Z,Y,X order.")
+    metadata_payload = dict(metadata or {})
+    distance_unit = str(
+        metadata_payload.get("distance_unit")
+        or ("pixel" if coordinate_scale is None else "scaled_coordinate_unit")
+    )
     frames = np.asarray(observations["frame"], dtype=np.int64)
     centroids = np.column_stack(
         [observations["centroid_z"], observations["centroid_y"], observations["centroid_x"]]
@@ -363,6 +368,7 @@ def track_minimum_centroid_distance(
         "track_set": track_name,
         "method": "minimum_centroid_distance",
         "max_distance": cutoff,
+        "distance_unit": distance_unit,
         "coordinate_order": ["z", "y", "x"],
         "coordinate_scale": scale.tolist(),
         "frame_linkage": "immediately_previous_local_frame_only",
@@ -418,13 +424,14 @@ def track_minimum_centroid_distance(
             "track_set": track_name,
             "method": "minimum_centroid_distance",
             "max_distance": cutoff,
+            "distance_unit": distance_unit,
             "coordinate_scale": scale.tolist(),
             "observation_count": n,
             "link_count": int(links.shape[0]),
             "track_path": track_path,
             "overwrite": bool(overwrite),
             "save_outputs": True,
-            "metadata": dict(metadata or {}),
+            "metadata": metadata_payload,
         }
         trajectory.store.write_tracking_run(run_name, run_record, overwrite=True)
         for frame, counts in frame_counts.items():
