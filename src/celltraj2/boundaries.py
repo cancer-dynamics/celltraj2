@@ -21,6 +21,7 @@ ENTITY_QUALITY_NO_POINTS = 1 << 0
 GEOMETRY_QUALITY_TOO_FEW_POINTS = 1 << 0
 GEOMETRY_QUALITY_OPERATOR_FAILED = 1 << 1
 GEOMETRY_QUALITY_DISCONNECTED_HINT = 1 << 2
+GEOMETRY_QUALITY_NOT_SELECTED = 1 << 3
 
 
 def _require_numpy() -> Any:
@@ -375,6 +376,142 @@ class BoundaryLibraryView:
         return self.store.read_boundary_entity_attributes(self.name, attribute_set)
 
 
+class InMemoryBoundaryLibraryView:
+    """Boundary-library view over an unsaved :class:`BoundaryLibraryResult`.
+
+    This mirrors the point/entity access used by geometry, neighbor, and
+    transient-tracking calculations so SITE ``Test`` jobs can execute the full
+    pipeline without mutating the H5 file.
+    """
+
+    def __init__(self, result: BoundaryLibraryResult) -> None:
+        self.name = result.boundary_set
+        self._entities = result.entities
+        self._points = dict(result.points)
+        self._schema = dict(result.schema)
+        self._sources = [dict(value) for value in result.sources]
+
+    @property
+    def schema(self) -> dict[str, Any]:
+        return dict(self._schema)
+
+    @property
+    def sources(self) -> list[dict[str, Any]]:
+        return [dict(value) for value in self._sources]
+
+    @property
+    def entities(self) -> Any:
+        return self._entities
+
+    @property
+    def point_count(self) -> int:
+        return int(self._points["point_id"].shape[0])
+
+    def entity(self, boundary_entity_id: int) -> Any:
+        value = int(boundary_entity_id)
+        if value < 1 or value > int(self.entities.shape[0]):
+            raise IndexError(f"boundary_entity_id {value} is outside 1..{int(self.entities.shape[0])}")
+        row = self.entities[value - 1]
+        if int(row["boundary_entity_id"]) != value:
+            matches = _require_numpy().flatnonzero(self.entities["boundary_entity_id"] == value)
+            if not matches.size:
+                raise KeyError(value)
+            row = self.entities[int(matches[0])]
+        return row
+
+    def point_slice(self, boundary_entity_id: int) -> slice:
+        row = self.entity(boundary_entity_id)
+        start = int(row["point_start"])
+        return slice(start, start + int(row["point_count"]))
+
+    def read_points(
+        self,
+        boundary_entity_id: int | None = None,
+        *,
+        rows: slice | Any | None = None,
+        fields: Sequence[str] | None = None,
+    ) -> dict[str, Any]:
+        if boundary_entity_id is not None and rows is not None:
+            raise ValueError("Pass boundary_entity_id or rows, not both")
+        selection = (
+            self.point_slice(boundary_entity_id)
+            if boundary_entity_id is not None
+            else (rows if rows is not None else slice(None))
+        )
+        names = list(fields) if fields is not None else sorted(self._points)
+        return {name: self._points[name][selection] for name in names}
+
+
+BoundaryDataView = BoundaryLibraryView | InMemoryBoundaryLibraryView
+
+
+def as_boundary_library_view(
+    trajectory: Any,
+    boundary_set: str,
+    library: BoundaryLibraryResult | BoundaryDataView | None = None,
+) -> BoundaryDataView:
+    """Resolve an H5-backed or unsaved boundary library through one API."""
+
+    name = validate_name(boundary_set, kind="boundary set")
+    if library is None:
+        return BoundaryLibraryView(trajectory.store, name)
+    if isinstance(library, BoundaryLibraryResult):
+        if library.boundary_set != name:
+            raise ValueError(
+                f"In-memory boundary set {library.boundary_set!r} does not match {name!r}"
+            )
+        return InMemoryBoundaryLibraryView(library)
+    if library.name != name:
+        raise ValueError(f"Boundary view {library.name!r} does not match {name!r}")
+    return library
+
+
+def resolve_boundary_source_ids(
+    library: BoundaryDataView,
+    *,
+    source_ids: Sequence[int] | None = None,
+    source_names: Sequence[str] | None = None,
+    source_roles: Sequence[str] | None = None,
+    require_one: bool = False,
+) -> set[int] | None:
+    """Resolve optional source selectors to stable integer source ids.
+
+    Multiple selector categories are intersected. ``None`` means no source
+    filtering; an explicitly supplied selector that matches nothing is an
+    error rather than a silently empty calculation.
+    """
+
+    selectors_used = any(value is not None for value in (source_ids, source_names, source_roles))
+    if not selectors_used:
+        if require_one:
+            if len(library.sources) != 1:
+                raise ValueError("Select exactly one boundary source")
+            return {int(library.sources[0]["source_id"])}
+        return None
+    selected = {int(value["source_id"]) for value in library.sources}
+    if source_ids is not None:
+        selected &= {int(value) for value in source_ids}
+    if source_names is not None:
+        names = {str(value) for value in source_names}
+        selected &= {
+            int(value["source_id"])
+            for value in library.sources
+            if str(value.get("name") or "") in names
+        }
+    if source_roles is not None:
+        roles = {str(value) for value in source_roles}
+        selected &= {
+            int(value["source_id"])
+            for value in library.sources
+            if str(value.get("role") or "") in roles
+        }
+    if not selected:
+        raise ValueError("Boundary source selectors did not match any library source")
+    if require_one and len(selected) != 1:
+        raise ValueError(f"Expected exactly one boundary source, matched {len(selected)}")
+    return selected
+
+
 def _normalize_zyx(array: Any, *, np: Any) -> tuple[Any, int]:
     values = np.asarray(array)
     if values.ndim == 2:
@@ -524,6 +661,7 @@ def build_boundary_library(
     entity_id = 1
     point_id = 1
     spatial_ndim_values: set[int] = set()
+    frame_shapes: dict[int, tuple[int, ...]] = {}
 
     for source_id, spec in enumerate(specs, start=1):
         if spec.kind == "mask_set":
@@ -561,6 +699,13 @@ def build_boundary_library(
                     raise FileNotFoundError(f"/labels/{spec.label_set}/frame_{frame}")
                 labels, spatial_ndim = _normalize_zyx(trajectory.read_label_frame(str(spec.label_set), frame), np=np)
             spatial_ndim_values.add(spatial_ndim)
+            shape = tuple(int(value) for value in labels.shape)
+            prior_shape = frame_shapes.setdefault(int(frame), shape)
+            if prior_shape != shape:
+                raise ValueError(
+                    f"Boundary sources for frame {int(frame)} do not share one native grid: "
+                    f"expected {prior_shape}, found {shape} for source {spec.name!r}"
+                )
             boundary_mask, orientation = _boundary_mask_and_orientation(labels, spatial_ndim=spatial_ndim, np=np)
             coords_all = np.argwhere(boundary_mask)
             labels_all = labels[boundary_mask].astype(np.int64, copy=False)
@@ -827,6 +972,10 @@ def compute_boundary_geometry(
     geometry_set: str = "surface_v1",
     knn: int = 40,
     backend: Literal["auto", "pcdiff", "local"] = "auto",
+    source_ids: Sequence[int] | None = None,
+    source_names: Sequence[str] | None = None,
+    source_roles: Sequence[str] | None = None,
+    library: BoundaryLibraryResult | BoundaryDataView | None = None,
     overwrite: bool = False,
     save_outputs: bool = True,
     metadata: Mapping[str, Any] | None = None,
@@ -838,7 +987,13 @@ def compute_boundary_geometry(
     geometry_name = validate_name(geometry_set, kind="boundary geometry set")
     if knn < 2:
         raise ValueError("knn must be >= 2")
-    view = BoundaryLibraryView(trajectory.store, boundary_name)
+    view = as_boundary_library_view(trajectory, boundary_name, library)
+    selected_source_ids = resolve_boundary_source_ids(
+        view,
+        source_ids=source_ids,
+        source_names=source_names,
+        source_roles=source_roles,
+    )
     count = view.point_count
     values = {
         "normals_zyx": np.full((count, 3), np.nan, dtype=np.float32),
@@ -869,6 +1024,9 @@ def compute_boundary_geometry(
     for entity in view.entities:
         start = int(entity["point_start"])
         stop = start + int(entity["point_count"])
+        if selected_source_ids is not None and int(entity["source_id"]) not in selected_source_ids:
+            values["quality_flags"][start:stop] |= GEOMETRY_QUALITY_NOT_SELECTED
+            continue
         entity_count = stop - start
         minimum = 5 if spatial_ndim == 3 else 3
         if entity_count < minimum:
@@ -939,6 +1097,9 @@ def compute_boundary_geometry(
         "knn": int(knn),
         "requested_backend": backend,
         "selected_backends": sorted(selected_backends),
+        "selected_source_ids": (
+            "all" if selected_source_ids is None else sorted(selected_source_ids)
+        ),
         "normal_orientation": "mask_inside_to_outside_hint_with_centroid_fallback",
         "shape_operator": "minus_surface_gradient_of_oriented_normal",
         "curvature_sign": "positive_when_shape_operator_eigenvalue_is_positive_for_stored_outward_normal",
@@ -1048,9 +1209,16 @@ def compute_boundary_neighbors(
     k: int = 1,
     source_entity_ids: Sequence[int] | None = None,
     target_entity_ids: Sequence[int] | None = None,
+    source_ids: Sequence[int] | None = None,
+    source_names: Sequence[str] | None = None,
+    source_roles: Sequence[str] | None = None,
+    target_ids: Sequence[int] | None = None,
+    target_names: Sequence[str] | None = None,
+    target_roles: Sequence[str] | None = None,
     same_frame: bool = True,
     exclude_same_entity: bool = True,
     max_distance: float | None = None,
+    library: BoundaryLibraryResult | BoundaryDataView | None = None,
     overwrite: bool = False,
     save_outputs: bool = True,
     metadata: Mapping[str, Any] | None = None,
@@ -1064,20 +1232,46 @@ def compute_boundary_neighbors(
         raise ValueError("k must be >= 1")
     if max_distance is not None and (not np.isfinite(max_distance) or float(max_distance) <= 0):
         raise ValueError("max_distance must be finite and > 0")
-    view = BoundaryLibraryView(trajectory.store, boundary_name)
+    view = as_boundary_library_view(trajectory, boundary_name, library)
+    selected_source_ids = resolve_boundary_source_ids(
+        view,
+        source_ids=source_ids,
+        source_names=source_names,
+        source_roles=source_roles,
+    )
+    selected_target_ids = resolve_boundary_source_ids(
+        view,
+        source_ids=target_ids,
+        source_names=target_names,
+        source_roles=target_roles,
+    )
     all_points = view.read_points(fields=("boundary_entity_id", "frame", "native_position_zyx"))
     positions = np.asarray(all_points["native_position_zyx"], dtype=float)
     point_entities = np.asarray(all_points["boundary_entity_id"], dtype=np.int64)
     point_frames = np.asarray(all_points["frame"], dtype=np.int32)
     point_count = int(positions.shape[0])
-    source_ids = set(int(value) for value in source_entity_ids) if source_entity_ids is not None else None
-    target_ids = set(int(value) for value in target_entity_ids) if target_entity_ids is not None else None
+    source_entity_id_set = (
+        set(int(value) for value in source_entity_ids) if source_entity_ids is not None else None
+    )
+    target_entity_id_set = (
+        set(int(value) for value in target_entity_ids) if target_entity_ids is not None else None
+    )
     source_mask = np.ones(point_count, dtype=bool)
     target_mask = np.ones(point_count, dtype=bool)
-    if source_ids is not None:
-        source_mask &= np.isin(point_entities, list(source_ids))
-    if target_ids is not None:
-        target_mask &= np.isin(point_entities, list(target_ids))
+    if source_entity_id_set is not None:
+        source_mask &= np.isin(point_entities, list(source_entity_id_set))
+    if target_entity_id_set is not None:
+        target_mask &= np.isin(point_entities, list(target_entity_id_set))
+    if selected_source_ids is not None or selected_target_ids is not None:
+        entity_source_by_id = np.zeros(int(view.entities.shape[0]) + 1, dtype=np.int32)
+        entity_source_by_id[
+            np.asarray(view.entities["boundary_entity_id"], dtype=np.int64)
+        ] = np.asarray(view.entities["source_id"], dtype=np.int32)
+        point_source_ids = entity_source_by_id[point_entities]
+        if selected_source_ids is not None:
+            source_mask &= np.isin(point_source_ids, list(selected_source_ids))
+        if selected_target_ids is not None:
+            target_mask &= np.isin(point_source_ids, list(selected_target_ids))
 
     row_targets: list[Any] = [np.empty(0, dtype=np.int64) for _ in range(point_count)]
     row_distances: list[Any] = [np.empty(0, dtype=float) for _ in range(point_count)]
@@ -1130,8 +1324,14 @@ def compute_boundary_neighbors(
         "same_frame": bool(same_frame),
         "exclude_same_entity": bool(exclude_same_entity),
         "max_distance": None if max_distance is None else float(max_distance),
-        "source_entity_ids": "all" if source_ids is None else sorted(source_ids),
-        "target_entity_ids": "all" if target_ids is None else sorted(target_ids),
+        "source_entity_ids": (
+            "all" if source_entity_id_set is None else sorted(source_entity_id_set)
+        ),
+        "target_entity_ids": (
+            "all" if target_entity_id_set is None else sorted(target_entity_id_set)
+        ),
+        "source_ids": "all" if selected_source_ids is None else sorted(selected_source_ids),
+        "target_ids": "all" if selected_target_ids is None else sorted(selected_target_ids),
         "edge_count": int(indices.shape[0]),
         "metadata": _json_safe(dict(metadata or {})),
     }
@@ -1270,6 +1470,7 @@ __all__ = [
     "BoundaryGeometryResult",
     "BoundaryLibraryResult",
     "BoundaryLibraryView",
+    "InMemoryBoundaryLibraryView",
     "BoundaryNeighborResult",
     "BoundarySourceSpec",
     "BoundaryTransportPlan",
@@ -1279,6 +1480,7 @@ __all__ = [
     "build_boundary_library",
     "compute_boundary_geometry",
     "compute_boundary_neighbors",
+    "resolve_boundary_source_ids",
     "deterministic_point_sample",
     "optimal_transport_plan",
     "pairwise_distance_matrix",

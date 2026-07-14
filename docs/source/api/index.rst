@@ -8,6 +8,7 @@ API Reference
    schema
    model_input
    boundaries
+   boundary_batch
    batch
    features
    feature_extraction
@@ -15,6 +16,7 @@ API Reference
    registration_batch
    tracking
    tracking_batch
+   surface_motion_batch
    store
    sources
    trajectory

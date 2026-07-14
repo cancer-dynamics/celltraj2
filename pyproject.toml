@@ -19,6 +19,9 @@ celltraj2-index-objects = "celltraj2.runners.index_objects:main"
 celltraj2-extract-features = "celltraj2.runners.extract_features:main"
 celltraj2-register-global = "celltraj2.runners.register_global:main"
 celltraj2-track-centroids = "celltraj2.runners.track_centroids:main"
+celltraj2-build-boundaries = "celltraj2.runners.build_boundaries:main"
+celltraj2-track-objects = "celltraj2.runners.track_objects:main"
+celltraj2-track-surfaces = "celltraj2.runners.track_surfaces:main"
 
 [project.urls]
 Homepage = "https://github.com/cancer-dynamics/celltraj2"

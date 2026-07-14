@@ -19,6 +19,15 @@ from celltraj2.boundaries import (
     compute_boundary_geometry,
     compute_boundary_neighbors,
     optimal_transport_plan,
+    resolve_boundary_source_ids,
+)
+from celltraj2.boundary_batch import (
+    BatchBoundarySummary,
+    BoundaryBatchJob,
+    BoundaryFileJob,
+    BoundaryGeometryJob,
+    BoundaryNeighborJob,
+    run_batch_boundaries,
 )
 from celltraj2.feature_extraction import (
     BatchFeatureExtractionSummary,
@@ -61,10 +70,18 @@ from celltraj2.schema import (
     TrajectoryMetadata,
 )
 from celltraj2.store import TrajectoryStore
+from celltraj2.surface_motion_batch import (
+    BatchSurfaceMotionSummary,
+    SurfaceMotionBatchJob,
+    SurfaceMotionFileJob,
+    run_batch_surface_motion,
+)
 from celltraj2.tracking import (
+    BoundaryMotionResult,
     SparseAdjacency,
     TrackGraph,
     TrackingResult,
+    compute_boundary_motion,
     track_minimum_boundary_ot_cost,
     track_minimum_centroid_distance,
 )
@@ -78,14 +95,21 @@ from celltraj2.trajectory import Trajectory
 
 __all__ = [
     "BatchSegmentationSummary",
+    "BatchBoundarySummary",
     "BatchTrackingSummary",
+    "BatchSurfaceMotionSummary",
     "BatchFeatureExtractionSummary",
     "BatchObjectIndexSummary",
     "BatchRegistrationSummary",
     "BoundaryGeometryResult",
+    "BoundaryBatchJob",
+    "BoundaryFileJob",
+    "BoundaryGeometryJob",
     "BoundaryLibraryResult",
     "BoundaryLibraryView",
     "BoundaryNeighborResult",
+    "BoundaryNeighborJob",
+    "BoundaryMotionResult",
     "BoundarySourceSpec",
     "BoundaryTransportPlan",
     "ChannelSpec",
@@ -109,6 +133,8 @@ __all__ = [
     "SegmentationResult",
     "SegmentationRunSpec",
     "SparseAdjacency",
+    "SurfaceMotionBatchJob",
+    "SurfaceMotionFileJob",
     "TrackGraph",
     "TrackingBatchJob",
     "TrackingFileJob",
@@ -119,17 +145,21 @@ __all__ = [
     "build_boundary_library",
     "compute_boundary_geometry",
     "compute_boundary_neighbors",
+    "compute_boundary_motion",
     "extract_feature_set",
     "estimate_pair_translation",
     "index_object_set",
     "optimal_transport_plan",
+    "resolve_boundary_source_ids",
     "regionprops_v1_spec",
     "register_global_translation",
     "run_batch_registration",
+    "run_batch_boundaries",
     "run_batch_object_indexing",
     "run_batch_feature_extraction",
     "run_batch_segmentation",
     "run_batch_tracking",
+    "run_batch_surface_motion",
     "site_signaling_v1_spec",
     "track_minimum_boundary_ot_cost",
     "track_minimum_centroid_distance",

@@ -1,4 +1,4 @@
-"""Headless batch centroid tracking for celltraj2 files."""
+"""Headless batch object tracking for celltraj2 files."""
 
 from __future__ import annotations
 
@@ -10,7 +10,11 @@ from typing import Any
 
 from celltraj2.object_indexing import JsonlReporter
 from celltraj2.schema import utc_now_iso
-from celltraj2.tracking import default_tracking_run_id, track_minimum_centroid_distance
+from celltraj2.tracking import (
+    default_tracking_run_id,
+    track_minimum_boundary_ot_cost,
+    track_minimum_centroid_distance,
+)
 from celltraj2.trajectory import Trajectory
 
 
@@ -30,7 +34,7 @@ def _json_safe(value: Any) -> Any:
 
 @dataclass(frozen=True)
 class TrackingFileJob:
-    """Centroid-tracking work for one trajectory H5."""
+    """One centroid- or boundary-OT tracking task for a trajectory H5."""
 
     h5_path: Path
     object_set: str
@@ -39,6 +43,16 @@ class TrackingFileJob:
     max_distance: float = 5.0
     coordinate_scale: tuple[float, float, float] = (1.0, 1.0, 1.0)
     registration_set: str | None = None
+    boundary_set: str | None = None
+    boundary_source_id: int | None = None
+    boundary_source_name: str | None = None
+    boundary_source_role: str | None = None
+    ot_cost_cutoff: float = float("inf")
+    ot_method: str = "emd"
+    sinkhorn_regularization: float = 0.05
+    max_boundary_points: int | None = 512
+    mass_tolerance: float = 1e-12
+    save_motion: bool = False
     enabled: bool = True
     overwrite: bool = False
     save_outputs: bool = True
@@ -58,15 +72,19 @@ class TrackingFileJob:
             "centroid": "minimum_centroid_distance",
             "mindist": "minimum_centroid_distance",
             "centroid_mindist": "minimum_centroid_distance",
+            "boundary": "minimum_registered_boundary_ot_cost",
+            "boundary_ot": "minimum_registered_boundary_ot_cost",
+            "ot": "minimum_registered_boundary_ot_cost",
         }
         method = aliases.get(method, method)
-        if method != "minimum_centroid_distance":
+        if method not in {"minimum_centroid_distance", "minimum_registered_boundary_ot_cost"}:
             raise ValueError(f"Unsupported tracking method {method!r}")
         scale_value = payload.get("coordinate_scale", (1.0, 1.0, 1.0))
         if not isinstance(scale_value, Sequence) or isinstance(scale_value, (str, bytes)) or len(scale_value) != 3:
             raise ValueError("coordinate_scale must contain Z,Y,X values")
         scale = tuple(float(value) for value in scale_value)
         max_distance = float(payload.get("max_distance", payload.get("distcut", 5.0)))
+        max_boundary_points_value = payload.get("max_boundary_points", 512)
         return cls(
             h5_path=Path(path_value),
             object_set=object_set,
@@ -77,6 +95,29 @@ class TrackingFileJob:
             registration_set=(
                 None if payload.get("registration_set") in (None, "") else str(payload.get("registration_set"))
             ),
+            boundary_set=(
+                None if payload.get("boundary_set") in (None, "") else str(payload.get("boundary_set"))
+            ),
+            boundary_source_id=(
+                None if payload.get("boundary_source_id") in (None, "")
+                else int(payload.get("boundary_source_id"))
+            ),
+            boundary_source_name=(
+                None if payload.get("boundary_source_name") in (None, "")
+                else str(payload.get("boundary_source_name"))
+            ),
+            boundary_source_role=(
+                None if payload.get("boundary_source_role") in (None, "")
+                else str(payload.get("boundary_source_role"))
+            ),
+            ot_cost_cutoff=float(payload.get("ot_cost_cutoff", float("inf"))),
+            ot_method=str(payload.get("ot_method") or "emd").lower(),
+            sinkhorn_regularization=float(payload.get("sinkhorn_regularization", 0.05)),
+            max_boundary_points=(
+                None if max_boundary_points_value in (None, "") else int(max_boundary_points_value)
+            ),
+            mass_tolerance=float(payload.get("mass_tolerance", 1e-12)),
+            save_motion=bool(payload.get("save_motion", False)),
             enabled=bool(payload.get("enabled", True)),
             overwrite=bool(payload.get("overwrite", False)),
             save_outputs=bool(payload.get("save_outputs", not bool(payload.get("dry_run", False)))),
@@ -188,6 +229,13 @@ def run_batch_tracking(
                 "coordinate_scale": list(file_job.coordinate_scale),
                 "distance_unit": str(file_job.metadata.get("distance_unit") or "scaled_coordinate_unit"),
                 "registration_set": file_job.registration_set,
+                "boundary_set": file_job.boundary_set,
+                "boundary_source_name": file_job.boundary_source_name,
+                "ot_method": file_job.ot_method if file_job.method == "minimum_registered_boundary_ot_cost" else None,
+                "max_boundary_points": (
+                    file_job.max_boundary_points
+                    if file_job.method == "minimum_registered_boundary_ot_cost" else None
+                ),
                 "save_outputs": save_outputs,
             }
         )
@@ -228,18 +276,41 @@ def _run_file_job(
                 }
             )
             return
-        result = track_minimum_centroid_distance(
-            trajectory,
-            file_job.object_set,
-            max_distance=file_job.max_distance,
-            track_set=file_job.track_set,
-            coordinate_scale=file_job.coordinate_scale,
-            registration_set=file_job.registration_set,
-            overwrite=overwrite,
-            save_outputs=save_outputs,
-            run_id=batch_job.job_id,
-            metadata={**batch_job.metadata, **file_job.metadata},
-        )
+        if file_job.method == "minimum_centroid_distance":
+            result = track_minimum_centroid_distance(
+                trajectory,
+                file_job.object_set,
+                max_distance=file_job.max_distance,
+                track_set=file_job.track_set,
+                coordinate_scale=file_job.coordinate_scale,
+                registration_set=file_job.registration_set,
+                overwrite=overwrite,
+                save_outputs=save_outputs,
+                run_id=batch_job.job_id,
+                metadata={**batch_job.metadata, **file_job.metadata},
+            )
+        else:
+            result = track_minimum_boundary_ot_cost(
+                trajectory,
+                file_job.object_set,
+                boundary_set=file_job.boundary_set,
+                boundary_source_id=file_job.boundary_source_id,
+                boundary_source_name=file_job.boundary_source_name,
+                boundary_source_role=file_job.boundary_source_role,
+                max_distance=file_job.max_distance,
+                ot_cost_cutoff=file_job.ot_cost_cutoff,
+                track_set=file_job.track_set,
+                registration_set=file_job.registration_set,
+                ot_method=file_job.ot_method,
+                sinkhorn_regularization=file_job.sinkhorn_regularization,
+                max_boundary_points=file_job.max_boundary_points,
+                mass_tolerance=file_job.mass_tolerance,
+                save_motion=file_job.save_motion,
+                overwrite=overwrite,
+                save_outputs=save_outputs,
+                run_id=batch_job.job_id,
+                metadata={**batch_job.metadata, **file_job.metadata},
+            )
         summary.completed += 1
         summary.observations += result.graph.observation_count
         summary.links += result.link_count

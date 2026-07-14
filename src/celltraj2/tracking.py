@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Sequence
@@ -276,6 +277,63 @@ class TrackingResult:
         }
 
 
+@dataclass(frozen=True)
+class BoundaryMotionResult:
+    """Point-level surface transport calculated along an object track graph."""
+
+    object_set: str
+    track_set: str
+    boundary_set: str
+    motion_set: str
+    links: Any
+    transport: dict[str, Any]
+    schema: dict[str, Any]
+    saved: bool
+    motion_path: str | None = None
+    frame_counts: dict[int, dict[str, Any]] = field(default_factory=dict)
+
+    @property
+    def link_count(self) -> int:
+        return int(self.links.shape[0])
+
+    @property
+    def transport_edge_count(self) -> int:
+        return int(self.transport["mass"].shape[0])
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "object_set": self.object_set,
+            "track_set": self.track_set,
+            "boundary_set": self.boundary_set,
+            "motion_set": self.motion_set,
+            "link_count": self.link_count,
+            "transport_edge_count": self.transport_edge_count,
+            "motion_path": self.motion_path,
+            "saved": self.saved,
+            "frame_counts": {str(key): dict(value) for key, value in self.frame_counts.items()},
+        }
+
+
+def track_graph_digest(adjacency: SparseAdjacency, links: Any, assignments: Any) -> str:
+    """Return a stable digest for surface-motion and feature dependencies."""
+
+    np = _require_numpy()
+    digest = hashlib.sha256()
+    for values in (
+        adjacency.indptr,
+        adjacency.indices,
+        adjacency.data,
+        np.asarray(adjacency.shape, dtype=np.int64),
+        links,
+        assignments,
+    ):
+        array = np.asarray(values)
+        digest.update(str(array.dtype).encode("utf-8"))
+        digest.update(str(tuple(array.shape)).encode("utf-8"))
+        digest.update(array.tobytes())
+    return digest.hexdigest()
+
+
 def default_tracking_run_id() -> str:
     """Return an H5-safe default tracking run id."""
 
@@ -424,6 +482,7 @@ def track_minimum_centroid_distance(
         },
         "link_count": int(links.shape[0]),
         "observation_count": n,
+        "track_digest": track_graph_digest(adjacency, links, assignments),
     }
     graph = TrackGraph(adjacency=adjacency, links=links, assignments=assignments, schema=schema)
     frame_counts: dict[int, dict[str, int]] = {}
@@ -495,11 +554,309 @@ def track_minimum_centroid_distance(
     )
 
 
+def compute_boundary_motion(
+    trajectory: Any,
+    object_set: str,
+    track_set: str,
+    *,
+    boundary_set: str,
+    motion_set: str = "surface_ot",
+    boundary_source_id: int | None = None,
+    boundary_source_name: str | None = None,
+    boundary_source_role: str | None = None,
+    registration_set: str | None = None,
+    ot_method: str = "emd",
+    sinkhorn_regularization: float = 0.05,
+    max_boundary_points: int | None = 512,
+    mass_tolerance: float = 1e-12,
+    overwrite: bool = False,
+    save_outputs: bool = True,
+    metadata: Mapping[str, Any] | None = None,
+) -> BoundaryMotionResult:
+    """Map boundary points across every accepted link in a stored object graph.
+
+    Object tracking owns link selection. This function only calculates the
+    point-level transport attached to those links, making surface motion usable
+    with centroid, imported, or boundary-OT track graphs.
+    """
+
+    from celltraj2.boundaries import (
+        BoundaryLibraryView,
+        boundary_motion_link_dtype,
+        deterministic_point_sample,
+        optimal_transport_plan,
+        resolve_boundary_source_ids,
+    )
+
+    np = _require_numpy()
+    object_name = validate_name(object_set, kind="object set")
+    track_name = validate_name(track_set, kind="track set")
+    boundary_name = validate_name(boundary_set, kind="boundary set")
+    motion_name = validate_name(motion_set, kind="boundary motion set")
+    if ot_method not in {"emd", "sinkhorn"}:
+        raise ValueError("ot_method must be 'emd' or 'sinkhorn'")
+
+    graph = trajectory.store.read_track_graph(object_name, track_name)
+    boundary = BoundaryLibraryView(trajectory.store, boundary_name)
+    selected_source_ids = resolve_boundary_source_ids(
+        boundary,
+        source_ids=None if boundary_source_id is None else (boundary_source_id,),
+        source_names=None if boundary_source_name in (None, "") else (str(boundary_source_name),),
+        source_roles=None if boundary_source_role in (None, "") else (str(boundary_source_role),),
+        require_one=True,
+    )
+    selected_source_id = int(next(iter(selected_source_ids or ())))
+    source_record = next(
+        value for value in boundary.sources if int(value["source_id"]) == selected_source_id
+    )
+    if str(source_record.get("kind") or "") != "object_set":
+        raise ValueError("Boundary motion requires an object_set boundary source")
+    if str(source_record.get("object_set") or "") != object_name:
+        raise ValueError(
+            f"Boundary source {source_record.get('name')!r} belongs to object set "
+            f"{source_record.get('object_set')!r}, not {object_name!r}"
+        )
+
+    entity_by_observation: dict[int, int] = {}
+    for entity in boundary.entities:
+        if int(entity["source_id"]) != selected_source_id:
+            continue
+        observation_id = int(entity["observation_id"])
+        if observation_id > 0:
+            if observation_id in entity_by_observation:
+                raise ValueError(
+                    f"Boundary source {source_record.get('name')!r} has duplicate "
+                    f"observation_id={observation_id}"
+                )
+            entity_by_observation[observation_id] = int(entity["boundary_entity_id"])
+
+    scale = np.asarray(boundary.schema.get("coordinate_scale_zyx", (1.0, 1.0, 1.0)), dtype=float)
+    selected_registration = registration_set or trajectory.store.active_registration_name()
+    registration = None
+    if selected_registration:
+        registration = trajectory.store.read_registration_set(selected_registration)
+        registered_scale = np.asarray(registration.schema.get("coordinate_scale_zyx", scale), dtype=float)
+        if (
+            str(registration.schema.get("method")) != "identity"
+            and (
+                registered_scale.shape != (3,)
+                or not np.allclose(registered_scale, scale, rtol=1e-7, atol=1e-10)
+            )
+        ):
+            raise ValueError(
+                f"Registration set {registration.name!r} uses coordinate_scale_zyx "
+                f"{registered_scale.tolist()}, not boundary scale {scale.tolist()}"
+            )
+    registration_dependency = (
+        None
+        if registration is None
+        else {
+            "registration_set": registration.name,
+            "registration_digest": registration.digest,
+            "registration_method": str(registration.schema.get("method") or ""),
+        }
+    )
+    track_registration_dependency = graph.schema.get("registration_dependency")
+    track_registration_digest = str(
+        (track_registration_dependency or {}).get("registration_digest") or ""
+    )
+    motion_registration_digest = str(
+        (registration_dependency or {}).get("registration_digest") or ""
+    )
+    if track_registration_digest != motion_registration_digest:
+        raise ValueError(
+            "Surface motion registration does not match the selected object track graph: "
+            f"track digest={track_registration_digest!r}, motion digest={motion_registration_digest!r}"
+        )
+    boundary_dependency = {
+        "boundary_set": boundary_name,
+        "boundary_digest": str(boundary.schema.get("boundary_digest") or ""),
+        "source_id": selected_source_id,
+        "source_name": str(source_record.get("name") or ""),
+        "coordinate_system": "native_roi_physical",
+    }
+    track_dependency = {
+        "object_set": object_name,
+        "track_set": track_name,
+        "track_digest": str(
+            graph.schema.get("track_digest")
+            or track_graph_digest(graph.adjacency, graph.links, graph.assignments)
+        ),
+    }
+
+    point_cache: dict[int, dict[str, Any]] = {}
+
+    def registered_entity_points(entity_id: int) -> dict[str, Any]:
+        if entity_id in point_cache:
+            return point_cache[entity_id]
+        entity = boundary.entity(entity_id)
+        point_data = boundary.read_points(entity_id, fields=("point_id", "native_position_zyx"))
+        native = np.asarray(point_data["native_position_zyx"], dtype=float)
+        registered = native
+        if registration is not None:
+            registered = registration.apply_zyx(
+                native,
+                np.full(native.shape[0], int(entity["frame"]), dtype=np.int64),
+            )
+        result = {
+            "point_id": np.asarray(point_data["point_id"], dtype=np.int64),
+            "native": native,
+            "registered": registered,
+            "sample": deterministic_point_sample(native.shape[0], max_boundary_points),
+        }
+        point_cache[entity_id] = result
+        return result
+
+    motion_links: list[tuple[Any, ...]] = []
+    transport_columns: dict[str, list[Any]] = {
+        "source_point_id": [],
+        "target_point_id": [],
+        "mass": [],
+        "edge_cost": [],
+        "registered_displacement_zyx": [],
+    }
+    frame_counts: dict[int, dict[str, Any]] = {}
+    transport_start = 0
+    selected_methods: set[str] = set()
+    for motion_link_id, link in enumerate(graph.links, start=1):
+        parent_observation_id = int(link["parent_observation_id"])
+        child_observation_id = int(link["child_observation_id"])
+        if parent_observation_id not in entity_by_observation or child_observation_id not in entity_by_observation:
+            raise ValueError(
+                f"Boundary source {source_record.get('name')!r} lacks an entity for track link "
+                f"{parent_observation_id}->{child_observation_id}"
+            )
+        parent_entity_id = entity_by_observation[parent_observation_id]
+        child_entity_id = entity_by_observation[child_observation_id]
+        parent_points = registered_entity_points(parent_entity_id)
+        child_points = registered_entity_points(child_entity_id)
+        if not parent_points["sample"].size or not child_points["sample"].size:
+            raise ValueError(
+                f"Track link {parent_observation_id}->{child_observation_id} has an empty boundary"
+            )
+        plan = optimal_transport_plan(
+            parent_points["registered"][parent_points["sample"]],
+            child_points["registered"][child_points["sample"]],
+            method=ot_method,  # type: ignore[arg-type]
+            regularization=sinkhorn_regularization,
+            mass_tolerance=mass_tolerance,
+        )
+        selected_methods.add(str(plan.method))
+        source_local = parent_points["sample"][plan.source_rows]
+        target_local = child_points["sample"][plan.target_rows]
+        source_point_ids = parent_points["point_id"][source_local]
+        target_point_ids = child_points["point_id"][target_local]
+        displacement = child_points["registered"][target_local] - parent_points["registered"][source_local]
+        transport_count = int(plan.mass.shape[0])
+        source_frame = int(link["source_frame"])
+        target_frame = int(link["target_frame"])
+        motion_links.append(
+            (
+                motion_link_id,
+                int(link["link_id"]),
+                parent_entity_id,
+                child_entity_id,
+                parent_observation_id,
+                child_observation_id,
+                source_frame,
+                target_frame,
+                transport_start,
+                transport_count,
+                float(plan.total_cost),
+                float(np.sum(plan.mass)),
+                0,
+            )
+        )
+        transport_columns["source_point_id"].append(source_point_ids.astype(np.int64))
+        transport_columns["target_point_id"].append(target_point_ids.astype(np.int64))
+        transport_columns["mass"].append(np.asarray(plan.mass, dtype=np.float64))
+        transport_columns["edge_cost"].append(np.asarray(plan.edge_cost, dtype=np.float32))
+        transport_columns["registered_displacement_zyx"].append(np.asarray(displacement, dtype=np.float32))
+        transport_start += transport_count
+        frame_summary = frame_counts.setdefault(
+            target_frame,
+            {
+                "source_frame": source_frame,
+                "target_frame": target_frame,
+                "link_count": 0,
+                "transport_edge_count": 0,
+                "transported_mass": 0.0,
+                "ot_cost_sum": 0.0,
+            },
+        )
+        frame_summary["link_count"] += 1
+        frame_summary["transport_edge_count"] += transport_count
+        frame_summary["transported_mass"] += float(np.sum(plan.mass))
+        frame_summary["ot_cost_sum"] += float(plan.total_cost)
+
+    transport = {
+        key: (
+            np.concatenate(blocks, axis=0)
+            if blocks
+            else np.empty((0, 3), dtype=np.float32)
+            if key == "registered_displacement_zyx"
+            else np.empty(0, dtype=np.int64 if key.endswith("point_id") else np.float64)
+        )
+        for key, blocks in transport_columns.items()
+    }
+    for counts in frame_counts.values():
+        counts["mean_ot_cost"] = (
+            counts.pop("ot_cost_sum") / counts["link_count"] if counts["link_count"] else None
+        )
+    schema = {
+        "schema": "celltraj2.boundary_motion.v1",
+        "boundary_set": boundary_name,
+        "motion_set": motion_name,
+        "created_at": utc_now_iso(),
+        "source": f"/object_sets/{object_name}/tracks/{track_name}",
+        "boundary_dependency": boundary_dependency,
+        "track_dependency": track_dependency,
+        "registration_dependency": registration_dependency,
+        "point_identity_coordinate_system": "native_boundary_point_id",
+        "displacement_coordinate_system": "registered_roi_physical",
+        "displacement_definition": "T_target(q_native)-T_source(p_native)",
+        "ot_method_requested": ot_method,
+        "transport_methods": sorted(selected_methods),
+        "sinkhorn_regularization": float(sinkhorn_regularization),
+        "mass_tolerance": float(mass_tolerance),
+        "max_boundary_points": max_boundary_points,
+        "motion_link_count": len(motion_links),
+        "transport_edge_count": int(transport_start),
+        "metadata": dict(metadata or {}),
+    }
+    links = np.asarray(motion_links, dtype=boundary_motion_link_dtype())
+    motion_path = None
+    if save_outputs:
+        motion_path = trajectory.store.write_boundary_motion(
+            boundary_name,
+            motion_name,
+            links=links,
+            transport=transport,
+            schema=schema,
+            overwrite=overwrite,
+        )
+    return BoundaryMotionResult(
+        object_set=object_name,
+        track_set=track_name,
+        boundary_set=boundary_name,
+        motion_set=motion_name,
+        links=links,
+        transport=transport,
+        schema=schema,
+        saved=bool(save_outputs),
+        motion_path=motion_path,
+        frame_counts=frame_counts,
+    )
+
+
 def track_minimum_boundary_ot_cost(
     trajectory: Any,
     object_set: str,
     *,
-    boundary_set: str,
+    boundary_set: str | None = None,
+    boundary_source_id: int | None = None,
+    boundary_source_name: str | None = None,
+    boundary_source_role: str | None = None,
     max_distance: float,
     ot_cost_cutoff: float = float("inf"),
     track_set: str = "boundary_ot",
@@ -524,16 +881,20 @@ def track_minimum_boundary_ot_cost(
     """
 
     from celltraj2.boundaries import (
-        BoundaryLibraryView,
+        as_boundary_library_view,
         boundary_motion_link_dtype,
+        build_boundary_library,
         deterministic_point_sample,
         optimal_transport_plan,
+        resolve_boundary_source_ids,
     )
 
     np = _require_numpy()
     object_name = validate_name(object_set, kind="object set")
     track_name = validate_name(track_set, kind="track set")
-    boundary_name = validate_name(boundary_set, kind="boundary set")
+    boundary_name = validate_name(
+        boundary_set or f"transient_{object_name}", kind="boundary set"
+    )
     motion_name = validate_name(motion_set or track_name, kind="boundary motion set")
     cutoff = float(max_distance)
     ot_cutoff = float(ot_cost_cutoff)
@@ -543,6 +904,11 @@ def track_minimum_boundary_ot_cost(
         raise ValueError("ot_cost_cutoff must be > 0 and may be infinity")
     if ot_method not in {"emd", "sinkhorn"}:
         raise ValueError("ot_method must be 'emd' or 'sinkhorn'")
+    if boundary_set is None and save_motion and save_outputs:
+        raise ValueError(
+            "Persistent boundary motion requires a stored boundary_set; "
+            "disable save_motion or build the library first"
+        )
 
     observations = trajectory.store.read_observations(object_name)
     observation_count = int(observations.shape[0])
@@ -551,21 +917,50 @@ def track_minimum_boundary_ot_cost(
         np.asarray(observations["observation_id"], dtype=np.int64), expected_ids
     ):
         raise ValueError("Observation rows must align to one-based observation_id values")
-    boundary = BoundaryLibraryView(trajectory.store, boundary_name)
+    transient_library = None
+    if boundary_set is None:
+        transient_library = build_boundary_library(
+            trajectory,
+            boundary_name,
+            object_set=object_name,
+            save_outputs=False,
+            metadata={"purpose": "transient_boundary_ot_tracking"},
+        )
+    boundary = as_boundary_library_view(trajectory, boundary_name, transient_library)
     boundary_schema = boundary.schema
+    selected_source_ids = resolve_boundary_source_ids(
+        boundary,
+        source_ids=None if boundary_source_id is None else (boundary_source_id,),
+        source_names=None if boundary_source_name in (None, "") else (str(boundary_source_name),),
+        source_roles=None if boundary_source_role in (None, "") else (str(boundary_source_role),),
+        require_one=True,
+    )
+    selected_source_id = int(next(iter(selected_source_ids or ())))
+    source_record = next(
+        value for value in boundary.sources if int(value["source_id"]) == selected_source_id
+    )
+    if str(source_record.get("kind") or "") != "object_set":
+        raise ValueError("Boundary OT tracking requires an object_set boundary source")
+    if str(source_record.get("object_set") or "") != object_name:
+        raise ValueError(
+            f"Boundary source {source_record.get('name')!r} belongs to object set "
+            f"{source_record.get('object_set')!r}, not {object_name!r}"
+        )
     scale = np.asarray(boundary_schema.get("coordinate_scale_zyx", (1.0, 1.0, 1.0)), dtype=float)
     if scale.shape != (3,) or not np.all(np.isfinite(scale)) or np.any(scale <= 0):
         raise ValueError(f"Boundary set {boundary_name!r} has invalid coordinate_scale_zyx")
     distance_unit = str(boundary_schema.get("distance_unit") or "scaled_coordinate_unit")
     entity_by_observation: dict[int, int] = {}
     for entity in boundary.entities:
+        if int(entity["source_id"]) != selected_source_id:
+            continue
         observation_id = int(entity["observation_id"])
         if observation_id <= 0:
             continue
         if observation_id in entity_by_observation:
             raise ValueError(
-                f"Boundary set {boundary_name!r} has multiple entities for observation_id={observation_id}; "
-                "select a source-specific boundary library for tracking"
+                f"Boundary source {source_record.get('name')!r} has multiple entities for "
+                f"observation_id={observation_id}"
             )
         entity_by_observation[observation_id] = int(entity["boundary_entity_id"])
     missing = [int(value) for value in expected_ids if int(value) not in entity_by_observation]
@@ -612,6 +1007,9 @@ def track_minimum_boundary_ot_cost(
         "boundary_set": boundary_name,
         "boundary_digest": str(boundary_schema.get("boundary_digest") or ""),
         "coordinate_system": "native_roi_physical",
+        "stored": boundary_set is not None,
+        "source_id": selected_source_id,
+        "source_name": str(source_record.get("name") or ""),
     }
 
     point_cache: dict[int, dict[str, Any]] = {}
@@ -726,6 +1124,8 @@ def track_minimum_boundary_ot_cost(
         "coordinate_scale": scale.tolist(),
         "registration_dependency": registration_dependency,
         "boundary_dependency": boundary_dependency,
+        "boundary_source_id": selected_source_id,
+        "boundary_source_name": str(source_record.get("name") or ""),
         "ot_method_requested": ot_method,
         "sinkhorn_regularization": float(sinkhorn_regularization),
         "max_boundary_points": max_boundary_points,
@@ -748,6 +1148,7 @@ def track_minimum_boundary_ot_cost(
         },
         "link_count": int(links.shape[0]),
         "observation_count": observation_count,
+        "track_digest": track_graph_digest(adjacency, links, assignments),
     }
     graph = TrackGraph(adjacency=adjacency, links=links, assignments=assignments, schema=schema)
 
@@ -774,7 +1175,7 @@ def track_minimum_boundary_ot_cost(
             schema=schema,
             overwrite=overwrite,
         )
-        if save_motion:
+        if save_motion and boundary_set is not None:
             motion_links: list[tuple[Any, ...]] = []
             transport_columns: dict[str, list[Any]] = {
                 "source_point_id": [],
@@ -841,6 +1242,11 @@ def track_minimum_boundary_ot_cost(
                 "created_at": utc_now_iso(),
                 "source": f"/object_sets/{object_name}/tracks/{track_name}",
                 "boundary_dependency": boundary_dependency,
+                "track_dependency": {
+                    "object_set": object_name,
+                    "track_set": track_name,
+                    "track_digest": schema["track_digest"],
+                },
                 "registration_dependency": registration_dependency,
                 "point_identity_coordinate_system": "native_boundary_point_id",
                 "displacement_coordinate_system": "registered_roi_physical",

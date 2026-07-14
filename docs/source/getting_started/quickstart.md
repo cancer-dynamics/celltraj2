@@ -83,6 +83,32 @@ with Trajectory(path) as traj:
     )
 ```
 
+Boundary OT can also calculate transient object boundaries when only the object
+links are needed:
+
+```python
+with Trajectory(path) as traj:
+    result = traj.track_minimum_boundary_ot_cost(
+        "epithelial",
+        boundary_set=None,
+        max_distance=8.0,
+        save_motion=False,
+    )
+```
+
+Surface motion is independently calculable for any saved object track graph:
+
+```python
+with Trajectory(path) as traj:
+    motion = traj.compute_boundary_motion(
+        "epithelial",
+        "centroid_mindist",
+        boundary_set="cell_surfaces",
+        boundary_source_name="epithelial",
+        motion_set="surface_ot",
+    )
+```
+
 ## Run A Dry Batch Segmentation
 
 Batch execution can be driven by any callable. This is the same executor shape

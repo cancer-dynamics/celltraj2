@@ -178,6 +178,39 @@ class SparseTrackingTests(unittest.TestCase):
                 {"h5_path": "sample.h5", "object_set": "cells", "method": "optimal_transport"}
             )
 
+    def test_boundary_ot_batch_supports_transient_boundaries(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "sample.ct2.h5"
+            self._create_indexed_h5(path)
+            events = []
+            summary = run_batch_tracking(
+                {
+                    "job_id": "transient_boundary_batch",
+                    "save_outputs": False,
+                    "files": [
+                        {
+                            "h5_path": str(path),
+                            "object_set": "cells",
+                            "track_set": "transient_ot",
+                            "method": "boundary_ot",
+                            "max_distance": 2.0,
+                            "ot_method": "sinkhorn",
+                            "max_boundary_points": None,
+                            "save_motion": False,
+                        }
+                    ],
+                },
+                reporter=events.append,
+            )
+            self.assertEqual(summary.completed, 1)
+            self.assertGreater(summary.links, 0)
+            started = next(event for event in events if event.get("event") == "file_started")
+            self.assertEqual(started["method"], "minimum_registered_boundary_ot_cost")
+            self.assertIsNone(started["boundary_set"])
+            with Trajectory(path, mode="r") as trajectory:
+                self.assertEqual(trajectory.boundary_sets(), [])
+                self.assertEqual(trajectory.track_sets("cells"), [])
+
     def test_batch_tracking_dry_run_and_saved_provenance(self):
         with TemporaryDirectory() as tmp:
             path = Path(tmp) / "sample.ct2.h5"
