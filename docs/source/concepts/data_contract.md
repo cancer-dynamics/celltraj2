@@ -261,6 +261,10 @@ Registration runs write provenance under `/runs/registration/<run_id>/`.
 Test jobs calculate the same matrices and canvas with `save_outputs=false` but
 do not change the H5. Saved jobs may make their result active. Consumers should
 resolve an explicit registration set first and otherwise use the active set.
+Batch jobs stream one `registration_frame_summary` event as soon as each frame
+is resolved, with its transform/status and pairwise optimizer diagnostics when
+applicable. These live events are screen/log provenance; the final canonical
+matrices and pairwise table remain the stored H5 contract.
 
 Stored raw images, labels, masks, bounding boxes, and centroids remain on their
 native grids. Viewers apply the active transform at display time, and
@@ -269,6 +273,67 @@ distance, or motility. This preserves editable/native segmentation data and
 avoids interpolation loss. Any derived result that depends on a registration
 must record both `registration_set` and `registration_digest`; a consumer must
 not silently co-render it under a different active digest.
+
+## Boundary Libraries
+
+Boundary libraries are ROI-level, named artifacts under `/boundaries/`. They
+store immutable geometry extracted from object labels, standalone label sets,
+and binary mask surfaces without applying global registration:
+
+```text
+/boundaries/<boundary_set>/
+  sources.json
+  schema.json
+  entities
+  points/
+    point_id
+    boundary_entity_id
+    frame
+    native_index_zyx
+    native_position_zyx
+    orientation_hint_zyx
+  entity_attributes/<attribute_set>/
+  geometry/<geometry_set>/
+  neighbors/<neighbor_set>/
+  motion/<motion_set>/
+```
+
+`boundary_entity_id` and `point_id` are one-based identities local to the
+boundary set. Every entity owns one contiguous, zero-based half-open point span
+described by `point_start` and `point_count`. An entity from an indexed object
+set carries its canonical `observation_id`; standalone labels use their native
+positive `source_label_id`; masks become explicitly named surface entities.
+State, cell type, biological role, and other classifications are row-aligned
+entity attributes, never overloaded identity numbers.
+
+Point columns are stored independently so consumers can read only the fields
+and entity spans needed from libraries containing millions of points. Native
+index coordinates retain the original array grid. Native positions apply the
+stored physical Z/Y/X calibration but no registration. The schema contains a
+stable `boundary_digest` for geometry, neighbor, tracking, and motion
+dependencies.
+
+Geometry sets are point-row-aligned and store oriented normals, tangent frames,
+principal/mean/Gaussian curvature, quality flags, and the surface kNN topology
+as CSR. The 3D surface backend follows the tissue-kinematic model: `pcdiff`
+builds the kNN graph, local basis, and surface differential operators; curvature
+comes from the symmetric shape operator `-grad_surface(normal)`. Two-dimensional
+boundaries use a deterministic local curve estimator. Mask inside/outside
+adjacency supplies the primary normal-orientation hint.
+
+Neighbor sets are also CSR over point rows. Their target indices join directly
+back to boundary point and entity metadata, allowing interactions to be sliced
+by source, mask role, cell type, state, or frame without duplicating target
+coordinates. Same-frame neighbor geometry is native and has no registration
+dependency.
+
+Between-frame boundary OT is different: candidate gating, transport cost, and
+displacement are calculated in registered physical coordinates. Motion sets
+retain native source and target `point_id` values, transport mass/cost, and the
+registered displacement
+`T_target(q_native) - T_source(p_native)`. Both the boundary set/digest and
+registration set/digest are recorded. Changing registration invalidates the
+derived track/motion set but never rewrites the boundary library.
 
 ## Sparse Lineage Graphs
 

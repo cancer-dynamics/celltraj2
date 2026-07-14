@@ -8,6 +8,18 @@ from celltraj2.batch import (
     SegmentationResult,
     run_batch_segmentation,
 )
+from celltraj2.boundaries import (
+    BoundaryGeometryResult,
+    BoundaryLibraryResult,
+    BoundaryLibraryView,
+    BoundaryNeighborResult,
+    BoundarySourceSpec,
+    BoundaryTransportPlan,
+    build_boundary_library,
+    compute_boundary_geometry,
+    compute_boundary_neighbors,
+    optimal_transport_plan,
+)
 from celltraj2.feature_extraction import (
     BatchFeatureExtractionSummary,
     FeatureExtractionBatchJob,
@@ -53,6 +65,7 @@ from celltraj2.tracking import (
     SparseAdjacency,
     TrackGraph,
     TrackingResult,
+    track_minimum_boundary_ot_cost,
     track_minimum_centroid_distance,
 )
 from celltraj2.tracking_batch import (
@@ -69,6 +82,12 @@ __all__ = [
     "BatchFeatureExtractionSummary",
     "BatchObjectIndexSummary",
     "BatchRegistrationSummary",
+    "BoundaryGeometryResult",
+    "BoundaryLibraryResult",
+    "BoundaryLibraryView",
+    "BoundaryNeighborResult",
+    "BoundarySourceSpec",
+    "BoundaryTransportPlan",
     "ChannelSpec",
     "FeatureExtractionBatchJob",
     "FeatureExtractionFileJob",
@@ -97,9 +116,13 @@ __all__ = [
     "Trajectory",
     "TrajectoryMetadata",
     "TrajectoryStore",
+    "build_boundary_library",
+    "compute_boundary_geometry",
+    "compute_boundary_neighbors",
     "extract_feature_set",
     "estimate_pair_translation",
     "index_object_set",
+    "optimal_transport_plan",
     "regionprops_v1_spec",
     "register_global_translation",
     "run_batch_registration",
@@ -108,6 +131,7 @@ __all__ = [
     "run_batch_segmentation",
     "run_batch_tracking",
     "site_signaling_v1_spec",
+    "track_minimum_boundary_ot_cost",
     "track_minimum_centroid_distance",
 ]
 

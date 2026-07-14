@@ -110,6 +110,7 @@ class GlobalRegistrationTests(unittest.TestCase):
             "objective_score": 0.0,
             "optimizer_nit": 1,
         }
+        progress_events = []
         with patch(
             "celltraj2.registration.estimate_pair_translation",
             side_effect=[failed, recovered],
@@ -118,6 +119,7 @@ class GlobalRegistrationTests(unittest.TestCase):
                 FakeTrajectory(),
                 "cells",
                 save_outputs=False,
+                progress=progress_events.append,
             )
 
         pairs = result.registration.pairwise_results
@@ -126,6 +128,10 @@ class GlobalRegistrationTests(unittest.TestCase):
         self.assertEqual(pairs[1]["target_frame"], 3)
         self.assertEqual(int(result.registration.frame_status[1]), FRAME_STATUS["failed"])
         self.assertEqual(int(result.registration.frame_status[2]), FRAME_STATUS["estimated"])
+        self.assertEqual([event["frame"] for event in progress_events], [1, 2, 3])
+        self.assertEqual([event["status"] for event in progress_events], ["reference", "failed", "estimated"])
+        self.assertEqual(progress_events[2]["source_frame"], 1)
+        self.assertIn("objective_score", progress_events[2])
 
     def _create_drift_h5(self, path: Path, *, partial: bool = False) -> None:
         self.require_h5py()
@@ -263,8 +269,17 @@ class GlobalRegistrationTests(unittest.TestCase):
                     ],
                 }
             )
-            preview = run_batch_registration(job)
+            preview_events = []
+            preview = run_batch_registration(job, reporter=preview_events.append)
             self.assertEqual(preview.completed, 1)
+            frame_events = [
+                event for event in preview_events if event.get("event") == "registration_frame_summary"
+            ]
+            self.assertEqual([event["frame"] for event in frame_events], [1, 2])
+            self.assertLess(
+                preview_events.index(frame_events[-1]),
+                next(index for index, event in enumerate(preview_events) if event.get("event") == "file_completed"),
+            )
             with Trajectory(path) as trajectory:
                 self.assertEqual(trajectory.registration_sets(), ["identity"])
             saved = run_batch_registration(

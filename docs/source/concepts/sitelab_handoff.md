@@ -309,6 +309,21 @@ it is not folded into analytical coordinates. New celltraj2 H5 files already
 contain an active `identity` set so every consumer has defined behavior before
 a computed run.
 
+The registration API accepts a progress callback, and the batch worker emits a
+`registration_frame_summary` JSONL event immediately when every frame is
+resolved. Events include reference/inherited/estimated/failed status, absolute
+Z/Y/X translation, object count, and, for estimated pairs, source frame, frame
+gap, relative translation, source/target counts, coarse/refined/final scores,
+optimizer method, and iteration count. SITE should render these events in its
+visible output panel as they arrive and preserve them in the job log and
+`events.jsonl`; it should not defer frame output until the file finishes.
+
+This follows the broader SITE interaction preference: calculation workers
+should stream verbose per-file, per-frame, and per-step inputs, intermediate
+results, quality metrics, and save/skip/failure state whenever those values are
+available. A final aggregate summary supplements rather than replaces live
+progress.
+
 After choosing an active indexed object set, SITE launches minimum-centroid
 tracking through:
 
@@ -397,6 +412,15 @@ lookup/observation row spine: SITE colors by row-aligned `lineage_id` and uses
 the CSR graph plus unique-parent cache to retain an observation's ancestors and
 descendants as frames change. Tracklet assignments can also be converted to
 napari-ready track rows and split-graph metadata.
+
+For a selected observation with stored tracks and numeric features, SITE can
+launch a feature-trajectory plot directly from the ROI object panel. It follows
+the unique `parent_observation_id` chain to the root, chooses the longest
+root-to-leaf branch containing the selection by default, and can add every
+forward child branch. Feature values remain row-aligned lookups from
+`features/<feature_set>/values`; no trajectory-specific feature copy is
+written. Saved plot sidecars use `sitelab.feature_trajectory_plot.v1` and
+record the exact observation-id branches rendered.
 
 The ROI navigator reports the active registration set, method, reference
 frame, current-frame Z/Y/X translation and status, and registered canvas size.

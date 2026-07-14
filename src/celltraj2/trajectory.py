@@ -6,6 +6,13 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Sequence
 
+from celltraj2.boundaries import (
+    BoundaryGeometryResult,
+    BoundaryLibraryResult,
+    BoundaryLibraryView,
+    BoundaryNeighborResult,
+    BoundarySourceSpec,
+)
 from celltraj2.objects import ObjectIndexResult, index_object_set
 from celltraj2.schema import ImageSourceSpec, TrajectoryMetadata
 from celltraj2.sources import ImageSource, image_source_from_spec
@@ -154,6 +161,71 @@ class ObjectSet:
 
     def read_tracks(self, track_set: str) -> Any:
         return self.trajectory.store.read_track_graph(self.name, track_set)
+
+    def build_boundary_library(
+        self,
+        boundary_set: str = "native",
+        *,
+        frames: Sequence[int] | None = None,
+        coordinate_scale: Sequence[float] | None = None,
+        overwrite: bool = False,
+        save_outputs: bool = True,
+        metadata: dict[str, Any] | None = None,
+    ) -> BoundaryLibraryResult:
+        """Build native boundaries for this indexed object set."""
+
+        return self.trajectory.build_boundary_library(
+            boundary_set,
+            object_set=self.name,
+            frames=frames,
+            coordinate_scale=coordinate_scale,
+            overwrite=overwrite,
+            save_outputs=save_outputs,
+            metadata=metadata,
+        )
+
+    def track_minimum_boundary_ot_cost(
+        self,
+        *,
+        boundary_set: str,
+        max_distance: float,
+        ot_cost_cutoff: float = float("inf"),
+        track_set: str = "boundary_ot",
+        motion_set: str | None = None,
+        registration_set: str | None = None,
+        ot_method: str = "emd",
+        sinkhorn_regularization: float = 0.05,
+        max_boundary_points: int | None = 512,
+        mass_tolerance: float = 1e-12,
+        save_motion: bool = True,
+        overwrite: bool = False,
+        save_outputs: bool = True,
+        run_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> Any:
+        """Track this object set using registered boundary OT costs."""
+
+        from celltraj2.tracking import track_minimum_boundary_ot_cost
+
+        return track_minimum_boundary_ot_cost(
+            self.trajectory,
+            self.name,
+            boundary_set=boundary_set,
+            max_distance=max_distance,
+            ot_cost_cutoff=ot_cost_cutoff,
+            track_set=track_set,
+            motion_set=motion_set,
+            registration_set=registration_set,
+            ot_method=ot_method,
+            sinkhorn_regularization=sinkhorn_regularization,
+            max_boundary_points=max_boundary_points,
+            mass_tolerance=mass_tolerance,
+            save_motion=save_motion,
+            overwrite=overwrite,
+            save_outputs=save_outputs,
+            run_id=run_id,
+            metadata=metadata,
+        )
 
 
 class Trajectory:
@@ -313,6 +385,113 @@ class Trajectory:
     def object_sets(self) -> list[str]:
         return self.store.list_object_sets()
 
+    def build_boundary_library(
+        self,
+        boundary_set: str,
+        *,
+        sources: Sequence[BoundarySourceSpec | Mapping[str, Any]] | None = None,
+        object_set: str | None = None,
+        frames: Sequence[int] | None = None,
+        coordinate_scale: Sequence[float] | None = None,
+        overwrite: bool = False,
+        save_outputs: bool = True,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> BoundaryLibraryResult:
+        """Build a native boundary library from indexed objects, labels, or masks."""
+
+        from celltraj2.boundaries import build_boundary_library
+
+        return build_boundary_library(
+            self,
+            boundary_set,
+            sources=sources,
+            object_set=object_set,
+            frames=frames,
+            coordinate_scale=coordinate_scale,
+            overwrite=overwrite,
+            save_outputs=save_outputs,
+            metadata=metadata,
+        )
+
+    def boundary_library(self, boundary_set: str) -> BoundaryLibraryView:
+        return self.store.boundary_library(boundary_set)
+
+    def boundary_sets(self) -> list[str]:
+        return self.store.list_boundary_sets()
+
+    def compute_boundary_geometry(
+        self,
+        boundary_set: str,
+        *,
+        geometry_set: str = "surface_v1",
+        knn: int = 40,
+        backend: str = "auto",
+        overwrite: bool = False,
+        save_outputs: bool = True,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> BoundaryGeometryResult:
+        from celltraj2.boundaries import compute_boundary_geometry
+
+        return compute_boundary_geometry(
+            self,
+            boundary_set,
+            geometry_set=geometry_set,
+            knn=knn,
+            backend=backend,  # type: ignore[arg-type]
+            overwrite=overwrite,
+            save_outputs=save_outputs,
+            metadata=metadata,
+        )
+
+    def compute_boundary_neighbors(
+        self,
+        boundary_set: str,
+        *,
+        neighbor_set: str = "nearest_external_v1",
+        k: int = 1,
+        source_entity_ids: Sequence[int] | None = None,
+        target_entity_ids: Sequence[int] | None = None,
+        same_frame: bool = True,
+        exclude_same_entity: bool = True,
+        max_distance: float | None = None,
+        overwrite: bool = False,
+        save_outputs: bool = True,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> BoundaryNeighborResult:
+        from celltraj2.boundaries import compute_boundary_neighbors
+
+        return compute_boundary_neighbors(
+            self,
+            boundary_set,
+            neighbor_set=neighbor_set,
+            k=k,
+            source_entity_ids=source_entity_ids,
+            target_entity_ids=target_entity_ids,
+            same_frame=same_frame,
+            exclude_same_entity=exclude_same_entity,
+            max_distance=max_distance,
+            overwrite=overwrite,
+            save_outputs=save_outputs,
+            metadata=metadata,
+        )
+
+    def write_boundary_entity_attributes(
+        self,
+        boundary_set: str,
+        attribute_set: str,
+        values: Any,
+        schema: Mapping[str, Any],
+        *,
+        overwrite: bool = False,
+    ) -> str:
+        return self.store.write_boundary_entity_attributes(
+            boundary_set,
+            attribute_set,
+            values,
+            schema,
+            overwrite=overwrite,
+        )
+
     def write_observations(
         self,
         object_set: str,
@@ -425,6 +604,44 @@ class Trajectory:
 
     def tracking_runs(self) -> list[str]:
         return self.store.list_tracking_runs()
+
+    def track_minimum_boundary_ot_cost(
+        self,
+        object_set: str,
+        *,
+        boundary_set: str,
+        max_distance: float,
+        ot_cost_cutoff: float = float("inf"),
+        track_set: str = "boundary_ot",
+        motion_set: str | None = None,
+        registration_set: str | None = None,
+        ot_method: str = "emd",
+        sinkhorn_regularization: float = 0.05,
+        max_boundary_points: int | None = 512,
+        mass_tolerance: float = 1e-12,
+        save_motion: bool = True,
+        overwrite: bool = False,
+        save_outputs: bool = True,
+        run_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> Any:
+        return self.object_set(object_set).track_minimum_boundary_ot_cost(
+            boundary_set=boundary_set,
+            max_distance=max_distance,
+            ot_cost_cutoff=ot_cost_cutoff,
+            track_set=track_set,
+            motion_set=motion_set,
+            registration_set=registration_set,
+            ot_method=ot_method,
+            sinkhorn_regularization=sinkhorn_regularization,
+            max_boundary_points=max_boundary_points,
+            mass_tolerance=mass_tolerance,
+            save_motion=save_motion,
+            overwrite=overwrite,
+            save_outputs=save_outputs,
+            run_id=run_id,
+            metadata=metadata,
+        )
 
     def extract_features(
         self,

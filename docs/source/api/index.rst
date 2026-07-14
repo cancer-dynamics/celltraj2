@@ -7,6 +7,7 @@ API Reference
    paths
    schema
    model_input
+   boundaries
    batch
    features
    feature_extraction

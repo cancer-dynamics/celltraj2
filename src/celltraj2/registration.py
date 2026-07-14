@@ -6,7 +6,7 @@ import hashlib
 import itertools
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from celltraj2.paths import validate_name
 from celltraj2.schema import utc_now_iso
@@ -518,6 +518,7 @@ def register_global_translation(
     set_active: bool = True,
     run_id: str | None = None,
     metadata: Mapping[str, Any] | None = None,
+    progress: Callable[[Mapping[str, Any]], None] | None = None,
 ) -> RegistrationResult:
     """Register all ROI frames from one indexed object's centroid point clouds."""
 
@@ -557,12 +558,37 @@ def register_global_translation(
     previous_anchor = reference_frame
     previous_translation = np.zeros(ndim, dtype=float)
     optimizer_methods: set[str] = set()
+
+    def report_frame(frame: int, **details: Any) -> None:
+        if progress is None:
+            return
+        translation_zyx = np.zeros(3, dtype=float)
+        translation_zyx[axis_indices] = transforms[int(frame) - 1, :-1, -1]
+        progress(
+            {
+                "frame": int(frame),
+                "status": FRAME_STATUS_NAMES.get(int(status[int(frame) - 1]), "unknown"),
+                "translation_zyx": translation_zyx.tolist(),
+                "coordinate_unit": unit,
+                "object_count": int(points_by_frame.get(int(frame), np.zeros((0, ndim))).shape[0]),
+                **details,
+            }
+        )
+
+    for identity_frame in range(1, reference_frame):
+        report_frame(identity_frame, note="before first available registration anchor")
+    report_frame(reference_frame, note="registration reference frame")
     for target_frame in anchors[1:]:
         gap = int(target_frame - previous_anchor)
         for inherited_frame in range(previous_anchor + 1, target_frame):
             if status[inherited_frame - 1] == FRAME_STATUS["identity"]:
                 transforms[inherited_frame - 1, :-1, -1] = previous_translation
                 status[inherited_frame - 1] = FRAME_STATUS["inherited"]
+                report_frame(
+                    inherited_frame,
+                    inherited_from_frame=int(previous_anchor),
+                    note="no indexed observations; inherited prior absolute transform",
+                )
         max_shift = np.asarray(
             [float(max_shift_per_frame)] * ndim if np.isscalar(max_shift_per_frame) else max_shift_per_frame,
             dtype=float,
@@ -604,6 +630,20 @@ def register_global_translation(
                 0 if success else 1,
             )
         )
+        report_frame(
+            target_frame,
+            source_frame=int(previous_anchor),
+            frame_gap=int(gap),
+            relative_translation_zyx=shift_zyx.tolist(),
+            source_count=int(points_by_frame[previous_anchor].shape[0]),
+            target_count=int(points_by_frame[target_frame].shape[0]),
+            coarse_score=float(estimate["coarse_score"]),
+            refined_score=float(estimate["refined_score"]),
+            objective_score=float(estimate["objective_score"]),
+            optimizer_method=str(estimate["optimizer_method"]),
+            optimizer_nit=int(estimate["optimizer_nit"]),
+            note="pairwise transform estimated" if success else "pairwise estimation failed; retained prior transform",
+        )
         if success:
             previous_anchor = target_frame
             previous_translation = target_translation
@@ -611,6 +651,11 @@ def register_global_translation(
         if status[inherited_frame - 1] == FRAME_STATUS["identity"]:
             transforms[inherited_frame - 1, :-1, -1] = previous_translation
             status[inherited_frame - 1] = FRAME_STATUS["inherited"]
+            report_frame(
+                inherited_frame,
+                inherited_from_frame=int(previous_anchor),
+                note="no later indexed observations; inherited prior absolute transform",
+            )
 
     pairwise = np.asarray(pair_records, dtype=pairwise_result_dtype())
     native_shape = _source_label_shape(trajectory, object_name, axes) or registration_native_shape(trajectory.metadata, axes)

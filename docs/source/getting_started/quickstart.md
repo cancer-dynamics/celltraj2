@@ -51,6 +51,38 @@ with Trajectory(path) as traj:
 
 Missing label or mask frame datasets mean "not processed yet", not "empty".
 
+## Build And Query Native Boundaries
+
+Index objects first, then build a boundary library. Stored points remain in
+native ROI coordinates; registration is applied only by registered views and
+between-frame analyses.
+
+```python
+with Trajectory(path) as traj:
+    traj.index_observations("epithelial")
+    traj.object_set("epithelial").build_boundary_library("cell_surfaces")
+    traj.compute_boundary_geometry("cell_surfaces", geometry_set="surface_v1")
+    traj.compute_boundary_neighbors("cell_surfaces", neighbor_set="nearest_external")
+
+    boundaries = traj.boundary_library("cell_surfaces")
+    entity_id = boundaries.entity_id_for_observation(1)
+    native_points = boundaries.native_positions(entity_id)
+    display_points = boundaries.registered_positions(entity_id)
+```
+
+Registered boundary OT tracking writes the normal sparse track graph plus a
+point-level motion set:
+
+```python
+with Trajectory(path) as traj:
+    result = traj.track_minimum_boundary_ot_cost(
+        "epithelial",
+        boundary_set="cell_surfaces",
+        max_distance=8.0,
+        track_set="boundary_ot",
+    )
+```
+
 ## Run A Dry Batch Segmentation
 
 Batch execution can be driven by any callable. This is the same executor shape

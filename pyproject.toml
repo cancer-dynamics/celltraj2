@@ -50,6 +50,8 @@ analysis = [
   "h5py>=3.10",
   "scipy>=1.10",
   "scikit-image>=0.22",
+  "pcdiff==1.0.1",
+  "POT>=0.9.4,<1",
   "zarr>=2.18",
   "dask[array]>=2024",
   "xarray>=2024",

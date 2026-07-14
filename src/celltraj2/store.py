@@ -104,6 +104,7 @@ class TrajectoryStore:
             "labels",
             "masks",
             "registrations",
+            "boundaries",
             "object_sets",
             "cells",
             "features",
@@ -368,6 +369,257 @@ class TrajectoryStore:
         if "object_sets" not in self._h5:
             return []
         return sorted(str(key) for key in self._h5["object_sets"].keys())
+
+    def write_boundary_library(
+        self,
+        boundary_set: str,
+        *,
+        entities: Any,
+        points: Mapping[str, Any],
+        sources: list[Mapping[str, Any]],
+        schema: Mapping[str, Any],
+        overwrite: bool = False,
+    ) -> str:
+        """Write one columnar native-coordinate boundary library."""
+
+        name = validate_name(boundary_set, kind="boundary set")
+        group_path = f"boundaries/{name}"
+        if group_path in self._h5:
+            if not overwrite:
+                raise FileExistsError(f"/{group_path}")
+            del self._h5[group_path]
+        group = self._h5.require_group(group_path)
+        entity_dataset = group.create_dataset("entities", data=entities, compression="gzip", shuffle=True)
+        entity_dataset.attrs["boundary_entity_id_base"] = 1
+        entity_dataset.attrs["point_span"] = "zero_based_half_open_point_start_point_count"
+        point_group = group.require_group("points")
+        expected_count: int | None = None
+        for column_name, values in points.items():
+            column = str(column_name)
+            count = int(getattr(values, "shape", (0,))[0])
+            if expected_count is None:
+                expected_count = count
+            elif count != expected_count:
+                raise ValueError(
+                    f"Boundary point column {column!r} has {count} rows; expected {expected_count}"
+                )
+            dataset = point_group.create_dataset(column, data=values, compression="gzip", shuffle=True)
+            dataset.attrs["row_alignment"] = f"/boundaries/{name}/points/point_id"
+        point_group.attrs["point_id_base"] = 1
+        point_group.attrs["row_alignment"] = "row_index_zero_based_maps_to_point_id_minus_1"
+        group.require_group("entity_attributes")
+        group.require_group("geometry")
+        group.require_group("neighbors")
+        group.require_group("motion")
+        self.write_json(f"/{group_path}/sources.json", [dict(value) for value in sources], overwrite=True)
+        self.write_json(f"/{group_path}/schema.json", dict(schema), overwrite=True)
+        return f"/{group_path}"
+
+    def boundary_library(self, boundary_set: str) -> Any:
+        """Return a lazy H5-backed boundary-library view."""
+
+        from celltraj2.boundaries import BoundaryLibraryView
+
+        return BoundaryLibraryView(self, boundary_set)
+
+    def list_boundary_sets(self) -> list[str]:
+        path = "boundaries"
+        if path not in self._h5:
+            return []
+        return sorted(str(key) for key in self._h5[path].keys())
+
+    def has_boundary_set(self, boundary_set: str) -> bool:
+        name = validate_name(boundary_set, kind="boundary set")
+        return f"boundaries/{name}/points/point_id" in self._h5
+
+    def write_boundary_entity_attributes(
+        self,
+        boundary_set: str,
+        attribute_set: str,
+        values: Any,
+        schema: Mapping[str, Any],
+        *,
+        overwrite: bool = False,
+    ) -> str:
+        """Write a table aligned to the boundary entity table."""
+
+        boundary_name = validate_name(boundary_set, kind="boundary set")
+        attribute_name = validate_name(attribute_set, kind="boundary entity attribute set")
+        base_path = f"boundaries/{boundary_name}"
+        if f"{base_path}/entities" not in self._h5:
+            raise KeyError(f"/{base_path}")
+        expected = int(self._h5[f"{base_path}/entities"].shape[0])
+        actual = int(getattr(values, "shape", (0,))[0])
+        if actual != expected:
+            raise ValueError(f"Boundary entity attributes have {actual} rows; expected {expected}")
+        group_path = f"{base_path}/entity_attributes/{attribute_name}"
+        if group_path in self._h5:
+            if not overwrite:
+                raise FileExistsError(f"/{group_path}")
+            del self._h5[group_path]
+        group = self._h5.require_group(group_path)
+        dataset = group.create_dataset("values", data=values, compression="gzip", shuffle=True)
+        dataset.attrs["row_alignment"] = f"/boundaries/{boundary_name}/entities"
+        self.write_json(f"/{group_path}/schema.json", dict(schema), overwrite=True)
+        return f"/{group_path}/values"
+
+    def read_boundary_entity_attributes(self, boundary_set: str, attribute_set: str) -> Any:
+        boundary_name = validate_name(boundary_set, kind="boundary set")
+        attribute_name = validate_name(attribute_set, kind="boundary entity attribute set")
+        return self._h5[
+            f"boundaries/{boundary_name}/entity_attributes/{attribute_name}/values"
+        ][()]
+
+    def list_boundary_entity_attribute_sets(self, boundary_set: str) -> list[str]:
+        boundary_name = validate_name(boundary_set, kind="boundary set")
+        path = f"boundaries/{boundary_name}/entity_attributes"
+        if path not in self._h5:
+            return []
+        return sorted(str(key) for key in self._h5[path].keys())
+
+    def write_boundary_geometry(
+        self,
+        boundary_set: str,
+        geometry_set: str,
+        *,
+        values: Mapping[str, Any],
+        topology_indptr: Any,
+        topology_indices: Any,
+        schema: Mapping[str, Any],
+        overwrite: bool = False,
+    ) -> str:
+        """Write point-row-aligned geometry columns."""
+
+        boundary_name = validate_name(boundary_set, kind="boundary set")
+        geometry_name = validate_name(geometry_set, kind="boundary geometry set")
+        base_path = f"boundaries/{boundary_name}"
+        if f"{base_path}/points/point_id" not in self._h5:
+            raise KeyError(f"/{base_path}")
+        expected = int(self._h5[f"{base_path}/points/point_id"].shape[0])
+        group_path = f"{base_path}/geometry/{geometry_name}"
+        if group_path in self._h5:
+            if not overwrite:
+                raise FileExistsError(f"/{group_path}")
+            del self._h5[group_path]
+        group = self._h5.require_group(group_path)
+        for column_name, column_values in values.items():
+            actual = int(getattr(column_values, "shape", (0,))[0])
+            if actual != expected:
+                raise ValueError(
+                    f"Boundary geometry column {column_name!r} has {actual} rows; expected {expected}"
+                )
+            dataset = group.create_dataset(
+                str(column_name), data=column_values, compression="gzip", shuffle=True
+            )
+            dataset.attrs["row_alignment"] = f"/boundaries/{boundary_name}/points/point_id"
+        if int(getattr(topology_indptr, "shape", (0,))[0]) != expected + 1:
+            raise ValueError("Boundary geometry topology indptr must have point_count + 1 rows")
+        topology_group = group.require_group("topology")
+        topology_group.attrs["format"] = "csr"
+        topology_group.attrs["row_alignment"] = f"/boundaries/{boundary_name}/points/point_id"
+        topology_group.create_dataset(
+            "indptr", data=topology_indptr, compression="gzip", shuffle=True
+        )
+        topology_group.create_dataset(
+            "indices", data=topology_indices, compression="gzip", shuffle=True
+        )
+        self.write_json(f"/{group_path}/schema.json", dict(schema), overwrite=True)
+        return f"/{group_path}"
+
+    def write_boundary_neighbors(
+        self,
+        boundary_set: str,
+        neighbor_set: str,
+        *,
+        indptr: Any,
+        indices: Any,
+        distance: Any,
+        displacement_zyx: Any,
+        schema: Mapping[str, Any],
+        overwrite: bool = False,
+    ) -> str:
+        """Write one point-row CSR boundary-neighbor set."""
+
+        boundary_name = validate_name(boundary_set, kind="boundary set")
+        neighbor_name = validate_name(neighbor_set, kind="boundary neighbor set")
+        base_path = f"boundaries/{boundary_name}"
+        expected_rows = int(self._h5[f"{base_path}/points/point_id"].shape[0])
+        if int(getattr(indptr, "shape", (0,))[0]) != expected_rows + 1:
+            raise ValueError("Boundary neighbor indptr must have point_count + 1 rows")
+        edge_count = int(getattr(indices, "shape", (0,))[0])
+        if int(getattr(distance, "shape", (0,))[0]) != edge_count:
+            raise ValueError("Boundary neighbor distances must align to indices")
+        if int(getattr(displacement_zyx, "shape", (0,))[0]) != edge_count:
+            raise ValueError("Boundary neighbor displacements must align to indices")
+        group_path = f"{base_path}/neighbors/{neighbor_name}"
+        if group_path in self._h5:
+            if not overwrite:
+                raise FileExistsError(f"/{group_path}")
+            del self._h5[group_path]
+        group = self._h5.require_group(group_path)
+        group.attrs["format"] = "csr"
+        group.attrs["row_alignment"] = f"/boundaries/{boundary_name}/points/point_id"
+        group.create_dataset("indptr", data=indptr, compression="gzip", shuffle=True)
+        group.create_dataset("indices", data=indices, compression="gzip", shuffle=True)
+        group.create_dataset("distance", data=distance, compression="gzip", shuffle=True)
+        group.create_dataset(
+            "displacement_zyx", data=displacement_zyx, compression="gzip", shuffle=True
+        )
+        self.write_json(f"/{group_path}/schema.json", dict(schema), overwrite=True)
+        return f"/{group_path}"
+
+    def write_boundary_motion(
+        self,
+        boundary_set: str,
+        motion_set: str,
+        *,
+        links: Any,
+        transport: Mapping[str, Any],
+        schema: Mapping[str, Any],
+        overwrite: bool = False,
+    ) -> str:
+        """Write entity links and sparse point-level transport edges."""
+
+        boundary_name = validate_name(boundary_set, kind="boundary set")
+        motion_name = validate_name(motion_set, kind="boundary motion set")
+        base_path = f"boundaries/{boundary_name}"
+        if f"{base_path}/points/point_id" not in self._h5:
+            raise KeyError(f"/{base_path}")
+        edge_count: int | None = None
+        for column_name, column_values in transport.items():
+            actual = int(getattr(column_values, "shape", (0,))[0])
+            if edge_count is None:
+                edge_count = actual
+            elif actual != edge_count:
+                raise ValueError(
+                    f"Boundary transport column {column_name!r} has {actual} rows; expected {edge_count}"
+                )
+        group_path = f"{base_path}/motion/{motion_name}"
+        if group_path in self._h5:
+            if not overwrite:
+                raise FileExistsError(f"/{group_path}")
+            del self._h5[group_path]
+        group = self._h5.require_group(group_path)
+        group.create_dataset("links", data=links, compression="gzip", shuffle=True)
+        transport_group = group.require_group("transport")
+        for column_name, column_values in transport.items():
+            dataset = transport_group.create_dataset(
+                str(column_name), data=column_values, compression="gzip", shuffle=True
+            )
+            dataset.attrs["row_alignment"] = "transport_edge"
+        self.write_json(f"/{group_path}/schema.json", dict(schema), overwrite=True)
+        return f"/{group_path}"
+
+    def read_boundary_motion(self, boundary_set: str, motion_set: str) -> dict[str, Any]:
+        boundary_name = validate_name(boundary_set, kind="boundary set")
+        motion_name = validate_name(motion_set, kind="boundary motion set")
+        group_path = f"boundaries/{boundary_name}/motion/{motion_name}"
+        group = self._h5[group_path]
+        return {
+            "links": group["links"][()],
+            "transport": {str(key): group["transport"][key][()] for key in group["transport"].keys()},
+            "schema": self.read_json(f"/{group_path}/schema.json"),
+        }
 
     def write_track_graph(
         self,

@@ -23,6 +23,12 @@ Current core capabilities:
   a parent-to-child CSR sparse matrix with row-aligned lineage/tracklet caches;
 - apply active registration before tracking distances and preserve registration
   digest, cutoff units, and Z/Y/X calibration in graph/run provenance;
+- build columnar native-coordinate boundary libraries from indexed objects,
+  standalone labels, and named mask surfaces with stable entity/point ids;
+- calculate tissue-model-compatible `pcdiff` surface bases, curvature, CSR
+  topology, and nearest external boundary interactions;
+- track with registered boundary optimal-transport costs while storing native
+  point correspondences and registration-versioned displacement maps;
 - query parents, children, histories, descendants, lineages, and maximal
   root-to-leaf trajectories, including scipy sparse trajectory membership;
 - compute row-aligned single-object feature tables, including regionprops,

@@ -232,6 +232,19 @@ def _run_file_job(
                 }
             )
             return
+
+        def report_frame(frame_event: Mapping[str, Any]) -> None:
+            emit(
+                {
+                    "event": "registration_frame_summary",
+                    "job_id": batch_job.job_id,
+                    "h5_path": str(h5_path),
+                    "registration_set": file_job.registration_set,
+                    "save_outputs": save_outputs,
+                    **dict(frame_event),
+                }
+            )
+
         result = register_global_translation(
             trajectory,
             file_job.object_set,
@@ -248,24 +261,12 @@ def _run_file_job(
             set_active=file_job.set_active,
             run_id=batch_job.job_id,
             metadata={**batch_job.metadata, **file_job.metadata},
+            progress=report_frame,
         )
         payload = result.to_dict()
         summary.completed += 1
         summary.frames += int(payload["frame_count"])
         summary.estimated_frames += int(payload["estimated_frame_count"])
-        for frame in result.registration.frames.tolist():
-            emit(
-                {
-                    "event": "registration_frame_summary",
-                    "job_id": batch_job.job_id,
-                    "h5_path": str(h5_path),
-                    "registration_set": result.registration.name,
-                    "frame": int(frame),
-                    "status": result.registration.status_for_frame(frame),
-                    "translation_zyx": result.registration.translation_zyx(frame).tolist(),
-                    "saved": save_outputs,
-                }
-            )
         emit({"event": "file_completed", "job_id": batch_job.job_id, "h5_path": str(h5_path), **payload})
 
 
