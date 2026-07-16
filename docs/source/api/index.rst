@@ -9,6 +9,7 @@ API Reference
    model_input
    boundaries
    boundary_batch
+   boundary_features
    batch
    features
    feature_extraction

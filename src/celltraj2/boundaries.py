@@ -315,14 +315,23 @@ class BoundaryLibraryView:
         frames = np.full(points.shape[0], int(entity["frame"]), dtype=np.int64)
         return registration.apply_zyx(points, frames)
 
-    def geometry(self, geometry_set: str, boundary_entity_id: int | None = None) -> dict[str, Any]:
+    def geometry(
+        self,
+        geometry_set: str,
+        boundary_entity_id: int | None = None,
+        *,
+        fields: Sequence[str] | None = None,
+    ) -> dict[str, Any]:
         name = validate_name(geometry_set, kind="boundary geometry set")
         selection = self.point_slice(boundary_entity_id) if boundary_entity_id is not None else slice(None)
         group = self.store.h5[f"{self.path}/geometry/{name}"]
+        selected = None if fields is None else {str(value) for value in fields}
         return {
             str(key): group[key][selection]
             for key in group.keys()
-            if str(key) != "schema.json" and hasattr(group[key], "shape")
+            if str(key) != "schema.json"
+            and hasattr(group[key], "shape")
+            and (selected is None or str(key) in selected)
         }
 
     def geometry_topology(self, geometry_set: str, boundary_entity_id: int) -> dict[str, Any]:

@@ -272,6 +272,7 @@ def extract_feature_set(
     frame_counts: dict[int, int] = {}
     frame_warnings: dict[int, list[str]] = {}
     frame_feature_summaries: dict[int, list[dict[str, Any]]] = {}
+    boundary_feature_cache: dict[str, Any] = {}
     run_name = validate_name(run_id or default_feature_extraction_run_id(), kind="feature-extraction run")
 
     if save_outputs:
@@ -310,6 +311,8 @@ def extract_feature_set(
                 frame=frame,
                 source_label_set=source_label_set,
                 feature=feature,
+                object_set=object_name,
+                boundary_cache=boundary_feature_cache,
                 np=np,
             )
             warnings.extend(result["warnings"])
@@ -413,6 +416,8 @@ def _compute_feature_frame(
     frame: int,
     source_label_set: str,
     feature: Mapping[str, Any],
+    object_set: str,
+    boundary_cache: dict[str, Any],
     np: Any,
 ) -> dict[str, Any]:
     kind = str(feature.get("kind") or feature.get("type") or "").lower()
@@ -436,6 +441,27 @@ def _compute_feature_frame(
             frame=frame,
             source_label_set=source_label_set,
             feature=feature,
+            np=np,
+        )
+    if kind in {
+        "boundary_geometry",
+        "surface_geometry",
+        "boundary_interaction",
+        "surface_interaction",
+        "boundary_contact",
+        "boundary_motion",
+        "surface_motion",
+        "boundary_multipole",
+        "surface_multipole",
+    }:
+        from celltraj2.boundary_features import compute_boundary_feature_frame
+
+        return compute_boundary_feature_frame(
+            trajectory,
+            object_set=object_set,
+            frame=frame,
+            feature=feature,
+            cache=boundary_cache,
             np=np,
         )
     raise ValueError(f"Unsupported feature kind: {kind!r}")

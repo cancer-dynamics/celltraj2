@@ -29,6 +29,10 @@ from celltraj2.boundary_batch import (
     BoundaryNeighborJob,
     run_batch_boundaries,
 )
+from celltraj2.boundary_features import (
+    boundary_multipole_magnitudes,
+    compute_boundary_feature_frame,
+)
 from celltraj2.feature_extraction import (
     BatchFeatureExtractionSummary,
     FeatureExtractionBatchJob,
@@ -143,6 +147,8 @@ __all__ = [
     "TrajectoryMetadata",
     "TrajectoryStore",
     "build_boundary_library",
+    "boundary_multipole_magnitudes",
+    "compute_boundary_feature_frame",
     "compute_boundary_geometry",
     "compute_boundary_neighbors",
     "compute_boundary_motion",

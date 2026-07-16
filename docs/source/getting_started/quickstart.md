@@ -109,6 +109,53 @@ with Trajectory(path) as traj:
     )
 ```
 
+Stored boundary products can be summarized directly into the ordinary
+row-aligned object feature table:
+
+```python
+with Trajectory(path) as traj:
+    result = traj.extract_features(
+        {
+            "feature_set": "surface_features_v1",
+            "object_set": "epithelial",
+            "features": [
+                {
+                    "kind": "boundary_geometry",
+                    "name": "curvature",
+                    "boundary_set": "cell_surfaces",
+                    "boundary_source_name": "epithelial",
+                    "geometry_set": "surface_v1",
+                    "fields": ["mean_curvature"],
+                    "statistics": ["mean", "std"],
+                },
+                {
+                    "kind": "boundary_interaction",
+                    "name": "matrix_contact",
+                    "boundary_set": "cell_surfaces",
+                    "boundary_source_name": "epithelial",
+                    "neighbor_set": "cell_to_matrix",
+                    "contact_distance": 1.0,
+                    "metrics": ["contact_fraction", "distance_mean"],
+                },
+                {
+                    "kind": "boundary_motion",
+                    "name": "mapped_motion",
+                    "boundary_set": "cell_surfaces",
+                    "boundary_source_name": "epithelial",
+                    "motion_set": "surface_ot",
+                    "geometry_set": "surface_v1",
+                    "direction": "incoming",
+                    "metrics": ["magnitude_mean", "normal_mean", "mapped_fraction"],
+                },
+            ],
+        }
+    )
+```
+
+Boundary feature columns retain the selected boundary digest and derived-product
+dependencies. Motion columns also retain the track and registration dependency
+stored by the motion set.
+
 ## Run A Dry Batch Segmentation
 
 Batch execution can be driven by any callable. This is the same executor shape

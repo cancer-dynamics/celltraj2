@@ -2,6 +2,8 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
 
+from celltraj2.boundaries import BoundarySourceSpec
+from celltraj2.boundary_features import boundary_multipole_magnitudes
 from celltraj2.feature_extraction import run_batch_feature_extraction
 from celltraj2.features import regionprops_v1_spec, site_signaling_v1_spec
 from celltraj2.schema import ChannelSpec, ImageSourceSpec, TrajectoryMetadata
@@ -62,6 +64,205 @@ class FeatureExtractionTests(unittest.TestCase):
             store.write_mask_frame("background", 1, background_mask)
         with Trajectory(path) as trajectory:
             trajectory.index_observations("cyto", run_id="index_cyto")
+
+    def _create_boundary_feature_h5(self, path: Path) -> None:
+        metadata = TrajectoryMetadata(
+            roi_id="sample_XY001_ROI001",
+            dataset_id="sample",
+            frame_count=2,
+            image_source=ImageSourceSpec(
+                source_type="embedded_h5",
+                axes=("T", "Y", "X", "C"),
+                sizes={"T": 2, "Y": 18, "X": 18, "C": 1},
+            ),
+            acquisition={"micron_per_pixel": 1.0, "voxel_size_um": {"Y": 1.0, "X": 1.0}},
+        )
+        frame_1 = self.np.zeros((18, 18), dtype=self.np.uint16)
+        frame_1[4:10, 2:7] = 1
+        frame_1[4:10, 8:13] = 2
+        frame_2 = self.np.zeros_like(frame_1)
+        frame_2[4:10, 3:8] = 1
+        frame_2[4:10, 9:14] = 2
+        with TrajectoryStore.create(path, metadata=metadata) as store:
+            store.write_label_frame("cells", 1, frame_1)
+            store.write_label_frame("cells", 2, frame_2)
+        with Trajectory(path) as trajectory:
+            trajectory.index_observations("cells", run_id="index_cells")
+            trajectory.build_boundary_library(
+                "cell_surfaces",
+                sources=[
+                    BoundarySourceSpec(
+                        kind="object_set",
+                        name="tracked_cells",
+                        object_set="cells",
+                        role="cell",
+                    )
+                ],
+            )
+            trajectory.compute_boundary_geometry(
+                "cell_surfaces", geometry_set="geometry", backend="local", knn=6
+            )
+            trajectory.compute_boundary_neighbors(
+                "cell_surfaces", neighbor_set="cell_contacts", k=1
+            )
+            trajectory.track_minimum_centroid_distance(
+                "cells", max_distance=3.0, track_set="centroid"
+            )
+            trajectory.compute_boundary_motion(
+                "cells",
+                "centroid",
+                boundary_set="cell_surfaces",
+                boundary_source_name="tracked_cells",
+                motion_set="surface_ot",
+                ot_method="sinkhorn",
+                sinkhorn_regularization=0.05,
+            )
+
+    def test_centered_boundary_multipoles_are_translation_and_rotation_invariant(self):
+        theta = self.np.linspace(0.0, 2.0 * self.np.pi, 32, endpoint=False)
+        points = self.np.column_stack(
+            [self.np.zeros(theta.size), self.np.sin(theta), self.np.cos(theta)]
+        )
+        charge = 1.0 + 0.5 * self.np.cos(2.0 * theta)
+        rotation = self.np.asarray(
+            [[1.0, 0.0, 0.0], [0.0, 0.0, -1.0], [0.0, 1.0, 0.0]]
+        )
+        first = boundary_multipole_magnitudes(points, charge, order=3, spatial_ndim=2)
+        second = boundary_multipole_magnitudes(
+            points @ rotation.T + self.np.asarray([4.0, -3.0, 7.0]),
+            charge,
+            order=3,
+            spatial_ndim=2,
+        )
+        self.np.testing.assert_allclose(first, second, atol=1e-10)
+
+    def test_boundary_object_features_combine_geometry_interaction_motion_and_multipoles(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "boundary_features.ct2.h5"
+            self._create_boundary_feature_h5(path)
+            with Trajectory(path) as trajectory:
+                result = trajectory.extract_features(
+                    {
+                        "feature_set": "boundary_v1",
+                        "object_set": "cells",
+                        "source_label_set": "cells",
+                        "features": [
+                            {
+                                "kind": "boundary_geometry",
+                                "name": "curvature",
+                                "boundary_set": "cell_surfaces",
+                                "boundary_source_name": "tracked_cells",
+                                "geometry_set": "geometry",
+                                "fields": ["mean_curvature"],
+                                "statistics": ["mean", "std"],
+                            },
+                            {
+                                "kind": "boundary_interaction",
+                                "name": "contact",
+                                "boundary_set": "cell_surfaces",
+                                "boundary_source_name": "tracked_cells",
+                                "neighbor_set": "cell_contacts",
+                                "contact_distance": 2.0,
+                                "metrics": [
+                                    "contact_fraction",
+                                    "distance_mean",
+                                    "neighbor_entity_count",
+                                ],
+                            },
+                            {
+                                "kind": "boundary_motion",
+                                "name": "mapped",
+                                "boundary_set": "cell_surfaces",
+                                "boundary_source_name": "tracked_cells",
+                                "motion_set": "surface_ot",
+                                "geometry_set": "geometry",
+                                "direction": "incoming",
+                                "metrics": [
+                                    "displacement_x_mean",
+                                    "magnitude_mean",
+                                    "normal_mean",
+                                    "mapped_fraction",
+                                    "ot_cost_mean",
+                                ],
+                            },
+                            {
+                                "kind": "boundary_multipole",
+                                "name": "neighbor_pattern",
+                                "boundary_set": "cell_surfaces",
+                                "boundary_source_name": "tracked_cells",
+                                "signal": "neighbor_distance",
+                                "neighbor_set": "cell_contacts",
+                                "distance_transform": "inverse_distance",
+                                "order": 2,
+                            },
+                        ],
+                    },
+                    run_id="boundary_features",
+                )
+                values = trajectory.object_set("cells").read_features("boundary_v1")
+                schema = trajectory.object_set("cells").read_feature_schema("boundary_v1")
+
+            self.assertEqual(result.feature_count, 13)
+            self.assertEqual(values.shape[0], 4)
+            self.assertTrue(self.np.all(self.np.isfinite(values["curvature_mean"])))
+            self.assertTrue(self.np.all(values["contact_contact_fraction"] > 0.0))
+            self.assertTrue(self.np.all(values["contact_neighbor_entity_count"] == 1.0))
+            self.assertTrue(self.np.all(self.np.isnan(values["mapped_magnitude_mean"][:2])))
+            self.assertTrue(self.np.all(self.np.isfinite(values["mapped_magnitude_mean"][2:])))
+            self.assertTrue(self.np.all(self.np.isfinite(values["neighbor_pattern_l2"])))
+            motion_column = next(
+                item for item in schema["columns"] if item["name"] == "mapped_magnitude_mean"
+            )
+            self.assertEqual(
+                motion_column["registration_dependency"],
+                motion_column["motion_dependency"]["schema"]["registration_dependency"],
+            )
+            self.assertEqual(
+                motion_column["boundary_dependency"]["boundary_set"], "cell_surfaces"
+            )
+
+    def test_boundary_feature_batch_test_is_read_only_and_reports_frame_summaries(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "boundary_feature_preview.ct2.h5"
+            self._create_boundary_feature_h5(path)
+            events = []
+            summary = run_batch_feature_extraction(
+                {
+                    "job_id": "boundary_feature_preview",
+                    "save_outputs": False,
+                    "files": [
+                        {
+                            "h5_path": str(path),
+                            "feature_spec": {
+                                "feature_set": "boundary_preview",
+                                "object_set": "cells",
+                                "source_label_set": "cells",
+                                "features": [
+                                    {
+                                        "kind": "boundary_interaction",
+                                        "name": "contact",
+                                        "boundary_set": "cell_surfaces",
+                                        "boundary_source_name": "tracked_cells",
+                                        "neighbor_set": "cell_contacts",
+                                        "contact_distance": 2.0,
+                                        "metrics": ["contact_fraction", "distance_mean"],
+                                    }
+                                ],
+                            },
+                        }
+                    ],
+                },
+                reporter=events.append,
+            )
+            self.assertEqual(summary.completed, 2)
+            self.assertEqual(summary.features, 2)
+            self.assertEqual(
+                len([event for event in events if event.get("event") == "feature_frame_summary"]),
+                4,
+            )
+            with Trajectory(path, mode="r") as trajectory:
+                self.assertNotIn("boundary_preview", trajectory.object_set("cells").feature_sets())
+                self.assertNotIn("boundary_feature_preview", trajectory.feature_extraction_runs())
 
     def test_regionprops_feature_set_is_named_and_row_aligned(self):
         try:
