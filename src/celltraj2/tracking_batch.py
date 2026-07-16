@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from celltraj2.object_indexing import JsonlReporter
+from celltraj2.h5_access import run_with_stale_retries, snapshot_revisions, validate_revisions
 from celltraj2.schema import utc_now_iso
 from celltraj2.tracking import (
     default_tracking_run_id,
@@ -240,7 +241,11 @@ def run_batch_tracking(
             }
         )
         try:
-            _run_file_job(batch_job, file_job, h5_path, summary, emit)
+            run_with_stale_retries(
+                lambda: _run_file_job(batch_job, file_job, h5_path, summary, emit),
+                reporter=emit,
+                context={"job_id": batch_job.job_id, "h5_path": str(h5_path)},
+            )
         except Exception as exc:
             summary.failed += 1
             emit({"event": "file_failed", "job_id": batch_job.job_id, "h5_path": str(h5_path), "error": repr(exc)})
@@ -259,8 +264,13 @@ def _run_file_job(
 ) -> None:
     save_outputs = bool(batch_job.save_outputs and file_job.save_outputs)
     overwrite = bool(batch_job.overwrite or file_job.overwrite)
-    mode = "r+" if save_outputs else "r"
-    with Trajectory(h5_path, mode=mode) as trajectory:
+    with Trajectory(
+        h5_path,
+        mode="r",
+        reporter=emit,
+        operation="tracking_calculation",
+        job_id=batch_job.job_id,
+    ) as trajectory:
         if not trajectory.object_set(file_job.object_set).has_observations():
             raise FileNotFoundError(f"/object_sets/{file_job.object_set}/observations")
         if save_outputs and trajectory.store.has_track_set(file_job.object_set, file_job.track_set) and not overwrite:
@@ -276,6 +286,27 @@ def _run_file_job(
                 }
             )
             return
+        dependency_paths = [f"/object_sets/{file_job.object_set}/observations"]
+        selected_registration = file_job.registration_set or trajectory.store.active_registration_name()
+        if selected_registration:
+            dependency_paths.append(f"/registrations/{selected_registration}")
+        if file_job.method == "minimum_registered_boundary_ot_cost" and file_job.boundary_set:
+            dependency_paths.append(f"/boundaries/{file_job.boundary_set}")
+        dependencies = snapshot_revisions(trajectory.store, dependency_paths)
+
+        def report_frame(frame_event: Mapping[str, Any]) -> None:
+            emit(
+                {
+                    "event": "tracking_frame_summary",
+                    "job_id": batch_job.job_id,
+                    "h5_path": str(h5_path),
+                    "object_set": file_job.object_set,
+                    "track_set": file_job.track_set,
+                    "saved": False,
+                    **dict(frame_event),
+                }
+            )
+
         if file_job.method == "minimum_centroid_distance":
             result = track_minimum_centroid_distance(
                 trajectory,
@@ -285,9 +316,10 @@ def _run_file_job(
                 coordinate_scale=file_job.coordinate_scale,
                 registration_set=file_job.registration_set,
                 overwrite=overwrite,
-                save_outputs=save_outputs,
+                save_outputs=False,
                 run_id=batch_job.job_id,
                 metadata={**batch_job.metadata, **file_job.metadata},
+                progress=report_frame,
             )
         else:
             result = track_minimum_boundary_ot_cost(
@@ -307,27 +339,89 @@ def _run_file_job(
                 mass_tolerance=file_job.mass_tolerance,
                 save_motion=file_job.save_motion,
                 overwrite=overwrite,
-                save_outputs=save_outputs,
+                save_outputs=False,
                 run_id=batch_job.job_id,
                 metadata={**batch_job.metadata, **file_job.metadata},
+                progress=report_frame,
             )
-        summary.completed += 1
-        summary.observations += result.graph.observation_count
-        summary.links += result.link_count
-        for frame, counts in result.frame_counts.items():
-            emit(
+    track_path = None
+    motion_path = None
+    if save_outputs:
+        with Trajectory(
+            h5_path,
+            mode="r+",
+            reporter=emit,
+            operation="tracking_commit",
+            job_id=batch_job.job_id,
+        ) as trajectory:
+            validate_revisions(trajectory.store, dependencies)
+            if trajectory.store.has_track_set(result.object_set, result.track_set) and not overwrite:
+                summary.skipped += 1
+                emit(
+                    {
+                        "event": "file_skipped",
+                        "job_id": batch_job.job_id,
+                        "h5_path": str(h5_path),
+                        "object_set": result.object_set,
+                        "track_set": result.track_set,
+                        "reason": "track set was written by another job",
+                    }
+                )
+                return
+            track_path = trajectory.store.write_track_graph(
+                result.object_set,
+                result.track_set,
+                adjacency=result.graph.adjacency,
+                links=result.graph.links,
+                assignments=result.graph.assignments,
+                schema=result.graph.schema,
+                overwrite=overwrite,
+            )
+            if result.motion_result is not None:
+                motion_path = trajectory.store.write_boundary_motion(
+                    result.motion_result.boundary_set,
+                    result.motion_result.motion_set,
+                    links=result.motion_result.links,
+                    transport=result.motion_result.transport,
+                    schema=result.motion_result.schema,
+                    overwrite=overwrite,
+                )
+            trajectory.store.write_tracking_run(
+                batch_job.job_id,
                 {
-                    "event": "tracking_frame_summary",
-                    "job_id": batch_job.job_id,
+                    "schema": "celltraj2.tracking_run.v1",
+                    "run_id": batch_job.job_id,
+                    "status": "completed",
+                    "completed_at": utc_now_iso(),
                     "h5_path": str(h5_path),
                     "object_set": result.object_set,
                     "track_set": result.track_set,
-                    "frame": int(frame),
-                    "saved": save_outputs,
-                    **counts,
-                }
+                    "method": file_job.method,
+                    "observation_count": result.graph.observation_count,
+                    "link_count": result.link_count,
+                    "frame_counts": result.frame_counts,
+                    "track_path": track_path,
+                    "motion_path": motion_path,
+                    "dependencies": dependencies,
+                    "graph_schema": result.graph.schema,
+                    "metadata": {**batch_job.metadata, **file_job.metadata},
+                },
+                overwrite=True,
             )
-        emit({"event": "file_completed", "job_id": batch_job.job_id, "h5_path": str(h5_path), **result.to_dict()})
+    summary.completed += 1
+    summary.observations += result.graph.observation_count
+    summary.links += result.link_count
+    emit(
+        {
+            "event": "file_completed",
+            "job_id": batch_job.job_id,
+            "h5_path": str(h5_path),
+            **result.to_dict(),
+            "saved": save_outputs,
+            "track_path": track_path,
+            "motion_path": motion_path,
+        }
+    )
 
 
 __all__ = [

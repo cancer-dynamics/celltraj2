@@ -161,7 +161,7 @@ class GlobalRegistrationTests(unittest.TestCase):
             frame_target[11, 13] = 3
             store.write_label_frame("cells", 1, frame_1)
             store.write_label_frame("cells", target_frame, frame_target)
-        with Trajectory(path) as trajectory:
+        with Trajectory(path, mode="r+") as trajectory:
             trajectory.index_observations("cells", frames=[1, target_frame], run_id="index_cells")
 
     def test_identity_registration_is_initialized_for_every_new_h5(self):
@@ -191,7 +191,7 @@ class GlobalRegistrationTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             path = Path(tmp) / "sample.ct2.h5"
             self._create_drift_h5(path)
-            with Trajectory(path) as trajectory:
+            with Trajectory(path, mode="r+") as trajectory:
                 native = trajectory.track_minimum_centroid_distance(
                     "cells",
                     max_distance=1.0,
@@ -230,7 +230,7 @@ class GlobalRegistrationTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             path = Path(tmp) / "sample.ct2.h5"
             self._create_drift_h5(path, partial=True)
-            with Trajectory(path) as trajectory:
+            with Trajectory(path, mode="r+") as trajectory:
                 result = trajectory.register_global_translation(
                     "cells",
                     max_shift_per_frame=2.0,
@@ -280,7 +280,7 @@ class GlobalRegistrationTests(unittest.TestCase):
                 preview_events.index(frame_events[-1]),
                 next(index for index, event in enumerate(preview_events) if event.get("event") == "file_completed"),
             )
-            with Trajectory(path) as trajectory:
+            with Trajectory(path, mode="r+") as trajectory:
                 self.assertEqual(trajectory.registration_sets(), ["identity"])
             saved = run_batch_registration(
                 {
@@ -298,7 +298,7 @@ class GlobalRegistrationTests(unittest.TestCase):
                 }
             )
             self.assertEqual(saved.completed, 1)
-            with Trajectory(path) as trajectory:
+            with Trajectory(path, mode="r+") as trajectory:
                 self.assertEqual(trajectory.active_registration_name(), "global_registration")
                 self.assertEqual(trajectory.registration_runs(), ["registration_saved"])
 

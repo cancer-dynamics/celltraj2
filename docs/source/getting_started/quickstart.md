@@ -27,16 +27,24 @@ project/cell_files/sample/sample_XY001_ROI001.ct2.h5
 
 ## Read Images And Write Labels
 
-Use the `Trajectory` facade for user-facing access:
+Use the `Trajectory` facade for user-facing access. It is read-only by default;
+make the write context explicit and keep it short:
 
 ```python
 from celltraj2 import Trajectory
 
 with Trajectory(path) as traj:
     image = traj.get_image_data(frame=1, channels=[0, 1])
-    labels = run_segmentation(image)
+
+labels = run_segmentation(image)
+
+with Trajectory(path, mode="r+") as traj:
     traj.write_label_frame("epithelial", frame=1, labels=labels)
 ```
+
+Headless batch workers apply this separation automatically and coordinate
+concurrent readers and short commits; see [H5 Access And Job
+Logging](../concepts/h5_access_and_logging.md).
 
 Frame ids are one-based in the H5 paths and public API. Parent acquisition
 coordinates from SITE remain zero-based in metadata.
@@ -58,7 +66,7 @@ native ROI coordinates; registration is applied only by registered views and
 between-frame analyses.
 
 ```python
-with Trajectory(path) as traj:
+with Trajectory(path, mode="r+") as traj:
     traj.index_observations("epithelial")
     traj.object_set("epithelial").build_boundary_library("cell_surfaces")
     traj.compute_boundary_geometry("cell_surfaces", geometry_set="surface_v1")
@@ -74,7 +82,7 @@ Registered boundary OT tracking writes the normal sparse track graph plus a
 point-level motion set:
 
 ```python
-with Trajectory(path) as traj:
+with Trajectory(path, mode="r+") as traj:
     result = traj.track_minimum_boundary_ot_cost(
         "epithelial",
         boundary_set="cell_surfaces",
@@ -87,7 +95,7 @@ Boundary OT can also calculate transient object boundaries when only the object
 links are needed:
 
 ```python
-with Trajectory(path) as traj:
+with Trajectory(path, mode="r+") as traj:
     result = traj.track_minimum_boundary_ot_cost(
         "epithelial",
         boundary_set=None,
@@ -99,7 +107,7 @@ with Trajectory(path) as traj:
 Surface motion is independently calculable for any saved object track graph:
 
 ```python
-with Trajectory(path) as traj:
+with Trajectory(path, mode="r+") as traj:
     motion = traj.compute_boundary_motion(
         "epithelial",
         "centroid_mindist",
@@ -113,7 +121,7 @@ Stored boundary products can be summarized directly into the ordinary
 row-aligned object feature table:
 
 ```python
-with Trajectory(path) as traj:
+with Trajectory(path, mode="r+") as traj:
     result = traj.extract_features(
         {
             "feature_set": "surface_features_v1",

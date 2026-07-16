@@ -46,7 +46,7 @@ class SparseTrackingTests(unittest.TestCase):
             frames.append(frame_3)
             for frame, labels in enumerate(frames, start=1):
                 store.write_label_frame("cells", frame, labels)
-        with Trajectory(path) as trajectory:
+        with Trajectory(path, mode="r+") as trajectory:
             trajectory.index_observations("cells", run_id="index_cells")
 
     def test_centroid_tracker_preserves_unique_parent_and_forward_branching(self):
@@ -54,7 +54,7 @@ class SparseTrackingTests(unittest.TestCase):
             path = Path(tmp) / "sample.ct2.h5"
             self._create_indexed_h5(path)
 
-            with Trajectory(path) as trajectory:
+            with Trajectory(path, mode="r+") as trajectory:
                 result = trajectory.track_minimum_centroid_distance(
                     "cells", max_distance=2.0, track_set="nearest"
                 )
@@ -81,7 +81,7 @@ class SparseTrackingTests(unittest.TestCase):
             path = Path(tmp) / "sample.ct2.h5"
             self._create_indexed_h5(path)
 
-            with Trajectory(path) as trajectory:
+            with Trajectory(path, mode="r+") as trajectory:
                 trajectory.object_set("cells").track_minimum_centroid_distance(
                     max_distance=2.0, track_set="nearest"
                 )
@@ -101,7 +101,7 @@ class SparseTrackingTests(unittest.TestCase):
             path = Path(tmp) / "sample.ct2.h5"
             self._create_indexed_h5(path)
 
-            with Trajectory(path) as trajectory:
+            with Trajectory(path, mode="r+") as trajectory:
                 result = trajectory.track_minimum_centroid_distance(
                     "cells",
                     max_distance=2.0,
@@ -234,7 +234,7 @@ class SparseTrackingTests(unittest.TestCase):
             self.assertEqual(dry.completed, 1)
             self.assertEqual(dry.links, 5)
             self.assertIn("tracking_frame_summary", [event.get("event") for event in events])
-            with Trajectory(path) as trajectory:
+            with Trajectory(path, mode="r+") as trajectory:
                 self.assertEqual(trajectory.track_sets("cells"), [])
 
             saved = run_batch_tracking(
@@ -256,8 +256,8 @@ class SparseTrackingTests(unittest.TestCase):
                 self.assertEqual(trajectory.tracking_runs(), ["track_saved"])
                 run = trajectory.store.read_tracking_run("track_saved")
                 self.assertEqual(run["link_count"], 5)
-                frame = trajectory.store.read_tracking_frame_result("track_saved", 2)
-                self.assertEqual(frame["linked_count"], 3)
+                self.assertEqual(run["frame_counts"]["2"]["linked_count"], 3)
+                self.assertNotIn("frames", trajectory.store.h5["runs/tracking/track_saved"])
 
 
 if __name__ == "__main__":

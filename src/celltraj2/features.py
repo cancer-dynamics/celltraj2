@@ -7,7 +7,7 @@ from collections import OrderedDict
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, field, is_dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from celltraj2.paths import validate_name
 from celltraj2.schema import utc_now_iso
@@ -110,6 +110,7 @@ class FeatureExtractionResult:
     source_label_set: str
     values: Any
     schema: dict[str, Any]
+    qc: dict[str, Any]
     frames: list[int]
     frame_counts: dict[int, int] = field(default_factory=dict)
     frame_warnings: dict[int, list[str]] = field(default_factory=dict)
@@ -247,6 +248,7 @@ def extract_feature_set(
     save_outputs: bool = True,
     run_id: str | None = None,
     metadata: Mapping[str, Any] | None = None,
+    progress: Callable[[Mapping[str, Any]], None] | None = None,
 ) -> FeatureExtractionResult:
     """Extract one row-aligned object feature set."""
 
@@ -297,6 +299,8 @@ def extract_feature_set(
         trajectory.store.write_feature_extraction_run(run_name, run_record, overwrite=True)
 
     for frame in selected_frames:
+        if progress is not None:
+            progress({"event": "frame_started", "frame": int(frame), "feature_set": feature_name})
         labels = np.asarray(trajectory.read_label_frame(source_label_set, frame))
         lookup = trajectory.object_set(object_name).read_lookup_frame(frame)
         frame_rows_touched: set[int] = set()
@@ -305,6 +309,18 @@ def extract_feature_set(
         frame_columns_seen: set[str] = set()
         warnings: list[str] = []
         for feature in feature_spec.features:
+            feature_kind = str(feature.get("kind") or feature.get("type") or "feature")
+            feature_label = str(feature.get("name") or feature.get("prefix") or feature_kind)
+            if progress is not None:
+                progress(
+                    {
+                        "event": "feature_started",
+                        "frame": int(frame),
+                        "feature_set": feature_name,
+                        "feature_kind": feature_kind,
+                        "feature_name": feature_label,
+                    }
+                )
             result = _compute_feature_frame(
                 trajectory,
                 labels,
@@ -332,6 +348,18 @@ def extract_feature_set(
                     np=np,
                 )
             )
+            if progress is not None:
+                progress(
+                    {
+                        "event": "feature_completed",
+                        "frame": int(frame),
+                        "feature_set": feature_name,
+                        "feature_kind": feature_kind,
+                        "feature_name": feature_label,
+                        "columns": list(result["columns"].keys()),
+                        "warnings": list(result["warnings"]),
+                    }
+                )
             for label_id, values in result["values_by_label"].items():
                 observation_id = _lookup_observation_id(lookup, int(label_id))
                 if observation_id < 1:
@@ -344,6 +372,17 @@ def extract_feature_set(
         frame_counts[frame] = len(frame_rows_touched)
         frame_warnings[frame] = warnings
         frame_feature_summaries[frame] = feature_summaries
+        if progress is not None:
+            progress(
+                {
+                    "event": "frame_completed",
+                    "frame": int(frame),
+                    "feature_set": feature_name,
+                    "value_count": int(len(frame_rows_touched)),
+                    "feature_summaries": feature_summaries,
+                    "warnings": warnings,
+                }
+            )
         if save_outputs:
             trajectory.store.write_feature_extraction_frame_result(
                 run_name,
@@ -399,6 +438,7 @@ def extract_feature_set(
         source_label_set=source_label_set,
         values=values,
         schema=schema,
+        qc=qc,
         frames=selected_frames,
         frame_counts=frame_counts,
         frame_warnings=frame_warnings,

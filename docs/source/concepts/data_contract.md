@@ -102,31 +102,31 @@ The H5 stores both:
   object_indexing/
     <run_id>/
       run.json
-      frames/
+      frames/              optional legacy/direct-API detail; batch progress is external
         frame_1.json
         frame_2.json
   segmentation/
     <run_id>/
       run.json
-      frames/
+      frames/              optional legacy/direct-API detail; batch progress is external
         frame_1.json
         frame_2.json
   feature_extraction/
     <run_id>/
       run.json
-      frames/
+      frames/              optional legacy/direct-API detail; batch progress is external
         frame_1.json
         frame_2.json
   registration/
     <run_id>/
       run.json
-      frames/
+      frames/              optional legacy/direct-API detail; batch progress is external
         frame_1.json
         frame_2.json
   tracking/
     <run_id>/
       run.json
-      frames/
+      frames/              optional legacy/direct-API detail; batch progress is external
         frame_1.json
         frame_2.json
 ```

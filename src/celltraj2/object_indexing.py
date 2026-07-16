@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import json
-import sys
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field, is_dataclass
 from pathlib import Path
-from typing import Any, TextIO
+from typing import Any
 
 from celltraj2.objects import default_object_index_run_id, index_object_set
+from celltraj2.h5_access import run_with_stale_retries, snapshot_revisions, validate_revisions
+from celltraj2.reporting import JsonlReporter
 from celltraj2.schema import utc_now_iso
 from celltraj2.trajectory import Trajectory
 
@@ -171,18 +172,6 @@ class BatchObjectIndexSummary:
 Reporter = Callable[[Mapping[str, Any]], None]
 
 
-class JsonlReporter:
-    """Write progress events as JSON lines."""
-
-    def __init__(self, stream: TextIO | None = None) -> None:
-        self.stream = stream or sys.stdout
-
-    def __call__(self, event: Mapping[str, Any]) -> None:
-        payload = {"timestamp": utc_now_iso(), **dict(event)}
-        self.stream.write(json.dumps(_json_safe(payload), sort_keys=True) + "\n")
-        self.stream.flush()
-
-
 def load_object_index_job(path: str | Path) -> ObjectIndexBatchJob:
     return ObjectIndexBatchJob.load(path)
 
@@ -216,7 +205,11 @@ def run_batch_object_indexing(
             }
         )
         try:
-            _run_file_job(batch_job, file_job, h5_path, summary, emit)
+            run_with_stale_retries(
+                lambda: _run_file_job(batch_job, file_job, h5_path, summary, emit),
+                reporter=emit,
+                context={"job_id": batch_job.job_id, "h5_path": str(h5_path)},
+            )
         except Exception as exc:
             summary.failed += 1
             emit({"event": "file_failed", "job_id": batch_job.job_id, "h5_path": str(h5_path), "error": repr(exc)})
@@ -235,12 +228,17 @@ def _run_file_job(
 ) -> None:
     save_outputs = bool(batch_job.save_outputs and file_job.save_outputs)
     overwrite = bool(batch_job.overwrite or file_job.overwrite)
-    mode = "r+" if save_outputs else "r"
-    with Trajectory(h5_path, mode=mode) as trajectory:
+    with Trajectory(
+        h5_path,
+        mode="r",
+        reporter=emit,
+        operation="object_index_calculation",
+        job_id=batch_job.job_id,
+    ) as trajectory:
         available_frames = trajectory.label_frames(file_job.source_labels)
         frames = file_job.frame_numbers(int(trajectory.metadata.frame_count or 1), available_frames=available_frames)
-        summary.frames += len(frames)
         if save_outputs and trajectory.store.has_observations(file_job.object_set) and not overwrite:
+            summary.frames += len(frames)
             summary.skipped += 1
             emit(
                 {
@@ -252,40 +250,111 @@ def _run_file_job(
                 }
             )
             return
+
+        dependencies = snapshot_revisions(
+            trajectory.store,
+            [
+                "/metadata/celltraj2.json",
+                *[f"/labels/{file_job.source_labels}/frame_{int(frame)}" for frame in frames],
+            ],
+        )
+
+        def report_frame(frame_event: Mapping[str, Any]) -> None:
+            emit(
+                {
+                    "event": "frame_completed",
+                    "job_id": batch_job.job_id,
+                    "h5_path": str(h5_path),
+                    "saved": False,
+                    **dict(frame_event),
+                }
+            )
+
         result = index_object_set(
             trajectory,
             file_job.object_set,
             source_label_set=file_job.source_labels,
             frames=frames,
             overwrite=overwrite,
-            save_outputs=save_outputs,
+            save_outputs=False,
             run_id=batch_job.job_id,
             metadata={**batch_job.metadata, **file_job.metadata},
+            progress=report_frame,
         )
-        summary.completed += len(result.frames)
-        summary.observations += result.observation_count
-        for frame in result.frames:
-            emit(
+    lookup_paths: dict[int, str] = {}
+    observations_path = None
+    if save_outputs:
+        with Trajectory(
+            h5_path,
+            mode="r+",
+            reporter=emit,
+            operation="object_index_commit",
+            job_id=batch_job.job_id,
+        ) as trajectory:
+            validate_revisions(trajectory.store, dependencies)
+            if trajectory.store.has_observations(file_job.object_set) and not overwrite:
+                summary.frames += len(result.frames)
+                summary.skipped += 1
+                emit(
+                    {
+                        "event": "file_skipped",
+                        "job_id": batch_job.job_id,
+                        "h5_path": str(h5_path),
+                        "object_set": file_job.object_set,
+                        "reason": "observations were written by another job",
+                    }
+                )
+                return
+            observations_path = trajectory.store.write_observations(
+                result.object_set,
+                result.observations,
+                result.schema,
+                source_label_set=result.source_label_set,
+                overwrite=overwrite,
+                metadata={**batch_job.metadata, **file_job.metadata},
+            )
+            if overwrite:
+                trajectory.store.clear_observation_lookup_frames(result.object_set)
+            for frame in result.frames:
+                lookup_paths[frame] = trajectory.store.write_observation_lookup_frame(
+                    result.object_set,
+                    frame,
+                    result.lookups[frame],
+                    overwrite=overwrite,
+                )
+            trajectory.store.write_object_indexing_run(
+                batch_job.job_id,
                 {
-                    "event": "frame_completed",
-                    "job_id": batch_job.job_id,
+                    "schema": "celltraj2.object_indexing_run.v1",
+                    "run_id": batch_job.job_id,
+                    "status": "completed",
+                    "completed_at": utc_now_iso(),
                     "h5_path": str(h5_path),
                     "object_set": result.object_set,
                     "source_label_set": result.source_label_set,
-                    "frame": int(frame),
-                    "observation_count": int(result.frame_counts.get(frame, 0)),
-                    "lookup_path": result.lookup_paths.get(frame),
-                    "saved": save_outputs,
-                }
+                    "frames": result.frames,
+                    "observation_count": result.observation_count,
+                    "frame_counts": result.frame_counts,
+                    "observations_path": observations_path,
+                    "dependencies": dependencies,
+                    "metadata": {**batch_job.metadata, **file_job.metadata},
+                },
+                overwrite=True,
             )
-        emit(
-            {
-                "event": "file_completed",
-                "job_id": batch_job.job_id,
-                "h5_path": str(h5_path),
-                **result.to_dict(),
-            }
-        )
+    summary.frames += len(result.frames)
+    summary.completed += len(result.frames)
+    summary.observations += result.observation_count
+    emit(
+        {
+            "event": "file_completed",
+            "job_id": batch_job.job_id,
+            "h5_path": str(h5_path),
+            **result.to_dict(),
+            "saved": save_outputs,
+            "observations_path": observations_path,
+            "lookup_paths": {str(key): value for key, value in lookup_paths.items()},
+        }
+    )
 
 
 def _parse_frame_values(value: Any) -> list[int]:

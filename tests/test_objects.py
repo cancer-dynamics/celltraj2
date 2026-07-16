@@ -36,7 +36,7 @@ class ObjectIndexingTests(unittest.TestCase):
             path = Path(tmp) / "sample.ct2.h5"
             self._create_labeled_h5(path)
 
-            with Trajectory(path) as trajectory:
+            with Trajectory(path, mode="r+") as trajectory:
                 result = trajectory.object_set("tumor").index_observations(run_id="index_tumor")
                 observations = trajectory.object_set("tumor").read_observations()
                 lookup_1 = trajectory.object_set("tumor").read_lookup_frame(1)
@@ -68,7 +68,7 @@ class ObjectIndexingTests(unittest.TestCase):
             path = Path(tmp) / "sample.ct2.h5"
             self._create_labeled_h5(path)
 
-            with Trajectory(path) as trajectory:
+            with Trajectory(path, mode="r+") as trajectory:
                 trajectory.index_observations("tumor", run_id="first")
                 with self.assertRaises(FileExistsError):
                     trajectory.index_observations("tumor", run_id="second")
@@ -103,8 +103,9 @@ class ObjectIndexingTests(unittest.TestCase):
                 run_record = store.read_object_indexing_run("obj_index_test")
                 self.assertEqual(run_record["status"], "completed")
                 self.assertEqual(run_record["observation_count"], 3)
-                frame_record = store.read_object_indexing_frame_result("obj_index_test", 1)
-                self.assertEqual(frame_record["observation_count"], 2)
+                self.assertNotIn("frames", store.h5["runs/object_indexing/obj_index_test"])
+            frame_record = next(event for event in events if event.get("event") == "frame_completed")
+            self.assertEqual(frame_record["observation_count"], 2)
             self.assertIn("job_completed", [event.get("event") for event in events])
 
     def test_batch_object_indexing_dry_run_does_not_write_h5_outputs(self):

@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 from celltraj2.paths import validate_name
 from celltraj2.schema import utc_now_iso
@@ -258,6 +258,7 @@ class TrackingResult:
     motion_path: str | None = None
     run_id: str | None = None
     frame_counts: dict[int, dict[str, int]] = field(default_factory=dict)
+    motion_result: BoundaryMotionResult | None = None
 
     @property
     def link_count(self) -> int:
@@ -353,6 +354,7 @@ def track_minimum_centroid_distance(
     save_outputs: bool = True,
     run_id: str | None = None,
     metadata: Mapping[str, Any] | None = None,
+    progress: Callable[[Mapping[str, Any]], None] | None = None,
 ) -> TrackingResult:
     """Link each observation to its nearest prior-frame centroid.
 
@@ -420,12 +422,30 @@ def track_minimum_centroid_distance(
     )
     edge_records: list[tuple[Any, ...]] = []
     link_id = 1
+    if progress is not None and np.any(frames == 1):
+        progress(
+            {
+                "frame": 1,
+                "object_count": int(np.sum(frames == 1)),
+                "linked_count": 0,
+                "unlinked_count": int(np.sum(frames == 1)),
+            }
+        )
     for frame in sorted(int(value) for value in np.unique(frames)):
         if frame <= 1:
             continue
         child_rows = np.flatnonzero(frames == frame)
         parent_rows = np.flatnonzero(frames == frame - 1)
         if not child_rows.size or not parent_rows.size:
+            if progress is not None:
+                progress(
+                    {
+                        "frame": int(frame),
+                        "object_count": int(child_rows.size),
+                        "linked_count": 0,
+                        "unlinked_count": int(child_rows.size),
+                    }
+                )
             continue
         parent_xyz = centroids[parent_rows]
         for child_row in child_rows:
@@ -451,6 +471,17 @@ def track_minimum_centroid_distance(
                 )
             )
             link_id += 1
+        if progress is not None:
+            object_count = int(child_rows.size)
+            linked_count = sum(1 for record in edge_records if int(record[4]) == frame)
+            progress(
+                {
+                    "frame": int(frame),
+                    "object_count": object_count,
+                    "linked_count": int(linked_count),
+                    "unlinked_count": object_count - int(linked_count),
+                }
+            )
 
     links = np.asarray(edge_records, dtype=link_dtype())
     adjacency = _csr_from_links(n, links, np=np)
@@ -572,6 +603,7 @@ def compute_boundary_motion(
     overwrite: bool = False,
     save_outputs: bool = True,
     metadata: Mapping[str, Any] | None = None,
+    progress: Callable[[Mapping[str, Any]], None] | None = None,
 ) -> BoundaryMotionResult:
     """Map boundary points across every accepted link in a stored object graph.
 
@@ -788,6 +820,23 @@ def compute_boundary_motion(
         frame_summary["transport_edge_count"] += transport_count
         frame_summary["transported_mass"] += float(np.sum(plan.mass))
         frame_summary["ot_cost_sum"] += float(plan.total_cost)
+        if progress is not None:
+            progress(
+                {
+                    "event": "surface_motion_link_summary",
+                    "motion_link_id": int(motion_link_id),
+                    "track_link_id": int(link["link_id"]),
+                    "source_observation_id": parent_observation_id,
+                    "target_observation_id": child_observation_id,
+                    "source_frame": source_frame,
+                    "target_frame": target_frame,
+                    "source_point_count": int(parent_points["native"].shape[0]),
+                    "target_point_count": int(child_points["native"].shape[0]),
+                    "transport_edge_count": transport_count,
+                    "transported_mass": float(np.sum(plan.mass)),
+                    "ot_cost": float(plan.total_cost),
+                }
+            )
 
     transport = {
         key: (
@@ -871,6 +920,7 @@ def track_minimum_boundary_ot_cost(
     save_outputs: bool = True,
     run_id: str | None = None,
     metadata: Mapping[str, Any] | None = None,
+    progress: Callable[[Mapping[str, Any]], None] | None = None,
 ) -> TrackingResult:
     """Track observations by registered boundary OT cost after centroid gating.
 
@@ -1042,12 +1092,30 @@ def track_minimum_boundary_ot_cost(
     edge_records: list[tuple[Any, ...]] = []
     accepted_plans: list[dict[str, Any]] = []
     link_id = 1
+    if progress is not None and np.any(frames == 1):
+        progress(
+            {
+                "frame": 1,
+                "object_count": int(np.sum(frames == 1)),
+                "linked_count": 0,
+                "unlinked_count": int(np.sum(frames == 1)),
+            }
+        )
     for frame in sorted(int(value) for value in np.unique(frames)):
         if frame <= 1:
             continue
         child_rows = np.flatnonzero(frames == frame)
         parent_rows = np.flatnonzero(frames == frame - 1)
         if not child_rows.size or not parent_rows.size:
+            if progress is not None:
+                progress(
+                    {
+                        "frame": int(frame),
+                        "object_count": int(child_rows.size),
+                        "linked_count": 0,
+                        "unlinked_count": int(child_rows.size),
+                    }
+                )
             continue
         parent_centroids = centroids[parent_rows]
         for child_row_value in child_rows:
@@ -1108,6 +1176,17 @@ def track_minimum_boundary_ot_cost(
             best["track_link_id"] = link_id
             accepted_plans.append(best)
             link_id += 1
+        if progress is not None:
+            object_count = int(child_rows.size)
+            linked_count = sum(1 for record in edge_records if int(record[4]) == frame)
+            progress(
+                {
+                    "frame": int(frame),
+                    "object_count": object_count,
+                    "linked_count": int(linked_count),
+                    "unlinked_count": object_count - int(linked_count),
+                }
+            )
 
     links = np.asarray(edge_records, dtype=link_dtype())
     adjacency = _csr_from_links(observation_count, links, np=np)
@@ -1164,6 +1243,22 @@ def track_minimum_boundary_ot_cost(
 
     track_path = None
     motion_path = None
+    motion_result = None
+    if save_motion and boundary_set is not None:
+        motion_result = _tracking_motion_from_plans(
+            object_name=object_name,
+            track_name=track_name,
+            boundary_name=boundary_name,
+            motion_name=motion_name,
+            observations=observations,
+            accepted_plans=accepted_plans,
+            boundary_dependency=boundary_dependency,
+            registration_dependency=registration_dependency,
+            track_digest=schema["track_digest"],
+            max_boundary_points=max_boundary_points,
+            frame_counts=frame_counts,
+            np=np,
+        )
     run_name = validate_name(run_id or default_tracking_run_id(), kind="tracking run")
     if save_outputs:
         track_path = trajectory.store.write_track_graph(
@@ -1175,92 +1270,13 @@ def track_minimum_boundary_ot_cost(
             schema=schema,
             overwrite=overwrite,
         )
-        if save_motion and boundary_set is not None:
-            motion_links: list[tuple[Any, ...]] = []
-            transport_columns: dict[str, list[Any]] = {
-                "source_point_id": [],
-                "target_point_id": [],
-                "mass": [],
-                "edge_cost": [],
-                "registered_displacement_zyx": [],
-            }
-            transport_start = 0
-            selected_methods: set[str] = set()
-            for motion_link_id, accepted in enumerate(accepted_plans, start=1):
-                plan = accepted["plan"]
-                selected_methods.add(str(plan.method))
-                parent_points = accepted["parent_points"]
-                child_points = accepted["child_points"]
-                source_local = parent_points["sample"][plan.source_rows]
-                target_local = child_points["sample"][plan.target_rows]
-                source_point_ids = parent_points["point_id"][source_local]
-                target_point_ids = child_points["point_id"][target_local]
-                displacement = (
-                    child_points["registered"][target_local]
-                    - parent_points["registered"][source_local]
-                )
-                transport_count = int(plan.mass.shape[0])
-                motion_links.append(
-                    (
-                        motion_link_id,
-                        accepted["track_link_id"],
-                        accepted["parent_entity_id"],
-                        accepted["child_entity_id"],
-                        accepted["parent_observation_id"],
-                        accepted["child_observation_id"],
-                        int(observations[accepted["parent_row"]]["frame"]),
-                        int(observations[accepted["child_observation_id"] - 1]["frame"]),
-                        transport_start,
-                        transport_count,
-                        float(plan.total_cost),
-                        float(np.sum(plan.mass)),
-                        0,
-                    )
-                )
-                transport_columns["source_point_id"].append(source_point_ids.astype(np.int64))
-                transport_columns["target_point_id"].append(target_point_ids.astype(np.int64))
-                transport_columns["mass"].append(np.asarray(plan.mass, dtype=np.float64))
-                transport_columns["edge_cost"].append(np.asarray(plan.edge_cost, dtype=np.float32))
-                transport_columns["registered_displacement_zyx"].append(
-                    np.asarray(displacement, dtype=np.float32)
-                )
-                transport_start += transport_count
-            transport = {
-                key: (
-                    np.concatenate(blocks, axis=0)
-                    if blocks
-                    else np.empty((0, 3), dtype=np.float32)
-                    if key == "registered_displacement_zyx"
-                    else np.empty(0, dtype=np.int64 if key.endswith("point_id") else np.float64)
-                )
-                for key, blocks in transport_columns.items()
-            }
-            motion_schema = {
-                "schema": "celltraj2.boundary_motion.v1",
-                "boundary_set": boundary_name,
-                "motion_set": motion_name,
-                "created_at": utc_now_iso(),
-                "source": f"/object_sets/{object_name}/tracks/{track_name}",
-                "boundary_dependency": boundary_dependency,
-                "track_dependency": {
-                    "object_set": object_name,
-                    "track_set": track_name,
-                    "track_digest": schema["track_digest"],
-                },
-                "registration_dependency": registration_dependency,
-                "point_identity_coordinate_system": "native_boundary_point_id",
-                "displacement_coordinate_system": "registered_roi_physical",
-                "displacement_definition": "T_target(q_native)-T_source(p_native)",
-                "transport_methods": sorted(selected_methods),
-                "max_boundary_points": max_boundary_points,
-                "transport_edge_count": int(transport_start),
-            }
+        if motion_result is not None:
             motion_path = trajectory.store.write_boundary_motion(
                 boundary_name,
                 motion_name,
-                links=np.asarray(motion_links, dtype=boundary_motion_link_dtype()),
-                transport=transport,
-                schema=motion_schema,
+                links=motion_result.links,
+                transport=motion_result.transport,
+                schema=motion_result.schema,
                 overwrite=overwrite,
             )
         metadata_payload = dict(metadata or {})
@@ -1312,6 +1328,105 @@ def track_minimum_boundary_ot_cost(
         motion_path=motion_path,
         run_id=run_name,
         frame_counts=frame_counts,
+        motion_result=motion_result,
+    )
+
+
+def _tracking_motion_from_plans(
+    *,
+    object_name: str,
+    track_name: str,
+    boundary_name: str,
+    motion_name: str,
+    observations: Any,
+    accepted_plans: list[dict[str, Any]],
+    boundary_dependency: Mapping[str, Any],
+    registration_dependency: Mapping[str, Any] | None,
+    track_digest: str,
+    max_boundary_points: int | None,
+    frame_counts: dict[int, dict[str, int]],
+    np: Any,
+) -> BoundaryMotionResult:
+    from celltraj2.boundaries import boundary_motion_link_dtype
+
+    motion_links: list[tuple[Any, ...]] = []
+    transport_columns: dict[str, list[Any]] = {
+        "source_point_id": [],
+        "target_point_id": [],
+        "mass": [],
+        "edge_cost": [],
+        "registered_displacement_zyx": [],
+    }
+    transport_start = 0
+    selected_methods: set[str] = set()
+    for motion_link_id, accepted in enumerate(accepted_plans, start=1):
+        plan = accepted["plan"]
+        selected_methods.add(str(plan.method))
+        parent_points = accepted["parent_points"]
+        child_points = accepted["child_points"]
+        source_local = parent_points["sample"][plan.source_rows]
+        target_local = child_points["sample"][plan.target_rows]
+        displacement = child_points["registered"][target_local] - parent_points["registered"][source_local]
+        transport_count = int(plan.mass.shape[0])
+        motion_links.append(
+            (
+                motion_link_id,
+                accepted["track_link_id"],
+                accepted["parent_entity_id"],
+                accepted["child_entity_id"],
+                accepted["parent_observation_id"],
+                accepted["child_observation_id"],
+                int(observations[accepted["parent_row"]]["frame"]),
+                int(observations[accepted["child_observation_id"] - 1]["frame"]),
+                transport_start,
+                transport_count,
+                float(plan.total_cost),
+                float(np.sum(plan.mass)),
+                0,
+            )
+        )
+        transport_columns["source_point_id"].append(parent_points["point_id"][source_local].astype(np.int64))
+        transport_columns["target_point_id"].append(child_points["point_id"][target_local].astype(np.int64))
+        transport_columns["mass"].append(np.asarray(plan.mass, dtype=np.float64))
+        transport_columns["edge_cost"].append(np.asarray(plan.edge_cost, dtype=np.float32))
+        transport_columns["registered_displacement_zyx"].append(np.asarray(displacement, dtype=np.float32))
+        transport_start += transport_count
+    transport = {
+        key: (
+            np.concatenate(blocks, axis=0)
+            if blocks
+            else np.empty((0, 3), dtype=np.float32)
+            if key == "registered_displacement_zyx"
+            else np.empty(0, dtype=np.int64 if key.endswith("point_id") else np.float64)
+        )
+        for key, blocks in transport_columns.items()
+    }
+    motion_schema = {
+        "schema": "celltraj2.boundary_motion.v1",
+        "boundary_set": boundary_name,
+        "motion_set": motion_name,
+        "created_at": utc_now_iso(),
+        "source": f"/object_sets/{object_name}/tracks/{track_name}",
+        "boundary_dependency": dict(boundary_dependency),
+        "track_dependency": {"object_set": object_name, "track_set": track_name, "track_digest": track_digest},
+        "registration_dependency": registration_dependency,
+        "point_identity_coordinate_system": "native_boundary_point_id",
+        "displacement_coordinate_system": "registered_roi_physical",
+        "displacement_definition": "T_target(q_native)-T_source(p_native)",
+        "transport_methods": sorted(selected_methods),
+        "max_boundary_points": max_boundary_points,
+        "transport_edge_count": int(transport_start),
+    }
+    return BoundaryMotionResult(
+        object_set=object_name,
+        track_set=track_name,
+        boundary_set=boundary_name,
+        motion_set=motion_name,
+        links=np.asarray(motion_links, dtype=boundary_motion_link_dtype()),
+        transport=transport,
+        schema=motion_schema,
+        saved=False,
+        frame_counts={int(key): dict(value) for key, value in frame_counts.items()},
     )
 
 

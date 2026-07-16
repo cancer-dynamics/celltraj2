@@ -62,7 +62,7 @@ class FeatureExtractionTests(unittest.TestCase):
             store.write_label_frame("foreground", 1, foreground_labels)
             store.write_mask_frame("nuc", 1, nuc_mask)
             store.write_mask_frame("background", 1, background_mask)
-        with Trajectory(path) as trajectory:
+        with Trajectory(path, mode="r+") as trajectory:
             trajectory.index_observations("cyto", run_id="index_cyto")
 
     def _create_boundary_feature_h5(self, path: Path) -> None:
@@ -86,7 +86,7 @@ class FeatureExtractionTests(unittest.TestCase):
         with TrajectoryStore.create(path, metadata=metadata) as store:
             store.write_label_frame("cells", 1, frame_1)
             store.write_label_frame("cells", 2, frame_2)
-        with Trajectory(path) as trajectory:
+        with Trajectory(path, mode="r+") as trajectory:
             trajectory.index_observations("cells", run_id="index_cells")
             trajectory.build_boundary_library(
                 "cell_surfaces",
@@ -140,7 +140,7 @@ class FeatureExtractionTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             path = Path(tmp) / "boundary_features.ct2.h5"
             self._create_boundary_feature_h5(path)
-            with Trajectory(path) as trajectory:
+            with Trajectory(path, mode="r+") as trajectory:
                 result = trajectory.extract_features(
                     {
                         "feature_set": "boundary_v1",
@@ -274,7 +274,7 @@ class FeatureExtractionTests(unittest.TestCase):
             path = Path(tmp) / "sample.ct2.h5"
             self._create_feature_h5(path)
 
-            with Trajectory(path) as trajectory:
+            with Trajectory(path, mode="r+") as trajectory:
                 spec = regionprops_v1_spec("cyto", properties=["area"])
                 result = trajectory.extract_features(spec, run_id="features_regionprops")
                 values = trajectory.object_set("cyto").read_features("regionprops_v1")
@@ -292,7 +292,7 @@ class FeatureExtractionTests(unittest.TestCase):
             path = Path(tmp) / "sample.ct2.h5"
             self._create_feature_h5(path)
 
-            with Trajectory(path) as trajectory:
+            with Trajectory(path, mode="r+") as trajectory:
                 spec = site_signaling_v1_spec(
                     "cyto",
                     signal_channel={"readout": "erk"},
@@ -319,7 +319,7 @@ class FeatureExtractionTests(unittest.TestCase):
             path = Path(tmp) / "sample.ct2.h5"
             self._create_feature_h5(path)
 
-            with Trajectory(path) as trajectory:
+            with Trajectory(path, mode="r+") as trajectory:
                 spec = {
                     "feature_set": "intensity_background",
                     "object_set": "cyto",
@@ -355,7 +355,7 @@ class FeatureExtractionTests(unittest.TestCase):
             path = Path(tmp) / "sample.ct2.h5"
             self._create_feature_h5(path)
 
-            with Trajectory(path) as trajectory:
+            with Trajectory(path, mode="r+") as trajectory:
                 spec = site_signaling_v1_spec(
                     "cyto",
                     signal_channel={"readout": "erk"},
@@ -383,7 +383,7 @@ class FeatureExtractionTests(unittest.TestCase):
             path = Path(tmp) / "sample.ct2.h5"
             self._create_feature_h5(path)
 
-            with Trajectory(path) as trajectory:
+            with Trajectory(path, mode="r+") as trajectory:
                 spec = site_signaling_v1_spec(
                     "cyto",
                     signal_channel={"readout": "erk"},

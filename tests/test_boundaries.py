@@ -55,7 +55,7 @@ class BoundaryLibraryTests(unittest.TestCase):
         with TrajectoryStore.create(path, metadata=self._metadata(len(frames))) as store:
             for frame, labels in enumerate(frames, start=1):
                 store.write_label_frame("cells", frame, labels)
-        with Trajectory(path) as trajectory:
+        with Trajectory(path, mode="r+") as trajectory:
             trajectory.index_observations("cells", run_id="index_cells")
 
     def test_sinkhorn_plan_preserves_uniform_mass(self):
@@ -99,7 +99,7 @@ class BoundaryLibraryTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             path = Path(tmp) / "sample.ct2.h5"
             self._create_indexed(path, [frame])
-            with Trajectory(path) as trajectory:
+            with Trajectory(path, mode="r+") as trajectory:
                 trajectory.write_mask_frame("basement", 1, basement)
                 result = trajectory.build_boundary_library(
                     "cells_and_matrix",
@@ -153,7 +153,7 @@ class BoundaryLibraryTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             path = Path(tmp) / "sample.ct2.h5"
             self._create_indexed(path, [frame])
-            with Trajectory(path) as trajectory:
+            with Trajectory(path, mode="r+") as trajectory:
                 trajectory.object_set("cells").build_boundary_library("native")
                 geometry = trajectory.compute_boundary_geometry(
                     "native", geometry_set="surface", knn=6, backend="local"
@@ -191,7 +191,7 @@ class BoundaryLibraryTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             path = Path(tmp) / "sample.ct2.h5"
             self._create_indexed(path, [frame_1, frame_2])
-            with Trajectory(path) as trajectory:
+            with Trajectory(path, mode="r+") as trajectory:
                 trajectory.object_set("cells").build_boundary_library("native")
                 native_before = trajectory.boundary_library("native").native_positions(2).copy()
                 frames = self.np.asarray([1, 2], dtype=self.np.int32)
@@ -265,7 +265,7 @@ class BoundaryLibraryTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             path = Path(tmp) / "sample.ct2.h5"
             self._create_indexed(path, [frame])
-            with Trajectory(path) as trajectory:
+            with Trajectory(path, mode="r+") as trajectory:
                 trajectory.write_mask_frame("basement", 1, basement)
             payload = {
                 "job_id": "boundary_batch_test",
@@ -348,7 +348,7 @@ class BoundaryLibraryTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             path = Path(tmp) / "sample.ct2.h5"
             self._create_indexed(path, [frame_1, frame_2])
-            with Trajectory(path) as trajectory:
+            with Trajectory(path, mode="r+") as trajectory:
                 transient = trajectory.track_minimum_boundary_ot_cost(
                     "cells",
                     boundary_set=None,

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 from celltraj2.boundaries import (
     BoundaryGeometryResult,
@@ -237,11 +237,31 @@ class ObjectSet:
 class Trajectory:
     """Open and interact with one celltraj2 per-ROI analysis H5."""
 
-    def __init__(self, path: str | Path, mode: str = "r+") -> None:
-        self.store = TrajectoryStore.open(path, mode=mode)
-        self.path = self.store.path
-        self.metadata = self.store.read_metadata()
-        self.image_source = self._load_image_source()
+    def __init__(
+        self,
+        path: str | Path,
+        mode: str = "r",
+        *,
+        timeout: float | None = None,
+        reporter: Callable[[Mapping[str, Any]], None] | None = None,
+        operation: str | None = None,
+        job_id: str | None = None,
+    ) -> None:
+        self.store = TrajectoryStore.open(
+            path,
+            mode=mode,
+            timeout=timeout,
+            reporter=reporter,
+            operation=operation,
+            job_id=job_id,
+        )
+        try:
+            self.path = self.store.path
+            self.metadata = self.store.read_metadata()
+            self.image_source = self._load_image_source()
+        except Exception:
+            self.store.close()
+            raise
 
     @classmethod
     def create(

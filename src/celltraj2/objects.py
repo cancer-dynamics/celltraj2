@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, field, is_dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from celltraj2.paths import validate_name
 from celltraj2.schema import utc_now_iso
@@ -95,6 +95,8 @@ class ObjectIndexResult:
     object_set: str
     source_label_set: str
     observations: Any
+    lookups: dict[int, Any]
+    schema: dict[str, Any]
     frames: list[int]
     frame_counts: dict[int, int] = field(default_factory=dict)
     lookup_paths: dict[int, str] = field(default_factory=dict)
@@ -161,6 +163,7 @@ def index_object_set(
     save_outputs: bool = True,
     run_id: str | None = None,
     metadata: Mapping[str, Any] | None = None,
+    progress: Callable[[Mapping[str, Any]], None] | None = None,
 ) -> ObjectIndexResult:
     """Index one source label set into stable object observations."""
 
@@ -192,6 +195,15 @@ def index_object_set(
         records.extend(frame_records)
         lookups[frame] = lookup
         frame_counts[frame] = len(frame_records)
+        if progress is not None:
+            progress(
+                {
+                    "frame": int(frame),
+                    "object_set": object_name,
+                    "source_label_set": label_name,
+                    "observation_count": int(len(frame_records)),
+                }
+            )
 
     observations = np.asarray(records, dtype=observation_dtype())
     schema = observation_schema(
@@ -263,6 +275,8 @@ def index_object_set(
         object_set=object_name,
         source_label_set=label_name,
         observations=observations,
+        lookups=lookups,
+        schema=schema,
         frames=selected_frames,
         frame_counts=frame_counts,
         lookup_paths=lookup_paths,

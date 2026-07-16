@@ -47,7 +47,7 @@ class StoreTests(unittest.TestCase):
             path = Path(tmp) / "sample.ct2.h5"
             with TrajectoryStore.create(path, metadata=metadata) as store:
                 store.write_raw_frame(1, self.np.zeros((2, 3, 4, 1), dtype=self.np.uint16))
-            with Trajectory(path) as traj:
+            with Trajectory(path, mode="r+") as traj:
                 traj.write_label_frame("epithelial", 1, self.np.ones((2, 3, 4), dtype=self.np.uint16))
                 self.assertEqual(traj.get_image_data(frame=1).shape, (2, 3, 4, 1))
                 self.assertEqual(traj.label_frames("epithelial"), [1])

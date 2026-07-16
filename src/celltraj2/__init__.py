@@ -46,6 +46,7 @@ from celltraj2.features import (
     regionprops_v1_spec,
     site_signaling_v1_spec,
 )
+from celltraj2.h5_access import H5AccessTimeout, H5DependencyChangedError, open_h5
 from celltraj2.object_indexing import (
     BatchObjectIndexSummary,
     ObjectIndexBatchJob,
@@ -122,6 +123,8 @@ __all__ = [
     "FeatureExtractionResult",
     "FeatureSetSpec",
     "ImageSourceSpec",
+    "H5AccessTimeout",
+    "H5DependencyChangedError",
     "JsonlReporter",
     "ObjectIndexBatchJob",
     "ObjectIndexFileJob",
@@ -156,6 +159,7 @@ __all__ = [
     "estimate_pair_translation",
     "index_object_set",
     "optimal_transport_plan",
+    "open_h5",
     "resolve_boundary_source_ids",
     "regionprops_v1_spec",
     "register_global_translation",

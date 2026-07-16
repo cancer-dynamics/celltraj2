@@ -5,8 +5,9 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Mapping as TypingMapping
 
+from celltraj2.h5_access import open_h5
 from celltraj2.paths import frame_key, frame_sort_key, raw_frame_path, validate_name
 from celltraj2.schema import SCHEMA_VERSION, ImageSourceSpec, TrajectoryMetadata
 
@@ -37,11 +38,28 @@ def _as_json_safe(value: Any) -> Any:
 class TrajectoryStore:
     """Low-level frame-based H5 store."""
 
-    def __init__(self, path: str | Path, mode: str = "r") -> None:
+    def __init__(
+        self,
+        path: str | Path,
+        mode: str = "r",
+        *,
+        timeout: float | None = None,
+        reporter: Callable[[TypingMapping[str, Any]], None] | None = None,
+        operation: str | None = None,
+        job_id: str | None = None,
+    ) -> None:
         self.path = Path(path)
         self.mode = mode
-        h5py = _require_h5py()
-        self._h5 = h5py.File(self.path, mode)
+        self._access = open_h5(
+            self.path,
+            mode,
+            timeout=timeout,
+            reporter=reporter,
+            operation=operation,
+            job_id=job_id,
+        )
+        self._h5 = self._access.__enter__()
+        self._closed = False
 
     @classmethod
     def create(
@@ -60,7 +78,7 @@ class TrajectoryStore:
         if out.exists() and not overwrite:
             raise FileExistsError(out)
         out.parent.mkdir(parents=True, exist_ok=True)
-        store = cls(out, mode="w")
+        store = cls(out, mode="w", operation="create")
         store._h5.attrs["celltraj2_schema_version"] = metadata.schema_version or SCHEMA_VERSION
         store._init_groups()
         store.write_json("/metadata/celltraj2.json", metadata.to_dict(), overwrite=True)
@@ -78,13 +96,32 @@ class TrajectoryStore:
         return store
 
     @classmethod
-    def open(cls, path: str | Path, mode: str = "r") -> "TrajectoryStore":
+    def open(
+        cls,
+        path: str | Path,
+        mode: str = "r",
+        *,
+        timeout: float | None = None,
+        reporter: Callable[[TypingMapping[str, Any]], None] | None = None,
+        operation: str | None = None,
+        job_id: str | None = None,
+    ) -> "TrajectoryStore":
         """Open an existing analysis H5."""
 
-        return cls(path, mode=mode)
+        return cls(
+            path,
+            mode=mode,
+            timeout=timeout,
+            reporter=reporter,
+            operation=operation,
+            job_id=job_id,
+        )
 
     def close(self) -> None:
-        self._h5.close()
+        if self._closed:
+            return
+        self._access.__exit__(None, None, None)
+        self._closed = True
 
     def __enter__(self) -> "TrajectoryStore":
         return self
@@ -95,6 +132,31 @@ class TrajectoryStore:
     @property
     def h5(self) -> Any:
         return self._h5
+
+    def file_revision(self) -> int:
+        return int(self._h5.attrs.get("celltraj2_revision", 0))
+
+    def resource_revision(self, path: str) -> int:
+        """Return a monotonic revision for one H5 resource path."""
+
+        key = str(path).strip("/")
+        if not key:
+            return self.file_revision()
+        if key not in self._h5:
+            return -1
+        return int(self._h5[key].attrs.get("celltraj2_revision", 0))
+
+    def _mark_mutation(self, path: str) -> int:
+        """Increment file and resource revisions after a successful mutation."""
+
+        revision = self.file_revision() + 1
+        self._h5.attrs["celltraj2_revision"] = revision
+        key = str(path).strip("/")
+        while key:
+            if key in self._h5:
+                self._h5[key].attrs["celltraj2_revision"] = revision
+            key, _, _ = key.rpartition("/")
+        return revision
 
     def _init_groups(self) -> None:
         for name in (
@@ -129,6 +191,7 @@ class TrajectoryStore:
         parent = self._h5.require_group(parent_path) if parent_path else self._h5
         h5py = _require_h5py()
         parent.create_dataset(name, data=_json_text(data), dtype=h5py.string_dtype(encoding="utf-8"))
+        self._mark_mutation(clean_path)
 
     def read_json(self, path: str) -> Any:
         """Read a JSON dataset."""
@@ -170,6 +233,7 @@ class TrajectoryStore:
         dataset.attrs["frame"] = int(frame)
         for attr_key, attr_value in dict(attrs or {}).items():
             dataset.attrs[str(attr_key)] = json.dumps(_as_json_safe(attr_value)) if isinstance(attr_value, (dict, list)) else attr_value
+        self._mark_mutation(f"{group_path.strip('/')}/{key}")
         return f"/{group_path.strip('/')}/{key}"
 
     def _read_frame_dataset(self, group_path: str, frame: int) -> Any:
@@ -299,6 +363,7 @@ class TrajectoryStore:
         dataset.attrs["observation_id_base"] = 1
         dataset.attrs["row_alignment"] = "row_index_zero_based_maps_to_observation_id_minus_1"
         self.write_json(f"{group_path}/observations_schema.json", dict(schema), overwrite=True)
+        self._mark_mutation(dataset_path)
         return f"/{dataset_path}"
 
     def read_observations(self, object_set: str) -> Any:
@@ -352,6 +417,7 @@ class TrajectoryStore:
         for key in list(group.keys()):
             if str(key).startswith("frame_"):
                 del group[key]
+        self._mark_mutation(path)
 
     def read_observation_lookup_frame(self, object_set: str, frame: int) -> Any:
         name = validate_name(object_set, kind="object set")
@@ -413,6 +479,7 @@ class TrajectoryStore:
         group.require_group("motion")
         self.write_json(f"/{group_path}/sources.json", [dict(value) for value in sources], overwrite=True)
         self.write_json(f"/{group_path}/schema.json", dict(schema), overwrite=True)
+        self._mark_mutation(group_path)
         return f"/{group_path}"
 
     def boundary_library(self, boundary_set: str) -> Any:
@@ -461,6 +528,7 @@ class TrajectoryStore:
         dataset = group.create_dataset("values", data=values, compression="gzip", shuffle=True)
         dataset.attrs["row_alignment"] = f"/boundaries/{boundary_name}/entities"
         self.write_json(f"/{group_path}/schema.json", dict(schema), overwrite=True)
+        self._mark_mutation(group_path)
         return f"/{group_path}/values"
 
     def read_boundary_entity_attributes(self, boundary_set: str, attribute_set: str) -> Any:
@@ -524,6 +592,7 @@ class TrajectoryStore:
             "indices", data=topology_indices, compression="gzip", shuffle=True
         )
         self.write_json(f"/{group_path}/schema.json", dict(schema), overwrite=True)
+        self._mark_mutation(group_path)
         return f"/{group_path}"
 
     def write_boundary_neighbors(
@@ -566,6 +635,7 @@ class TrajectoryStore:
             "displacement_zyx", data=displacement_zyx, compression="gzip", shuffle=True
         )
         self.write_json(f"/{group_path}/schema.json", dict(schema), overwrite=True)
+        self._mark_mutation(group_path)
         return f"/{group_path}"
 
     def write_boundary_motion(
@@ -608,6 +678,7 @@ class TrajectoryStore:
             )
             dataset.attrs["row_alignment"] = "transport_edge"
         self.write_json(f"/{group_path}/schema.json", dict(schema), overwrite=True)
+        self._mark_mutation(group_path)
         return f"/{group_path}"
 
     def read_boundary_motion(self, boundary_set: str, motion_set: str) -> dict[str, Any]:
@@ -656,6 +727,7 @@ class TrajectoryStore:
         assignments_dataset = group.create_dataset("assignments", data=assignments, compression="gzip")
         assignments_dataset.attrs["row_alignment"] = f"/object_sets/{object_name}/observations"
         self.write_json(f"/{group_path}/schema.json", dict(schema), overwrite=True)
+        self._mark_mutation(group_path)
         return f"/{group_path}"
 
     def read_track_graph(self, object_set: str, track_set: str) -> Any:
@@ -713,6 +785,7 @@ class TrajectoryStore:
         group.create_dataset("pairwise_results", data=registration.pairwise_results, compression="gzip")
         self.write_json(f"/{group_path}/schema.json", dict(registration.schema), overwrite=True)
         self.write_json(f"/{group_path}/canvas.json", dict(registration.canvas), overwrite=True)
+        self._mark_mutation(group_path)
         return f"/{group_path}"
 
     def read_registration_set(self, registration_set: str) -> Any:
@@ -787,8 +860,7 @@ class TrajectoryStore:
         """Write top-level provenance for one registration run."""
 
         name = validate_name(run_id, kind="registration run")
-        group = self._h5.require_group(f"runs/registration/{name}")
-        group.require_group("frames")
+        self._h5.require_group(f"runs/registration/{name}")
         self.write_json(f"/runs/registration/{name}/run.json", dict(data), overwrite=overwrite)
         return f"/runs/registration/{name}/run.json"
 
@@ -832,8 +904,7 @@ class TrajectoryStore:
         """Write top-level metadata for one tracking run."""
 
         name = validate_name(run_id, kind="tracking run")
-        group = self._h5.require_group(f"runs/tracking/{name}")
-        group.require_group("frames")
+        self._h5.require_group(f"runs/tracking/{name}")
         self.write_json(f"/runs/tracking/{name}/run.json", dict(data), overwrite=overwrite)
         return f"/runs/tracking/{name}/run.json"
 
@@ -895,6 +966,7 @@ class TrajectoryStore:
         self.write_json(f"/{group_path}/schema.json", dict(schema), overwrite=True)
         if qc is not None:
             self.write_json(f"/{group_path}/qc.json", dict(qc), overwrite=True)
+        self._mark_mutation(group_path)
         return f"/{group_path}/values"
 
     def read_feature_values(self, object_set: str, feature_set: str) -> Any:
@@ -929,8 +1001,7 @@ class TrajectoryStore:
         """Write top-level metadata for one segmentation run."""
 
         name = validate_name(run_id, kind="segmentation run")
-        group = self._h5.require_group(f"runs/segmentation/{name}")
-        group.require_group("frames")
+        self._h5.require_group(f"runs/segmentation/{name}")
         self.write_json(f"/runs/segmentation/{name}/run.json", dict(data), overwrite=overwrite)
         return f"/runs/segmentation/{name}/run.json"
 
@@ -974,8 +1045,7 @@ class TrajectoryStore:
         """Write top-level metadata for one object-indexing run."""
 
         name = validate_name(run_id, kind="object-indexing run")
-        group = self._h5.require_group(f"runs/object_indexing/{name}")
-        group.require_group("frames")
+        self._h5.require_group(f"runs/object_indexing/{name}")
         self.write_json(f"/runs/object_indexing/{name}/run.json", dict(data), overwrite=overwrite)
         return f"/runs/object_indexing/{name}/run.json"
 
@@ -1019,8 +1089,7 @@ class TrajectoryStore:
         """Write top-level metadata for one feature-extraction run."""
 
         name = validate_name(run_id, kind="feature-extraction run")
-        group = self._h5.require_group(f"runs/feature_extraction/{name}")
-        group.require_group("frames")
+        self._h5.require_group(f"runs/feature_extraction/{name}")
         self.write_json(f"/runs/feature_extraction/{name}/run.json", dict(data), overwrite=overwrite)
         return f"/runs/feature_extraction/{name}/run.json"
 

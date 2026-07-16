@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from celltraj2.object_indexing import JsonlReporter
+from celltraj2.h5_access import run_with_stale_retries, snapshot_revisions, validate_revisions
 from celltraj2.registration import default_registration_run_id, register_global_translation
 from celltraj2.schema import utc_now_iso
 from celltraj2.trajectory import Trajectory
@@ -197,7 +198,11 @@ def run_batch_registration(
             }
         )
         try:
-            _run_file_job(batch_job, file_job, h5_path, summary, emit)
+            run_with_stale_retries(
+                lambda: _run_file_job(batch_job, file_job, h5_path, summary, emit),
+                reporter=emit,
+                context={"job_id": batch_job.job_id, "h5_path": str(h5_path)},
+            )
         except Exception as exc:
             summary.failed += 1
             emit({"event": "file_failed", "job_id": batch_job.job_id, "h5_path": str(h5_path), "error": repr(exc)})
@@ -216,8 +221,13 @@ def _run_file_job(
 ) -> None:
     save_outputs = bool(batch_job.save_outputs and file_job.save_outputs)
     overwrite = bool(batch_job.overwrite or file_job.overwrite)
-    mode = "r+" if save_outputs else "r"
-    with Trajectory(h5_path, mode=mode) as trajectory:
+    with Trajectory(
+        h5_path,
+        mode="r",
+        reporter=emit,
+        operation="registration_calculation",
+        job_id=batch_job.job_id,
+    ) as trajectory:
         if not trajectory.object_set(file_job.object_set).has_observations():
             raise FileNotFoundError(f"/object_sets/{file_job.object_set}/observations")
         if save_outputs and trajectory.store.has_registration_set(file_job.registration_set) and not overwrite:
@@ -232,6 +242,10 @@ def _run_file_job(
                 }
             )
             return
+        dependencies = snapshot_revisions(
+            trajectory.store,
+            [f"/object_sets/{file_job.object_set}/observations"],
+        )
 
         def report_frame(frame_event: Mapping[str, Any]) -> None:
             emit(
@@ -257,17 +271,72 @@ def _run_file_job(
             contact_r0=file_job.contact_r0,
             contact_d0=file_job.contact_d0,
             overwrite=overwrite,
-            save_outputs=save_outputs,
+            save_outputs=False,
             set_active=file_job.set_active,
             run_id=batch_job.job_id,
             metadata={**batch_job.metadata, **file_job.metadata},
             progress=report_frame,
         )
-        payload = result.to_dict()
-        summary.completed += 1
-        summary.frames += int(payload["frame_count"])
-        summary.estimated_frames += int(payload["estimated_frame_count"])
-        emit({"event": "file_completed", "job_id": batch_job.job_id, "h5_path": str(h5_path), **payload})
+    registration_path = None
+    active = False
+    if save_outputs:
+        with Trajectory(
+            h5_path,
+            mode="r+",
+            reporter=emit,
+            operation="registration_commit",
+            job_id=batch_job.job_id,
+        ) as trajectory:
+            validate_revisions(trajectory.store, dependencies)
+            if trajectory.store.has_registration_set(file_job.registration_set) and not overwrite:
+                summary.skipped += 1
+                emit(
+                    {
+                        "event": "file_skipped",
+                        "job_id": batch_job.job_id,
+                        "h5_path": str(h5_path),
+                        "registration_set": file_job.registration_set,
+                        "reason": "registration set was written by another job",
+                    }
+                )
+                return
+            registration_path = trajectory.store.write_registration_set(result.registration, overwrite=overwrite)
+            if file_job.set_active:
+                trajectory.store.set_active_registration(
+                    result.registration.name,
+                    reason="registration_run",
+                    run_id=batch_job.job_id,
+                )
+                active = True
+            trajectory.store.write_registration_run(
+                batch_job.job_id,
+                {
+                    "schema": "celltraj2.registration_run.v1",
+                    "run_id": batch_job.job_id,
+                    "status": "completed",
+                    "completed_at": utc_now_iso(),
+                    "h5_path": str(h5_path),
+                    "object_set": file_job.object_set,
+                    "registration_set": result.registration.name,
+                    "registration_digest": result.registration.digest,
+                    "registration_path": registration_path,
+                    "set_active": bool(file_job.set_active),
+                    "dependencies": dependencies,
+                    "schema_record": result.registration.schema,
+                    "metadata": {**batch_job.metadata, **file_job.metadata},
+                },
+                overwrite=True,
+            )
+    payload = {
+        **result.to_dict(),
+        "saved": save_outputs,
+        "active": active,
+        "registration_path": registration_path,
+    }
+    summary.completed += 1
+    summary.frames += int(payload["frame_count"])
+    summary.estimated_frames += int(payload["estimated_frame_count"])
+    emit({"event": "file_completed", "job_id": batch_job.job_id, "h5_path": str(h5_path), **payload})
 
 
 __all__ = [

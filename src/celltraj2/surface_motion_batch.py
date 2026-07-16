@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from celltraj2.object_indexing import JsonlReporter
+from celltraj2.h5_access import run_with_stale_retries, snapshot_revisions, validate_revisions
 from celltraj2.paths import validate_name
 from celltraj2.schema import utc_now_iso
 from celltraj2.tracking import compute_boundary_motion, default_tracking_run_id
@@ -198,76 +199,19 @@ def run_batch_surface_motion(
             }
         )
         try:
-            mode = "r+" if save_outputs else "r"
-            with Trajectory(h5_path, mode=mode) as trajectory:
-                if (
-                    save_outputs
-                    and file_job.motion_set in trajectory.boundary_library(file_job.boundary_set).motion_sets()
-                    and not (batch_job.overwrite or file_job.overwrite)
-                ):
-                    summary.skipped += 1
-                    emit({**common, "event": "file_skipped", "reason": "motion set already exists"})
-                    continue
-                result = compute_boundary_motion(
-                    trajectory,
-                    file_job.object_set,
-                    file_job.track_set,
-                    boundary_set=file_job.boundary_set,
-                    motion_set=file_job.motion_set,
-                    boundary_source_id=file_job.boundary_source_id,
-                    boundary_source_name=file_job.boundary_source_name,
-                    boundary_source_role=file_job.boundary_source_role,
-                    registration_set=file_job.registration_set,
-                    ot_method=file_job.ot_method,
-                    sinkhorn_regularization=file_job.sinkhorn_regularization,
-                    max_boundary_points=file_job.max_boundary_points,
-                    mass_tolerance=file_job.mass_tolerance,
-                    overwrite=bool(batch_job.overwrite or file_job.overwrite),
-                    save_outputs=save_outputs,
-                    metadata={**batch_job.metadata, **file_job.metadata},
-                )
-                boundary = trajectory.boundary_library(file_job.boundary_set)
-                for link in result.links:
-                    source_entity = boundary.entity(int(link["source_entity_id"]))
-                    target_entity = boundary.entity(int(link["target_entity_id"]))
-                    emit(
-                        {
-                            **common,
-                            "event": "surface_motion_link_summary",
-                            "motion_link_id": int(link["motion_link_id"]),
-                            "track_link_id": int(link["track_link_id"]),
-                            "source_observation_id": int(link["source_observation_id"]),
-                            "target_observation_id": int(link["target_observation_id"]),
-                            "source_frame": int(link["source_frame"]),
-                            "target_frame": int(link["target_frame"]),
-                            "source_point_count": int(source_entity["point_count"]),
-                            "target_point_count": int(target_entity["point_count"]),
-                            "transport_edge_count": int(link["transport_count"]),
-                            "transported_mass": float(link["transported_mass"]),
-                            "ot_cost": float(link["ot_cost"]),
-                        }
-                    )
-                for frame, counts in result.frame_counts.items():
-                    emit({**common, "event": "surface_motion_frame_summary", "frame": int(frame), **counts})
-                if save_outputs:
-                    trajectory.store.write_json(
-                        f"/runs/surface_motion/{validate_name(batch_job.job_id, kind='surface motion run')}/run.json",
-                        {
-                            "schema": "celltraj2.surface_motion_run.v1",
-                            "job_id": batch_job.job_id,
-                            "completed_at": utc_now_iso(),
-                            **result.to_dict(),
-                            "boundary_dependency": result.schema.get("boundary_dependency"),
-                            "track_dependency": result.schema.get("track_dependency"),
-                            "registration_dependency": result.schema.get("registration_dependency"),
-                            "metadata": {**batch_job.metadata, **file_job.metadata},
-                        },
-                        overwrite=True,
-                    )
+            outcome = run_with_stale_retries(
+                lambda: _run_surface_motion_file(batch_job, file_job, h5_path, emit, common),
+                reporter=emit,
+                context=common,
+            )
+            if outcome is None:
+                summary.skipped += 1
+                continue
+            result, motion_path = outcome
             summary.completed += 1
             summary.links += result.link_count
             summary.transport_edges += result.transport_edge_count
-            emit({**common, "event": "file_completed", **result.to_dict()})
+            emit({**common, "event": "file_completed", **result.to_dict(), "saved": save_outputs, "motion_path": motion_path})
         except Exception as exc:
             summary.failed += 1
             emit({**common, "event": "file_failed", "error": repr(exc)})
@@ -275,6 +219,107 @@ def run_batch_surface_motion(
                 raise
     emit({"event": "job_completed", **summary.to_dict()})
     return summary
+
+
+def _run_surface_motion_file(
+    batch_job: SurfaceMotionBatchJob,
+    file_job: SurfaceMotionFileJob,
+    h5_path: Path,
+    emit: Reporter,
+    common: Mapping[str, Any],
+) -> tuple[Any, str | None] | None:
+    """Calculate read-only, then hold the canonical H5 only for commit."""
+
+    save_outputs = bool(batch_job.save_outputs and file_job.save_outputs)
+    overwrite = bool(batch_job.overwrite or file_job.overwrite)
+    with Trajectory(
+        h5_path,
+        mode="r",
+        reporter=emit,
+        operation="surface_motion_calculation",
+        job_id=batch_job.job_id,
+    ) as trajectory:
+        if (
+            save_outputs
+            and file_job.motion_set in trajectory.boundary_library(file_job.boundary_set).motion_sets()
+            and not overwrite
+        ):
+            emit({**common, "event": "file_skipped", "reason": "motion set already exists"})
+            return None
+        selected_registration = file_job.registration_set or trajectory.store.active_registration_name()
+        dependency_paths = [
+            f"/object_sets/{file_job.object_set}/tracks/{file_job.track_set}",
+            f"/boundaries/{file_job.boundary_set}",
+            f"/boundaries/{file_job.boundary_set}/motion/{file_job.motion_set}",
+        ]
+        if selected_registration:
+            dependency_paths.append(f"/registrations/{selected_registration}")
+        dependencies = snapshot_revisions(trajectory.store, dependency_paths)
+
+        def report_progress(event: Mapping[str, Any]) -> None:
+            emit({**common, **dict(event)})
+
+        result = compute_boundary_motion(
+            trajectory,
+            file_job.object_set,
+            file_job.track_set,
+            boundary_set=file_job.boundary_set,
+            motion_set=file_job.motion_set,
+            boundary_source_id=file_job.boundary_source_id,
+            boundary_source_name=file_job.boundary_source_name,
+            boundary_source_role=file_job.boundary_source_role,
+            registration_set=file_job.registration_set,
+            ot_method=file_job.ot_method,
+            sinkhorn_regularization=file_job.sinkhorn_regularization,
+            max_boundary_points=file_job.max_boundary_points,
+            mass_tolerance=file_job.mass_tolerance,
+            overwrite=overwrite,
+            save_outputs=False,
+            metadata={**batch_job.metadata, **file_job.metadata},
+            progress=report_progress,
+        )
+        for frame, counts in result.frame_counts.items():
+            emit({**common, "event": "surface_motion_frame_summary", "frame": int(frame), **counts})
+
+    motion_path = None
+    if save_outputs:
+        with Trajectory(
+            h5_path,
+            mode="r+",
+            reporter=emit,
+            operation="surface_motion_commit",
+            job_id=batch_job.job_id,
+        ) as trajectory:
+            validate_revisions(trajectory.store, dependencies)
+            existing = file_job.motion_set in trajectory.boundary_library(file_job.boundary_set).motion_sets()
+            if existing and not overwrite:
+                emit({**common, "event": "file_skipped", "reason": "motion set was written by another job"})
+                return None
+            motion_path = trajectory.store.write_boundary_motion(
+                result.boundary_set,
+                result.motion_set,
+                links=result.links,
+                transport=result.transport,
+                schema=result.schema,
+                overwrite=overwrite,
+            )
+            trajectory.store.write_json(
+                f"/runs/surface_motion/{validate_name(batch_job.job_id, kind='surface motion run')}/run.json",
+                {
+                    "schema": "celltraj2.surface_motion_run.v1",
+                    "job_id": batch_job.job_id,
+                    "completed_at": utc_now_iso(),
+                    **result.to_dict(),
+                    "motion_path": motion_path,
+                    "dependencies": dependencies,
+                    "boundary_dependency": result.schema.get("boundary_dependency"),
+                    "track_dependency": result.schema.get("track_dependency"),
+                    "registration_dependency": result.schema.get("registration_dependency"),
+                    "metadata": {**batch_job.metadata, **file_job.metadata},
+                },
+                overwrite=True,
+            )
+    return result, motion_path
 
 
 __all__ = [

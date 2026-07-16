@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import json
-import sys
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field, is_dataclass, replace
 from pathlib import Path
-from typing import Any, TextIO
+from typing import Any
 
 from celltraj2.model_input import compose_model_input, model_input_summary, normalized_frame_axes
+from celltraj2.h5_access import H5DependencyChangedError, snapshot_revisions, validate_revisions
+from celltraj2.reporting import JsonlReporter
 from celltraj2.schema import utc_now_iso
 from celltraj2.trajectory import Trajectory
 
@@ -253,18 +254,6 @@ Reporter = Callable[[Mapping[str, Any]], None]
 Segmenter = Callable[[Any, SegmentationFileJob, int], Any]
 
 
-class JsonlReporter:
-    """Write progress events as JSON lines."""
-
-    def __init__(self, stream: TextIO | None = None) -> None:
-        self.stream = stream or sys.stdout
-
-    def __call__(self, event: Mapping[str, Any]) -> None:
-        payload = {"timestamp": utc_now_iso(), **dict(event)}
-        self.stream.write(json.dumps(_json_safe(payload), sort_keys=True) + "\n")
-        self.stream.flush()
-
-
 def load_batch_job(path: str | Path) -> SegmentationBatchJob:
     return SegmentationBatchJob.load(path)
 
@@ -309,16 +298,20 @@ def _run_file_job(
     emit: Reporter,
 ) -> None:
     save_outputs = bool(batch_job.save_outputs and file_job.save_outputs)
-    mode = "r+" if save_outputs else "r"
-    with Trajectory(h5_path, mode=mode) as trajectory:
+    with Trajectory(
+        h5_path,
+        mode="r",
+        reporter=emit,
+        operation="segmentation_preflight",
+        job_id=batch_job.job_id,
+    ) as trajectory:
         frame_count = int(trajectory.metadata.frame_count or 1)
         frames = file_job.frame_numbers(frame_count)
-        summary.frames += len(frames)
         run_record = {
             "schema": "celltraj2.segmentation_run.v1",
             "run_id": batch_job.job_id,
             "job_id": batch_job.job_id,
-            "status": "running",
+            "status": "completed",
             "started_at": utc_now_iso(),
             "h5_path": str(h5_path),
             "roi_id": trajectory.metadata.roi_id,
@@ -333,21 +326,32 @@ def _run_file_job(
             "model_input": file_job.model_input,
             "metadata": file_job.metadata,
         }
-        if save_outputs:
-            trajectory.write_segmentation_run(batch_job.job_id, run_record, overwrite=True)
-        failed_before = int(summary.failed)
-        for frame in frames:
-            _run_frame(batch_job, file_job, trajectory, frame, segmenter, summary, emit)
-        run_record["status"] = "completed_with_errors" if summary.failed > failed_before else "completed"
-        run_record["completed_at"] = utc_now_iso()
-        if save_outputs:
+    summary.frames += len(frames)
+    completed_before = int(summary.completed)
+    skipped_before = int(summary.skipped)
+    failed_before = int(summary.failed)
+    for frame in frames:
+        _run_frame(batch_job, file_job, h5_path, frame, segmenter, summary, emit)
+    run_record["status"] = "completed_with_errors" if summary.failed > failed_before else "completed"
+    run_record["completed_at"] = utc_now_iso()
+    run_record["completed_frames"] = int(summary.completed - completed_before)
+    run_record["skipped_frames"] = int(summary.skipped - skipped_before)
+    run_record["failed_frames"] = int(summary.failed - failed_before)
+    if save_outputs:
+        with Trajectory(
+            h5_path,
+            mode="r+",
+            reporter=emit,
+            operation="segmentation_provenance_commit",
+            job_id=batch_job.job_id,
+        ) as trajectory:
             trajectory.write_segmentation_run(batch_job.job_id, run_record, overwrite=True)
 
 
 def _run_frame(
     batch_job: SegmentationBatchJob,
     file_job: SegmentationFileJob,
-    trajectory: Trajectory,
+    h5_path: Path,
     frame: int,
     segmenter: Segmenter,
     summary: BatchSegmentationSummary,
@@ -355,40 +359,81 @@ def _run_frame(
 ) -> None:
     overwrite = bool(batch_job.overwrite or file_job.overwrite)
     save_outputs = bool(batch_job.save_outputs and file_job.save_outputs)
-    if save_outputs and _has_output_frame(trajectory, file_job, frame) and not overwrite:
-        summary.skipped += 1
-        record = {
-            "frame": int(frame),
-            "status": "skipped",
-            "reason": f"{file_job.output_group} frame exists",
-            "output_name": file_job.output_name,
-            "output_kind": file_job.output_group,
-            "output_h5_path": file_job.output_h5_path,
-            "saved": False,
-        }
-        trajectory.write_segmentation_frame_result(batch_job.job_id, frame, record, overwrite=True)
-        emit({"event": "frame_skipped", "job_id": batch_job.job_id, "h5_path": str(trajectory.path), **record})
-        return
-
     try:
-        frame_data = trajectory.get_image_data(frame=frame)
-        frame_axes = normalized_frame_axes(trajectory.frame_axes(getattr(frame_data, "ndim", 0)), getattr(frame_data, "ndim", 0))
-        effective_do_3d = _effective_do_3d_for_frame(file_job, frame_axes)
-        effective_file_job = _file_job_with_effective_do_3d(file_job, effective_do_3d)
-        model_input = compose_model_input(
-            frame_data,
-            channel_specs=effective_file_job.channel_specs,
-            axes=frame_axes,
-            do_3d=effective_file_job.do_3d,
-            z_index=effective_file_job.z_index,
-            channel_index_map=trajectory.channel_index_map(),
-        )
+        emit({"event": "frame_started", "job_id": batch_job.job_id, "h5_path": str(h5_path), "frame": int(frame)})
+        with Trajectory(
+            h5_path,
+            mode="r",
+            reporter=emit,
+            operation=f"segmentation_read_frame_{int(frame)}",
+            job_id=batch_job.job_id,
+        ) as trajectory:
+            if save_outputs and _has_output_frame(trajectory, file_job, frame) and not overwrite:
+                summary.skipped += 1
+                record = {
+                    "frame": int(frame),
+                    "status": "skipped",
+                    "reason": f"{file_job.output_group} frame exists",
+                    "output_name": file_job.output_name,
+                    "output_kind": file_job.output_group,
+                    "output_h5_path": file_job.output_h5_path,
+                    "saved": False,
+                }
+                emit({"event": "frame_skipped", "job_id": batch_job.job_id, "h5_path": str(h5_path), **record})
+                return
+            dependencies = ["/metadata/celltraj2.json", "/sources/image_source.json"]
+            if str(getattr(trajectory.metadata.image_source, "source_type", "")) == "embedded_h5":
+                dependencies.append(trajectory.store.raw_frame_path(frame))
+            revisions = snapshot_revisions(trajectory.store, dependencies)
+            frame_data = trajectory.get_image_data(frame=frame)
+            frame_axes = normalized_frame_axes(
+                trajectory.frame_axes(getattr(frame_data, "ndim", 0)),
+                getattr(frame_data, "ndim", 0),
+            )
+            effective_do_3d = _effective_do_3d_for_frame(file_job, frame_axes)
+            effective_file_job = _file_job_with_effective_do_3d(file_job, effective_do_3d)
+            model_input = compose_model_input(
+                frame_data,
+                channel_specs=effective_file_job.channel_specs,
+                axes=frame_axes,
+                do_3d=effective_file_job.do_3d,
+                z_index=effective_file_job.z_index,
+                channel_index_map=trajectory.channel_index_map(),
+            )
         channel_axis = 1 if effective_file_job.do_3d and getattr(model_input, "ndim", 0) == 4 else 0 if (not effective_file_job.do_3d and getattr(model_input, "ndim", 0) == 3) else None
         result = _coerce_segmentation_result(segmenter(model_input, effective_file_job, frame))
         output_path = None
         if save_outputs:
-            output_path = _write_output_frame(trajectory, file_job, frame, result.labels, overwrite=overwrite, batch_job=batch_job)
-        preview_output_path = _frame_preview_output_path(batch_job, file_job, trajectory, frame)
+            with Trajectory(
+                h5_path,
+                mode="r+",
+                reporter=emit,
+                operation=f"segmentation_commit_frame_{int(frame)}",
+                job_id=batch_job.job_id,
+            ) as trajectory:
+                validate_revisions(trajectory.store, revisions)
+                if _has_output_frame(trajectory, file_job, frame) and not overwrite:
+                    summary.skipped += 1
+                    record = {
+                        "frame": int(frame),
+                        "status": "skipped",
+                        "reason": f"{file_job.output_group} frame was written by another job",
+                        "output_name": file_job.output_name,
+                        "output_kind": file_job.output_group,
+                        "output_h5_path": file_job.output_h5_path,
+                        "saved": False,
+                    }
+                    emit({"event": "frame_skipped", "job_id": batch_job.job_id, "h5_path": str(h5_path), **record})
+                    return
+                output_path = _write_output_frame(
+                    trajectory,
+                    file_job,
+                    frame,
+                    result.labels,
+                    overwrite=overwrite,
+                    batch_job=batch_job,
+                )
+        preview_output_path = _frame_preview_output_path(batch_job, file_job, h5_path, frame)
         if preview_output_path is not None:
             _write_preview_npz(
                 preview_output_path,
@@ -420,9 +465,33 @@ def _run_frame(
             "requested_do_3D": bool(file_job.do_3d),
             "effective_do_3D": bool(effective_file_job.do_3d),
         }
-        if save_outputs:
-            trajectory.write_segmentation_frame_result(batch_job.job_id, frame, record, overwrite=True)
-        emit({"event": "frame_completed", "job_id": batch_job.job_id, "h5_path": str(trajectory.path), **record})
+        emit({"event": "frame_completed", "job_id": batch_job.job_id, "h5_path": str(h5_path), **record})
+    except H5DependencyChangedError as exc:
+        emit(
+            {
+                "event": "commit_stale",
+                "job_id": batch_job.job_id,
+                "h5_path": str(h5_path),
+                "frame": int(frame),
+                "attempt": int(stale_attempt),
+                "max_attempts": 3,
+                "recomputing": stale_attempt < 3,
+                "error": str(exc),
+            }
+        )
+        if stale_attempt < 3:
+            _run_frame(
+                batch_job,
+                file_job,
+                h5_path,
+                frame,
+                segmenter,
+                summary,
+                emit,
+                stale_attempt=stale_attempt + 1,
+            )
+            return
+        raise
     except Exception as exc:
         summary.failed += 1
         record = {
@@ -434,9 +503,7 @@ def _run_frame(
             "error": repr(exc),
             "saved": False,
         }
-        if save_outputs:
-            trajectory.write_segmentation_frame_result(batch_job.job_id, frame, record, overwrite=True)
-        emit({"event": "frame_failed", "job_id": batch_job.job_id, "h5_path": str(trajectory.path), **record})
+        emit({"event": "frame_failed", "job_id": batch_job.job_id, "h5_path": str(h5_path), **record})
         if batch_job.fail_fast:
             raise
 
@@ -547,11 +614,11 @@ def _write_preview_npz(
 def _frame_preview_output_path(
     batch_job: SegmentationBatchJob,
     file_job: SegmentationFileJob,
-    trajectory: Trajectory,
+    h5_path: Path,
     frame: int,
 ) -> Path | None:
     if batch_job.preview_output_dir is not None:
-        stem = _safe_filename(Path(trajectory.path).name)
+        stem = _safe_filename(Path(h5_path).name)
         output = _safe_filename(file_job.output_name)
         return Path(batch_job.preview_output_dir) / f"{stem}__{output}__frame_{int(frame)}.npz"
     if batch_job.preview_output_path is not None:

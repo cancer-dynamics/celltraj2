@@ -9,13 +9,16 @@ from pathlib import Path
 from typing import Any
 
 from celltraj2.boundaries import (
+    BoundaryGeometryResult,
     BoundaryLibraryResult,
+    BoundaryNeighborResult,
     BoundarySourceSpec,
     as_boundary_library_view,
     build_boundary_library,
     compute_boundary_geometry,
     compute_boundary_neighbors,
 )
+from celltraj2.h5_access import run_with_stale_retries, snapshot_revisions, validate_revisions
 from celltraj2.object_indexing import JsonlReporter
 from celltraj2.paths import validate_name
 from celltraj2.schema import utc_now_iso
@@ -394,7 +397,11 @@ def run_batch_boundaries(
             }
         )
         try:
-            _run_boundary_file(batch_job, file_job, h5_path, summary, emit, common)
+            run_with_stale_retries(
+                lambda: _run_boundary_file(batch_job, file_job, h5_path, summary, emit, common),
+                reporter=emit,
+                context=common,
+            )
         except Exception as exc:
             summary.failed += 1
             emit({**common, "event": "file_failed", "error": repr(exc)})
@@ -415,11 +422,25 @@ def _run_boundary_file(
     save_outputs = bool(batch_job.save_outputs and file_job.save_outputs)
     overwrite_library = bool(batch_job.overwrite_library or file_job.overwrite_library)
     overwrite_derived = bool(batch_job.overwrite_derived or file_job.overwrite_derived)
-    mode = "r+" if save_outputs else "r"
-    with Trajectory(h5_path, mode=mode) as trajectory:
+    geometry_results: list[tuple[BoundaryGeometryResult, bool]] = []
+    neighbor_results: list[tuple[BoundaryNeighborResult, bool]] = []
+    geometry_count = 0
+    neighbor_count = 0
+    neighbor_edge_count = 0
+    with Trajectory(
+        h5_path,
+        mode="r",
+        reporter=emit,
+        operation="boundary_calculation",
+        job_id=batch_job.job_id,
+    ) as trajectory:
         exists = trajectory.store.has_boundary_set(file_job.boundary_set)
         library_result: BoundaryLibraryResult | None = None
         reused = False
+        dependencies = snapshot_revisions(
+            trajectory.store,
+            _boundary_dependency_paths(file_job),
+        )
         if exists and file_job.reuse_existing and not overwrite_library:
             view = trajectory.boundary_library(file_job.boundary_set)
             _validate_existing_sources(view, file_job.sources)
@@ -444,14 +465,10 @@ def _run_boundary_file(
                 frames=file_job.frames or None,
                 coordinate_scale=file_job.coordinate_scale,
                 overwrite=overwrite_library,
-                save_outputs=save_outputs,
+                save_outputs=False,
                 metadata={**batch_job.metadata, **file_job.metadata, "run_id": batch_job.job_id},
             )
-            view = as_boundary_library_view(
-                trajectory,
-                file_job.boundary_set,
-                None if save_outputs else library_result,
-            )
+            view = as_boundary_library_view(trajectory, file_job.boundary_set, library_result)
             emit(
                 {
                     **common,
@@ -463,9 +480,6 @@ def _run_boundary_file(
             )
 
         _emit_library_frames(emit, common, view)
-        summary.entities += int(view.entities.shape[0])
-        summary.points += int(view.point_count)
-
         for geometry_job in file_job.geometries:
             if not geometry_job.enabled:
                 continue
@@ -483,12 +497,13 @@ def _run_boundary_file(
                 backend=geometry_job.backend,  # type: ignore[arg-type]
                 source_names=geometry_job.source_names or None,
                 source_roles=geometry_job.source_roles or None,
-                library=None if save_outputs else view,
+                library=view,
                 overwrite=overwrite,
-                save_outputs=save_outputs,
+                save_outputs=False,
                 metadata={**batch_job.metadata, **file_job.metadata, **geometry_job.metadata},
             )
-            summary.geometry_sets += 1
+            geometry_results.append((result, overwrite))
+            geometry_count += 1
             emit(
                 {
                     **common,
@@ -532,13 +547,14 @@ def _run_boundary_file(
                 same_frame=neighbor_job.same_frame,
                 exclude_same_entity=neighbor_job.exclude_same_entity,
                 max_distance=neighbor_job.max_distance,
-                library=None if save_outputs else view,
+                library=view,
                 overwrite=overwrite,
-                save_outputs=save_outputs,
+                save_outputs=False,
                 metadata={**batch_job.metadata, **file_job.metadata, **neighbor_job.metadata, "reverse": reverse},
             )
-            summary.neighbor_sets += 1
-            summary.neighbor_edges += result.edge_count
+            neighbor_results.append((result, overwrite))
+            neighbor_count += 1
+            neighbor_edge_count += result.edge_count
             _neighbor_frame_events(emit, common, result, view)
             emit(
                 {
@@ -549,7 +565,49 @@ def _run_boundary_file(
                 }
             )
 
-        if save_outputs:
+        entity_count = int(view.entities.shape[0])
+        point_count = int(view.point_count)
+        boundary_digest = view.schema.get("boundary_digest")
+
+    if save_outputs:
+        with Trajectory(
+            h5_path,
+            mode="r+",
+            reporter=emit,
+            operation="boundary_commit",
+            job_id=batch_job.job_id,
+        ) as trajectory:
+            validate_revisions(trajectory.store, dependencies)
+            if library_result is not None:
+                trajectory.store.write_boundary_library(
+                    library_result.boundary_set,
+                    entities=library_result.entities,
+                    points=library_result.points,
+                    sources=library_result.sources,
+                    schema=library_result.schema,
+                    overwrite=overwrite_library,
+                )
+            for result, overwrite in geometry_results:
+                trajectory.store.write_boundary_geometry(
+                    result.boundary_set,
+                    result.geometry_set,
+                    values=result.values,
+                    topology_indptr=result.topology_indptr,
+                    topology_indices=result.topology_indices,
+                    schema=result.schema,
+                    overwrite=overwrite,
+                )
+            for result, overwrite in neighbor_results:
+                trajectory.store.write_boundary_neighbors(
+                    result.boundary_set,
+                    result.neighbor_set,
+                    indptr=result.indptr,
+                    indices=result.indices,
+                    distance=result.distance,
+                    displacement_zyx=result.displacement_zyx,
+                    schema=result.schema,
+                    overwrite=overwrite,
+                )
             trajectory.store.write_json(
                 f"/runs/boundaries/{validate_name(batch_job.job_id, kind='boundary run')}/run.json",
                 {
@@ -557,24 +615,48 @@ def _run_boundary_file(
                     "job_id": batch_job.job_id,
                     "h5_path": str(h5_path),
                     "boundary_set": file_job.boundary_set,
-                    "boundary_digest": view.schema.get("boundary_digest"),
+                    "boundary_digest": boundary_digest,
                     "reused_library": reused,
                     "completed_at": utc_now_iso(),
+                    "dependencies": dependencies,
                     "metadata": {**batch_job.metadata, **file_job.metadata},
                 },
                 overwrite=True,
             )
-        summary.completed += 1
-        emit(
-            {
-                **common,
-                "event": "file_completed",
-                "entity_count": int(view.entities.shape[0]),
-                "point_count": int(view.point_count),
-                "boundary_digest": view.schema.get("boundary_digest"),
-                "reused_library": reused,
-            }
-        )
+    summary.completed += 1
+    summary.entities += entity_count
+    summary.points += point_count
+    summary.geometry_sets += geometry_count
+    summary.neighbor_sets += neighbor_count
+    summary.neighbor_edges += neighbor_edge_count
+    emit(
+        {
+            **common,
+            "event": "file_completed",
+            "entity_count": entity_count,
+            "point_count": point_count,
+            "boundary_digest": boundary_digest,
+            "reused_library": reused,
+        }
+    )
+
+
+def _boundary_dependency_paths(file_job: BoundaryFileJob) -> list[str]:
+    # A missing target has revision -1, so another job creating it while this
+    # calculation runs is detected before commit too.
+    paths: set[str] = {f"/boundaries/{file_job.boundary_set}"}
+    for source in file_job.sources:
+        if source.kind == "object_set" and source.object_set:
+            paths.add(f"/object_sets/{source.object_set}")
+            # Object boundaries are rasterized from their source label frames.
+            # The precise label set is stored in object_set.json, so tracking
+            # the labels root safely covers that indirect dependency.
+            paths.add("/labels")
+        if source.kind == "label_set" and source.label_set:
+            paths.add(f"/labels/{source.label_set}")
+        if source.kind == "mask_set" and source.label_set:
+            paths.add(f"/masks/{source.label_set}")
+    return sorted(paths)
 
 
 __all__ = [

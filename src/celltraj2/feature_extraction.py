@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import json
-import sys
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field, is_dataclass
 from pathlib import Path
-from typing import Any, TextIO
+from typing import Any
 
 from celltraj2.features import FeatureSetSpec, default_feature_extraction_run_id, extract_feature_set
+from celltraj2.h5_access import run_with_stale_retries, snapshot_revisions, validate_revisions
+from celltraj2.reporting import JsonlReporter
 from celltraj2.schema import utc_now_iso
 from celltraj2.trajectory import Trajectory
 
@@ -173,18 +174,6 @@ class BatchFeatureExtractionSummary:
 Reporter = Callable[[Mapping[str, Any]], None]
 
 
-class JsonlReporter:
-    """Write progress events as JSON lines."""
-
-    def __init__(self, stream: TextIO | None = None) -> None:
-        self.stream = stream or sys.stdout
-
-    def __call__(self, event: Mapping[str, Any]) -> None:
-        payload = {"timestamp": utc_now_iso(), **dict(event)}
-        self.stream.write(json.dumps(_json_safe(payload), sort_keys=True) + "\n")
-        self.stream.flush()
-
-
 def load_feature_extraction_job(path: str | Path) -> FeatureExtractionBatchJob:
     return FeatureExtractionBatchJob.load(path)
 
@@ -218,7 +207,11 @@ def run_batch_feature_extraction(
             }
         )
         try:
-            _run_file_job(batch_job, file_job, h5_path, summary, emit)
+            run_with_stale_retries(
+                lambda: _run_file_job(batch_job, file_job, h5_path, summary, emit),
+                reporter=emit,
+                context={"job_id": batch_job.job_id, "h5_path": str(h5_path)},
+            )
         except Exception as exc:
             summary.failed += 1
             emit({"event": "file_failed", "job_id": batch_job.job_id, "h5_path": str(h5_path), "error": repr(exc)})
@@ -237,15 +230,20 @@ def _run_file_job(
 ) -> None:
     save_outputs = bool(batch_job.save_outputs and file_job.save_outputs)
     overwrite = bool(batch_job.overwrite or file_job.overwrite)
-    mode = "r+" if save_outputs else "r"
-    with Trajectory(h5_path, mode=mode) as trajectory:
+    with Trajectory(
+        h5_path,
+        mode="r",
+        reporter=emit,
+        operation="feature_calculation",
+        job_id=batch_job.job_id,
+    ) as trajectory:
         available_frames = trajectory.object_set(file_job.feature_spec.object_set).lookup_frames()
         frames = file_job.frame_numbers(int(trajectory.metadata.frame_count or 1), available_frames=available_frames)
-        summary.frames += len(frames)
         if save_outputs and trajectory.store.has_feature_set(
             file_job.feature_spec.object_set,
             file_job.feature_spec.feature_set,
         ) and not overwrite:
+            summary.frames += len(frames)
             summary.skipped += 1
             emit(
                 {
@@ -258,54 +256,147 @@ def _run_file_job(
                 }
             )
             return
+
+        dependency_paths = _feature_dependency_paths(file_job.feature_spec, frames)
+        image_source = trajectory.metadata.image_source
+        if str(getattr(image_source, "source_type", "")) == "embedded_h5":
+            dependency_paths.extend(
+                trajectory.store.raw_frame_path(int(frame)) for frame in frames
+            )
+        dependencies = snapshot_revisions(trajectory.store, sorted(set(dependency_paths)))
+
+        def report_progress(event: Mapping[str, Any]) -> None:
+            payload = dict(event)
+            name = str(payload.pop("event", "feature_progress"))
+            common = {
+                "event": name,
+                "job_id": batch_job.job_id,
+                "h5_path": str(h5_path),
+                "object_set": file_job.feature_spec.object_set,
+                "feature_set": file_job.feature_spec.feature_set,
+                "saved": False,
+            }
+            if name == "frame_completed":
+                for summary_item in payload.pop("feature_summaries", []) or []:
+                    emit({**common, "event": "feature_frame_summary", **payload, **summary_item})
+            emit({**common, **payload})
+
         result = extract_feature_set(
             trajectory,
             file_job.feature_spec,
             frames=frames,
             overwrite=overwrite,
-            save_outputs=save_outputs,
+            save_outputs=False,
             run_id=batch_job.job_id,
             metadata={**batch_job.metadata, **file_job.metadata},
+            progress=report_progress,
         )
-        summary.completed += len(result.frames)
-        summary.features += result.feature_count
-        summary.observations += result.observation_count
-        for frame in result.frames:
-            for feature_summary in result.frame_feature_summaries.get(frame, []):
+        dependencies.update(
+            snapshot_revisions(
+                trajectory.store,
+                [f"/labels/{result.source_label_set}/frame_{int(frame)}" for frame in result.frames],
+            )
+        )
+    values_path = None
+    if save_outputs:
+        with Trajectory(
+            h5_path,
+            mode="r+",
+            reporter=emit,
+            operation="feature_commit",
+            job_id=batch_job.job_id,
+        ) as trajectory:
+            validate_revisions(trajectory.store, dependencies)
+            if trajectory.store.has_feature_set(result.object_set, result.feature_set) and not overwrite:
+                summary.frames += len(result.frames)
+                summary.skipped += 1
                 emit(
                     {
-                        "event": "feature_frame_summary",
+                        "event": "file_skipped",
                         "job_id": batch_job.job_id,
                         "h5_path": str(h5_path),
                         "object_set": result.object_set,
                         "feature_set": result.feature_set,
-                        "frame": int(frame),
-                        "saved": save_outputs,
-                        **feature_summary,
+                        "reason": "feature set was written by another job",
                     }
                 )
-            emit(
+                return
+            values_path = trajectory.store.write_feature_set(
+                result.object_set,
+                result.feature_set,
+                result.values,
+                result.schema,
+                overwrite=overwrite,
+                qc=result.qc,
+            )
+            trajectory.store.write_feature_extraction_run(
+                batch_job.job_id,
                 {
-                    "event": "frame_completed",
-                    "job_id": batch_job.job_id,
+                    "schema": "celltraj2.feature_extraction_run.v1",
+                    "run_id": batch_job.job_id,
+                    "status": "completed",
+                    "completed_at": utc_now_iso(),
                     "h5_path": str(h5_path),
                     "object_set": result.object_set,
+                    "source_label_set": result.source_label_set,
                     "feature_set": result.feature_set,
-                    "frame": int(frame),
-                    "value_count": int(result.frame_counts.get(frame, 0)),
-                    "feature_count": len(result.frame_feature_summaries.get(frame, [])),
-                    "warnings": result.frame_warnings.get(frame, []),
-                    "saved": save_outputs,
-                }
+                    "frames": result.frames,
+                    "feature_count": result.feature_count,
+                    "observation_count": result.observation_count,
+                    "values_path": values_path,
+                    "dependencies": dependencies,
+                    "feature_spec": file_job.feature_spec.to_dict(),
+                    "metadata": {**batch_job.metadata, **file_job.metadata},
+                },
+                overwrite=True,
             )
-        emit(
-            {
-                "event": "file_completed",
-                "job_id": batch_job.job_id,
-                "h5_path": str(h5_path),
-                **result.to_dict(),
-            }
-        )
+    summary.frames += len(result.frames)
+    summary.completed += len(result.frames)
+    summary.features += result.feature_count
+    summary.observations += result.observation_count
+    emit(
+        {
+            "event": "file_completed",
+            "job_id": batch_job.job_id,
+            "h5_path": str(h5_path),
+            **result.to_dict(),
+            "saved": save_outputs,
+            "values_path": values_path,
+        }
+    )
+
+
+def _feature_dependency_paths(spec: FeatureSetSpec, frames: list[int]) -> list[str]:
+    """Return the H5 resources that make one feature calculation valid."""
+
+    paths = {
+        "/metadata/celltraj2.json",
+        "/sources/image_source.json",
+        f"/object_sets/{spec.object_set}/observations",
+        *{f"/object_sets/{spec.object_set}/lookup/frame_{int(frame)}" for frame in frames},
+    }
+    source_label = str(spec.source_label_set or spec.object_set)
+    paths.update(f"/labels/{source_label}/frame_{int(frame)}" for frame in frames)
+
+    def visit(value: Any, *, source_kind: str | None = None) -> None:
+        if isinstance(value, Mapping):
+            kind = str(value.get("source_kind") or source_kind or "")
+            for key, item in value.items():
+                if key in {"label_set", "exclude_label_set"} and item not in (None, ""):
+                    paths.add(f"/labels/{item}")
+                elif key in {"mask_set", "include_mask_set", "exclude_mask_set"} and item not in (None, ""):
+                    paths.add(f"/masks/{item}")
+                elif key == "source_name" and item not in (None, "") and kind in {"label", "mask"}:
+                    paths.add(f"/{'labels' if kind == 'label' else 'masks'}/{item}")
+                elif key == "boundary_set" and item not in (None, ""):
+                    paths.add(f"/boundaries/{item}")
+                visit(item, source_kind=kind)
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                visit(item, source_kind=source_kind)
+
+    visit(spec.features)
+    return sorted(paths)
 
 
 def _parse_frame_values(value: Any) -> list[int]:

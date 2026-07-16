@@ -64,8 +64,9 @@ class BatchSegmentationTests(unittest.TestCase):
                 self.assertEqual(store.list_segmentation_runs(), ["seg_test"])
                 run_record = store.read_segmentation_run("seg_test")
                 self.assertEqual(run_record["status"], "completed")
-                frame_record = store.read_segmentation_frame_result("seg_test", 1)
-                self.assertEqual(frame_record["backend_metadata"]["engine"], "fake")
+                self.assertNotIn("frames", store.h5["runs/segmentation/seg_test"])
+            frame_record = next(event for event in events if event.get("event") == "frame_completed")
+            self.assertEqual(frame_record["backend_metadata"]["engine"], "fake")
             self.assertIn("job_completed", [event.get("event") for event in events])
 
     def test_batch_segmentation_downgrades_2d_source_from_requested_3d(self):
@@ -89,6 +90,7 @@ class BatchSegmentationTests(unittest.TestCase):
                 labels = self.np.ones((3, 4), dtype=self.np.uint16)
                 return SegmentationResult(labels=labels, metadata={"engine": "fake", "do_3D": file_job.do_3d})
 
+            events = []
             events = []
             summary = run_batch_segmentation(
                 {
@@ -135,6 +137,7 @@ class BatchSegmentationTests(unittest.TestCase):
             def should_not_run(_image, _file_job, _frame):
                 raise AssertionError("existing labels should be skipped")
 
+            events = []
             summary = run_batch_segmentation(
                 {
                     "job_id": "seg_skip",
@@ -153,12 +156,12 @@ class BatchSegmentationTests(unittest.TestCase):
                     ],
                 },
                 should_not_run,
+                reporter=lambda event: events.append(dict(event)),
             )
 
             self.assertEqual(summary.skipped, 1)
-            with TrajectoryStore.open(path, mode="r") as store:
-                frame_record = store.read_segmentation_frame_result("seg_skip", 1)
-                self.assertEqual(frame_record["status"], "skipped")
+            frame_record = next(event for event in events if event.get("event") == "frame_skipped")
+            self.assertEqual(frame_record["status"], "skipped")
 
     def test_batch_segmentation_dry_run_does_not_write_h5_outputs(self):
         with TemporaryDirectory() as tmp:
@@ -223,6 +226,7 @@ class BatchSegmentationTests(unittest.TestCase):
                 labels[..., 1:3] = 5
                 return labels
 
+            events = []
             summary = run_batch_segmentation(
                 {
                     "job_id": "seg_mask",
@@ -243,15 +247,16 @@ class BatchSegmentationTests(unittest.TestCase):
                     ],
                 },
                 fake_segmenter,
+                reporter=lambda event: events.append(dict(event)),
             )
 
             self.assertEqual(summary.completed, 1)
             with TrajectoryStore.open(path, mode="r") as store:
                 self.assertEqual(store.list_mask_frames("cyto_mask"), [1])
                 self.assertEqual(store.read_mask_frame("cyto_mask", 1).dtype, self.np.bool_)
-                frame_record = store.read_segmentation_frame_result("seg_mask", 1)
-                self.assertEqual(frame_record["output_kind"], "masks")
-                self.assertEqual(frame_record["output_h5_path"], "/masks/cyto_mask")
+            frame_record = next(event for event in events if event.get("event") == "frame_completed")
+            self.assertEqual(frame_record["output_kind"], "masks")
+            self.assertEqual(frame_record["output_h5_path"], "/masks/cyto_mask")
 
     def test_batch_segmentation_preview_npz_contains_input_and_labels(self):
         with TemporaryDirectory() as tmp:

@@ -94,13 +94,17 @@ existing frame dataset is replaced.
 
 ## Save, Test, And Preview Modes
 
-`save_outputs=true` opens the H5 in read/write mode. Completed frames are saved
-to `/labels` or `/masks`, and run provenance is written under:
+`save_outputs=true` reads and calculates each frame without a read/write
+handle. It briefly opens the canonical H5 with `r+` to commit that completed
+frame, then closes it. Final run provenance is written under:
 
 ```text
 /runs/segmentation/<job_id>/run.json
-/runs/segmentation/<job_id>/frames/frame_<n>.json
 ```
+
+Per-frame progress is flushed to the external JSONL event stream instead of
+creating progress records inside the H5. See [H5 Access And Job
+Logging](h5_access_and_logging.md) for locking, retries, and concurrency.
 
 `save_outputs=false` opens the H5 read-only. The worker still reads images,
 composes model input, runs the segmentation callable, and reports events, but
@@ -182,6 +186,9 @@ SITE writer.
 - `frame_completed`
 - `frame_skipped`
 - `frame_failed`
+- `h5_lock_waiting`
+- `h5_lock_acquired`
+- `commit_stale`
 - `file_failed`
 - `job_completed`
 
