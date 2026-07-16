@@ -68,7 +68,10 @@ between-frame analyses.
 ```python
 with Trajectory(path, mode="r+") as traj:
     traj.index_observations("epithelial")
-    traj.object_set("epithelial").build_boundary_library("cell_surfaces")
+    traj.object_set("epithelial").build_boundary_library(
+        "cell_surfaces",
+        point_spacing=1.0,  # physical units from acquisition calibration
+    )
     traj.compute_boundary_geometry("cell_surfaces", geometry_set="surface_v1")
     traj.compute_boundary_neighbors("cell_surfaces", neighbor_set="nearest_external")
 

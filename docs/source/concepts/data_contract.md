@@ -313,6 +313,16 @@ stored physical Z/Y/X calibration but no registration. The schema contains a
 stable `boundary_digest` for geometry, neighbor, tracking, and motion
 dependencies.
 
+Libraries may retain every native boundary voxel or use a requested physical
+`point_spacing`. Sampling occurs after exact native label-transition detection,
+not by resizing the label image. Each entity's native candidates are grouped in
+physical-space bins and the exact native boundary voxel nearest each occupied
+bin center is retained. This preserves small entities, thin surfaces, label
+identity, and native-grid provenance while reducing the canonical rows used by
+all downstream products. `schema.json/sampling` records the method, point
+spacing and unit, native Z/Y/X spacing, native candidate and retained counts,
+retention fraction, and per-source/per-frame summaries.
+
 Geometry sets are point-row-aligned and store oriented normals, tangent frames,
 principal/mean/Gaussian curvature, quality flags, and the surface kNN topology
 as CSR. The 3D surface backend follows the tissue-kinematic model: `pcdiff`

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field, is_dataclass
 from pathlib import Path
@@ -127,6 +128,7 @@ class BoundaryFileJob:
     sources: tuple[BoundarySourceSpec, ...]
     frames: tuple[int, ...] = ()
     coordinate_scale: tuple[float, float, float] | None = None
+    point_spacing: float | None = None
     geometries: tuple[BoundaryGeometryJob, ...] = ()
     neighbors: tuple[BoundaryNeighborJob, ...] = ()
     enabled: bool = True
@@ -163,12 +165,17 @@ class BoundaryFileJob:
             if len(values) != 3:
                 raise ValueError("coordinate_scale must contain Z,Y,X values")
             coordinate_scale = (values[0], values[1], values[2])
+        point_spacing_value = payload.get("point_spacing")
+        point_spacing = None if point_spacing_value in (None, "") else float(point_spacing_value)
+        if point_spacing is not None and (not math.isfinite(point_spacing) or point_spacing <= 0):
+            raise ValueError("point_spacing must be a finite positive coordinate distance")
         return cls(
             h5_path=Path(path_value),
             boundary_set=boundary_set,
             sources=sources,
             frames=tuple(int(value) for value in payload.get("frames", ()) or ()),
             coordinate_scale=coordinate_scale,
+            point_spacing=point_spacing,
             geometries=tuple(
                 item if isinstance(item, BoundaryGeometryJob) else BoundaryGeometryJob.from_dict(item)
                 for item in payload.get("geometries", payload.get("geometry", ())) or ()
@@ -283,15 +290,40 @@ def _validate_existing_sources(view: Any, requested: Sequence[BoundarySourceSpec
             )
 
 
+def _validate_existing_sampling(view: Any, point_spacing: float | None) -> None:
+    sampling = dict(view.schema.get("sampling") or {})
+    stored_value = sampling.get("point_spacing")
+    stored_spacing = None if stored_value in (None, "") else float(stored_value)
+    if point_spacing is None and stored_spacing is None:
+        return
+    if point_spacing is not None and stored_spacing is not None and math.isclose(
+        float(point_spacing), stored_spacing, rel_tol=1e-9, abs_tol=1e-12
+    ):
+        return
+    stored_label = "full native resolution" if stored_spacing is None else f"{stored_spacing:g}"
+    requested_label = "full native resolution" if point_spacing is None else f"{float(point_spacing):g}"
+    raise ValueError(
+        f"Existing boundary library uses {stored_label}; requested {requested_label}. "
+        "Choose a new boundary-set name or rebuild/overwrite the canonical library."
+    )
+
+
 def _emit_library_frames(emit: Reporter, common: dict[str, Any], view: Any) -> None:
     import numpy as np
 
     entities = view.entities
+    sampling_rows = {
+        (int(item.get("source_id") or 0), int(item.get("frame") or 0)): dict(item)
+        for item in view.schema.get("sampling_frame_summary", []) or []
+        if isinstance(item, Mapping)
+    }
     for source in view.sources:
         source_id = int(source["source_id"])
         source_entities = entities[entities["source_id"] == source_id]
         for frame in sorted(int(value) for value in np.unique(source_entities["frame"])):
             rows = source_entities[source_entities["frame"] == frame]
+            sampling = sampling_rows.get((source_id, frame), {})
+            retained_count = int(np.sum(rows["point_count"]))
             emit(
                 {
                     **common,
@@ -302,7 +334,9 @@ def _emit_library_frames(emit: Reporter, common: dict[str, Any], view: Any) -> N
                     "source_kind": str(source.get("kind") or ""),
                     "frame": frame,
                     "entity_count": int(rows.shape[0]),
-                    "point_count": int(np.sum(rows["point_count"])),
+                    "point_count": retained_count,
+                    "native_point_count": int(sampling.get("native_point_count", retained_count)),
+                    "retained_fraction": float(sampling.get("retained_fraction", 1.0)),
                     "empty_entity_count": int(np.sum(rows["point_count"] == 0)),
                 }
             )
@@ -444,6 +478,7 @@ def _run_boundary_file(
         if exists and file_job.reuse_existing and not overwrite_library:
             view = trajectory.boundary_library(file_job.boundary_set)
             _validate_existing_sources(view, file_job.sources)
+            _validate_existing_sampling(view, file_job.point_spacing)
             if file_job.coordinate_scale is not None:
                 import numpy as np
 
@@ -464,6 +499,7 @@ def _run_boundary_file(
                 sources=file_job.sources,
                 frames=file_job.frames or None,
                 coordinate_scale=file_job.coordinate_scale,
+                point_spacing=file_job.point_spacing,
                 overwrite=overwrite_library,
                 save_outputs=False,
                 metadata={**batch_job.metadata, **file_job.metadata, "run_id": batch_job.job_id},
@@ -475,6 +511,7 @@ def _run_boundary_file(
                     "event": "boundary_library_completed",
                     "entity_count": library_result.entity_count,
                     "point_count": library_result.point_count,
+                    "sampling": dict(library_result.schema.get("sampling") or {}),
                     "boundary_digest": library_result.schema.get("boundary_digest"),
                 }
             )

@@ -5,9 +5,11 @@ import unittest
 from celltraj2.boundaries import (
     GEOMETRY_QUALITY_NOT_SELECTED,
     BoundarySourceSpec,
+    _sample_native_boundary_points,
+    build_boundary_library,
     optimal_transport_plan,
 )
-from celltraj2.boundary_batch import run_batch_boundaries
+from celltraj2.boundary_batch import BoundaryFileJob, run_batch_boundaries
 from celltraj2.registration import (
     FRAME_STATUS,
     RegistrationSet,
@@ -71,6 +73,129 @@ class BoundaryLibraryTests(unittest.TestCase):
         self.assertEqual(plan.method, "numpy.sinkhorn")
         self.assertAlmostEqual(float(self.np.sum(plan.mass)), 1.0, places=7)
         self.assertAlmostEqual(plan.total_cost, 1.0, places=5)
+
+    def test_native_boundary_grid_sampling_is_deterministic_and_respects_pixel_floor(self):
+        coordinates = self.np.column_stack(
+            [
+                self.np.zeros(20, dtype=int),
+                self.np.zeros(20, dtype=int),
+                self.np.arange(20, dtype=int),
+            ]
+        )
+        orientation = self.np.tile(self.np.asarray([[0.0, 1.0, 0.0]]), (20, 1))
+        native_coords, _native_hints = _sample_native_boundary_points(
+            coordinates,
+            orientation,
+            coordinate_scale=self.np.asarray([1.0, 0.25, 0.25]),
+            spatial_ndim=2,
+            point_spacing=0.25,
+            np=self.np,
+        )
+        sampled_coords, sampled_hints = _sample_native_boundary_points(
+            coordinates,
+            orientation,
+            coordinate_scale=self.np.asarray([1.0, 0.25, 0.25]),
+            spatial_ndim=2,
+            point_spacing=1.0,
+            np=self.np,
+        )
+
+        self.assertEqual(native_coords.shape[0], coordinates.shape[0])
+        self.assertEqual(sampled_coords.shape[0], 5)
+        self.assertTrue(self.np.all(sampled_hints == orientation[sampled_coords[:, 2]]))
+        self.assertTrue(
+            self.np.array_equal(
+                sampled_coords,
+                _sample_native_boundary_points(
+                    coordinates,
+                    orientation,
+                    coordinate_scale=self.np.asarray([1.0, 0.25, 0.25]),
+                    spatial_ndim=2,
+                    point_spacing=1.0,
+                    np=self.np,
+                )[0],
+            )
+        )
+
+    def test_sampled_boundary_library_builds_without_resizing_source_labels(self):
+        frame = self.np.zeros((14, 14), dtype=self.np.uint16)
+        frame[2:11, 3:12] = 1
+        observations = self.np.asarray(
+            [(1, 1, 1)],
+            dtype=[("observation_id", "<i8"), ("frame", "<i4"), ("label_id", "<i8")],
+        )
+
+        class Store:
+            def has_observations(self, name):
+                return name == "cells"
+
+            def read_json(self, path):
+                return {"source_label_set": "cells"}
+
+            def read_observations(self, name):
+                return observations
+
+            def has_label_frame(self, name, frame_number):
+                return name == "cells" and frame_number == 1
+
+        class FakeTrajectory:
+            metadata = self._metadata(1)
+            store = Store()
+
+            def label_frames(self, name):
+                return [1]
+
+            def read_label_frame(self, name, frame_number):
+                return frame
+
+        native = build_boundary_library(
+            FakeTrajectory(),
+            "native",
+            object_set="cells",
+            save_outputs=False,
+        )
+        sampled = build_boundary_library(
+            FakeTrajectory(),
+            "sampled",
+            object_set="cells",
+            point_spacing=2.0,
+            save_outputs=False,
+        )
+
+        self.assertLess(sampled.point_count, native.point_count)
+        self.assertEqual(sampled.entity_count, native.entity_count)
+        self.assertEqual(sampled.entities[0]["observation_id"], 1)
+        self.assertEqual(sampled.schema["sampling"]["native_point_count"], native.point_count)
+        native_coords = {tuple(row) for row in native.points["native_index_zyx"]}
+        self.assertTrue(
+            all(tuple(row) in native_coords for row in sampled.points["native_index_zyx"])
+        )
+
+    def test_boundary_batch_job_roundtrips_point_spacing(self):
+        job = BoundaryFileJob.from_dict(
+            {
+                "h5_path": "sample.ct2.h5",
+                "boundary_set": "cells_surface",
+                "point_spacing": 1.0,
+                "sources": [
+                    {"kind": "object_set", "name": "cells", "object_set": "cells"}
+                ],
+            }
+        )
+
+        self.assertEqual(job.point_spacing, 1.0)
+        self.assertEqual(job.to_dict()["point_spacing"], 1.0)
+        with self.assertRaisesRegex(ValueError, "point_spacing"):
+            BoundaryFileJob.from_dict(
+                {
+                    "h5_path": "sample.ct2.h5",
+                    "boundary_set": "cells_surface",
+                    "point_spacing": 0,
+                    "sources": [
+                        {"kind": "object_set", "name": "cells", "object_set": "cells"}
+                    ],
+                }
+            )
 
     def test_pcdiff_shape_operator_recovers_unit_sphere_curvature(self):
         try:
@@ -144,6 +269,47 @@ class BoundaryLibraryTests(unittest.TestCase):
                 self.assertEqual(
                     [(item.start, item.stop) for item in view.point_spans([3, 1])],
                     [(0, 8), (20, 30)],
+                )
+
+    def test_physical_grid_sampling_reduces_canonical_point_rows_and_records_resolution(self):
+        frame = self.np.zeros((18, 18), dtype=self.np.uint16)
+        frame[2:12, 2:12] = 1
+        frame[5:16, 13:17] = 2
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "sample.ct2.h5"
+            self._create_indexed(path, [frame])
+            with Trajectory(path, mode="r+") as trajectory:
+                native = trajectory.object_set("cells").build_boundary_library(
+                    "native", save_outputs=False
+                )
+                sampled = trajectory.object_set("cells").build_boundary_library(
+                    "sampled",
+                    point_spacing=2.0,
+                )
+
+                self.assertLess(sampled.point_count, native.point_count)
+                self.assertEqual(sampled.schema["sampling"]["method"], "physical_voxel_grid")
+                self.assertEqual(sampled.schema["sampling"]["point_spacing"], 2.0)
+                self.assertEqual(sampled.schema["sampling"]["distance_unit"], "um")
+                self.assertEqual(
+                    sampled.schema["sampling"]["native_point_count"], native.point_count
+                )
+                self.assertEqual(
+                    sampled.schema["sampling"]["retained_point_count"], sampled.point_count
+                )
+                self.assertGreater(sampled.schema["sampling"]["retained_fraction"], 0.0)
+                self.assertLess(sampled.schema["sampling"]["retained_fraction"], 1.0)
+                self.assertTrue(self.np.all(sampled.entities["point_count"] > 0))
+
+                native_coords = {tuple(row) for row in native.points["native_index_zyx"]}
+                self.assertTrue(
+                    all(tuple(row) in native_coords for row in sampled.points["native_index_zyx"])
+                )
+                geometry = trajectory.compute_boundary_geometry(
+                    "sampled", geometry_set="surface", knn=6, backend="local"
+                )
+                self.assertEqual(
+                    geometry.values["mean_curvature"].shape[0], sampled.point_count
                 )
 
     def test_geometry_and_external_neighbor_sets_are_point_row_aligned(self):
@@ -274,6 +440,7 @@ class BoundaryLibraryTests(unittest.TestCase):
                     {
                         "h5_path": str(path),
                         "boundary_set": "cells_and_matrix",
+                        "point_spacing": 2.0,
                         "sources": [
                             {
                                 "kind": "object_set",
@@ -313,6 +480,9 @@ class BoundaryLibraryTests(unittest.TestCase):
             self.assertEqual(dry_summary.geometry_sets, 1)
             self.assertEqual(dry_summary.neighbor_sets, 1)
             self.assertTrue(any(event.get("event") == "boundary_frame_summary" for event in events))
+            frame_events = [event for event in events if event.get("event") == "boundary_frame_summary"]
+            self.assertTrue(all("native_point_count" in event for event in frame_events))
+            self.assertTrue(any(float(event["retained_fraction"]) < 1.0 for event in frame_events))
             with Trajectory(path, mode="r") as trajectory:
                 self.assertEqual(trajectory.boundary_sets(), [])
 
@@ -322,6 +492,7 @@ class BoundaryLibraryTests(unittest.TestCase):
             self.assertEqual(saved_summary.completed, 1)
             with Trajectory(path, mode="r") as trajectory:
                 view = trajectory.boundary_library("cells_and_matrix")
+                self.assertEqual(view.schema["sampling"]["point_spacing"], 2.0)
                 self.assertEqual(view.geometry_sets(), ["cell_surface"])
                 self.assertEqual(view.neighbor_sets(), ["cell_to_matrix"])
                 geometry = view.geometry("cell_surface")

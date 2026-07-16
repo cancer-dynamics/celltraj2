@@ -568,6 +568,51 @@ def _boundary_mask_and_orientation(labels: Any, *, spatial_ndim: int, np: Any) -
     return boundary, orientation
 
 
+def _sample_native_boundary_points(
+    coordinates: Any,
+    orientation: Any,
+    *,
+    coordinate_scale: Any,
+    spatial_ndim: int,
+    point_spacing: float | None,
+    np: Any,
+) -> tuple[Any, Any]:
+    """Select deterministic native boundary voxels on a physical-space grid.
+
+    Sampling never invents interpolated coordinates: one native boundary voxel
+    nearest each occupied physical grid-bin center is retained. This preserves
+    label identity and exact native-grid provenance while reducing every
+    point-row-aligned downstream product.
+    """
+
+    coords = np.asarray(coordinates)
+    hints = np.asarray(orientation)
+    if point_spacing is None or coords.shape[0] <= 1:
+        return coords, hints
+    spacing = float(point_spacing)
+    active_axes = np.asarray((1, 2) if int(spatial_ndim) == 2 else (0, 1, 2), dtype=np.int64)
+    scale = np.asarray(coordinate_scale, dtype=float)
+    if spacing <= float(np.min(scale[active_axes])) * (1.0 + 1e-9):
+        return coords, hints
+
+    positions = coords[:, active_axes].astype(float, copy=False) * scale[active_axes][None, :]
+    bins = np.floor(positions / spacing).astype(np.int64)
+    _unique_bins, inverse = np.unique(bins, axis=0, return_inverse=True)
+    if int(_unique_bins.shape[0]) == int(coords.shape[0]):
+        return coords, hints
+
+    centers = (bins.astype(float) + 0.5) * spacing
+    squared_distance = np.sum((positions - centers) ** 2, axis=1)
+    row = np.arange(coords.shape[0], dtype=np.int64)
+    order = np.lexsort((row, squared_distance, inverse))
+    ordered_bins = inverse[order]
+    first = np.empty(order.shape[0], dtype=bool)
+    first[0] = True
+    first[1:] = ordered_bins[1:] != ordered_bins[:-1]
+    selected = np.sort(order[first])
+    return coords[selected], hints[selected]
+
+
 def _resolve_source_specs(
     trajectory: Any,
     sources: Sequence[BoundarySourceSpec | Mapping[str, Any]] | None,
@@ -641,6 +686,7 @@ def build_boundary_library(
     object_set: str | None = None,
     frames: Sequence[int] | None = None,
     coordinate_scale: Sequence[float] | None = None,
+    point_spacing: float | None = None,
     overwrite: bool = False,
     save_outputs: bool = True,
     metadata: Mapping[str, Any] | None = None,
@@ -655,6 +701,10 @@ def build_boundary_library(
     scale = np.asarray(coordinate_scale or calibration["coordinate_scale"], dtype=float)
     if scale.shape != (3,) or not np.all(np.isfinite(scale)) or np.any(scale <= 0):
         raise ValueError("coordinate_scale must contain three finite positive values in Z,Y,X order")
+    if point_spacing is not None:
+        point_spacing = float(point_spacing)
+        if not np.isfinite(point_spacing) or point_spacing <= 0:
+            raise ValueError("point_spacing must be a finite positive physical-coordinate distance")
 
     entity_records: list[tuple[Any, ...]] = []
     point_blocks: dict[str, list[Any]] = {
@@ -671,6 +721,8 @@ def build_boundary_library(
     point_id = 1
     spatial_ndim_values: set[int] = set()
     frame_shapes: dict[int, tuple[int, ...]] = {}
+    native_point_count = 0
+    sampling_frame_summary: list[dict[str, Any]] = []
 
     for source_id, spec in enumerate(specs, start=1):
         if spec.kind == "mask_set":
@@ -734,12 +786,25 @@ def build_boundary_library(
             else:
                 entity_items = [(1, 0)] if np.any(labels > 0) else []
 
+            frame_native_point_count = 0
+            frame_retained_point_count = 0
             for label_id, observation_id in entity_items:
                 left = int(np.searchsorted(labels_all, label_id, side="left"))
                 right = int(np.searchsorted(labels_all, label_id, side="right"))
                 coords = coords_all[left:right]
                 hints = hints_all[left:right]
+                raw_count = int(coords.shape[0])
+                frame_native_point_count += raw_count
+                coords, hints = _sample_native_boundary_points(
+                    coords,
+                    hints,
+                    coordinate_scale=scale,
+                    spatial_ndim=spatial_ndim,
+                    point_spacing=point_spacing,
+                    np=np,
+                )
                 count = int(coords.shape[0])
+                frame_retained_point_count += count
                 quality = ENTITY_QUALITY_NO_POINTS if count == 0 else 0
                 entity_records.append(
                     (
@@ -764,6 +829,20 @@ def build_boundary_library(
                     point_id += count
                     point_start += count
                 entity_id += 1
+            native_point_count += frame_native_point_count
+            sampling_frame_summary.append(
+                {
+                    "source_id": int(source_id),
+                    "frame": int(frame),
+                    "native_point_count": int(frame_native_point_count),
+                    "retained_point_count": int(frame_retained_point_count),
+                    "retained_fraction": (
+                        float(frame_retained_point_count / frame_native_point_count)
+                        if frame_native_point_count
+                        else 1.0
+                    ),
+                }
+            )
 
     if len(spatial_ndim_values) > 1:
         raise ValueError("All sources in one boundary library must have the same spatial dimensionality")
@@ -789,6 +868,21 @@ def build_boundary_library(
         key: (np.concatenate(blocks, axis=0) if blocks else np.empty(empty_shapes[key], dtype=dtypes[key]))
         for key, blocks in point_blocks.items()
     }
+    retained_point_count = int(points["point_id"].shape[0])
+    distance_unit = str(calibration["distance_unit"] if coordinate_scale is None else "scaled_coordinate_unit")
+    sampling = {
+        "method": "physical_voxel_grid" if point_spacing is not None else "full_native",
+        "point_spacing": None if point_spacing is None else float(point_spacing),
+        "distance_unit": distance_unit,
+        "native_spacing_zyx": scale.tolist(),
+        "native_point_count": int(native_point_count),
+        "retained_point_count": retained_point_count,
+        "retained_fraction": (
+            float(retained_point_count / native_point_count) if native_point_count else 1.0
+        ),
+        "representative": "nearest_native_boundary_voxel_to_grid_bin_center",
+        "preserves_native_grid_points": True,
+    }
     schema = {
         "schema": "celltraj2.boundary_library.v1",
         "boundary_set": name,
@@ -797,7 +891,7 @@ def build_boundary_library(
         "native_index_coordinate_system": "native_roi_array_index",
         "native_position_coordinate_system": "native_roi_physical",
         "coordinate_scale_zyx": scale.tolist(),
-        "distance_unit": str(calibration["distance_unit"] if coordinate_scale is None else "scaled_coordinate_unit"),
+        "distance_unit": distance_unit,
         "calibration_source": str(calibration["source"] if coordinate_scale is None else "explicit"),
         "registration_applied": False,
         "spatial_ndim": int(spatial_ndim),
@@ -807,7 +901,9 @@ def build_boundary_library(
         "entity_point_layout": "contiguous_half_open_point_start_point_count",
         "entity_sort_order": ["source_id", "frame", "source_label_id"],
         "entity_count": int(entities.shape[0]),
-        "point_count": int(points["point_id"].shape[0]),
+        "point_count": retained_point_count,
+        "sampling": sampling,
+        "sampling_frame_summary": sampling_frame_summary,
         "boundary_digest": boundary_digest(entities, points, source_records),
         "metadata": _json_safe(dict(metadata or {})),
     }
