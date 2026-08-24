@@ -8,7 +8,7 @@ from dataclasses import asdict, dataclass, field, is_dataclass
 from pathlib import Path
 from typing import Any
 
-from celltraj2.objects import default_object_index_run_id, index_object_set
+from celltraj2.objects import default_object_index_run_id, index_label_arrays, index_object_set
 from celltraj2.h5_access import run_with_stale_retries, snapshot_revisions, validate_revisions
 from celltraj2.reporting import JsonlReporter
 from celltraj2.schema import utc_now_iso
@@ -35,7 +35,10 @@ class ObjectIndexFileJob:
 
     h5_path: Path
     object_set: str = "segmentation"
+    source_kind: str = "label_set"
     source_label_set: str | None = None
+    source_mask_set: str | None = None
+    mask_conversion: str = "whole_foreground"
     enabled: bool = True
     overwrite: bool = False
     save_outputs: bool = True
@@ -50,8 +53,21 @@ class ObjectIndexFileJob:
             raise ValueError("Object-indexing file job requires h5_path")
         object_set = str(payload.get("object_set") or payload.get("label_set") or "segmentation")
         source_label_set = payload.get("source_label_set")
-        if source_label_set in (None, ""):
+        source_kind = str(payload.get("source_kind") or "label_set").lower()
+        source_mask_set = payload.get("source_mask_set", payload.get("mask_set"))
+        if source_kind not in {"label_set", "mask_set"}:
+            raise ValueError("Object-indexing source_kind must be label_set or mask_set")
+        if source_kind == "mask_set" and source_mask_set in (None, ""):
+            source_mask_set = payload.get("source_name") or payload.get("label_set") or object_set
+        if source_label_set in (None, "") and source_kind == "mask_set":
+            source_label_set = payload.get("derived_label_set") or f"{object_set}_labels"
+        elif source_label_set in (None, ""):
             source_label_set = payload.get("label_set") or object_set
+        mask_conversion = str(payload.get("mask_conversion") or "whole_foreground").lower()
+        if mask_conversion not in {"whole_foreground", "connected_components"}:
+            raise ValueError(
+                "mask_conversion must be whole_foreground or connected_components"
+            )
         frames = payload.get("frames")
         if not isinstance(frames, Mapping):
             frames = {
@@ -63,7 +79,10 @@ class ObjectIndexFileJob:
         return cls(
             h5_path=Path(path_value),
             object_set=object_set,
+            source_kind=source_kind,
             source_label_set=str(source_label_set),
+            source_mask_set=None if source_mask_set in (None, "") else str(source_mask_set),
+            mask_conversion=mask_conversion,
             enabled=bool(payload.get("enabled", True)),
             overwrite=bool(payload.get("overwrite", False)),
             save_outputs=bool(payload.get("save_outputs", not bool(payload.get("dry_run", False)))),
@@ -74,6 +93,10 @@ class ObjectIndexFileJob:
     @property
     def source_labels(self) -> str:
         return str(self.source_label_set or self.object_set)
+
+    @property
+    def source_name(self) -> str:
+        return str(self.source_mask_set if self.source_kind == "mask_set" else self.source_labels)
 
     def frame_numbers(self, frame_count: int, *, available_frames: Sequence[int] | None = None) -> list[int]:
         """Return validated one-based frames for this file."""
@@ -200,6 +223,8 @@ def run_batch_object_indexing(
                 "job_id": batch_job.job_id,
                 "h5_path": str(h5_path),
                 "object_set": file_job.object_set,
+                "source_kind": file_job.source_kind,
+                "source_name": file_job.source_name,
                 "source_label_set": file_job.source_labels,
                 "save_outputs": save_outputs,
             }
@@ -235,7 +260,11 @@ def _run_file_job(
         operation="object_index_calculation",
         job_id=batch_job.job_id,
     ) as trajectory:
-        available_frames = trajectory.label_frames(file_job.source_labels)
+        available_frames = (
+            trajectory.mask_frames(file_job.source_name)
+            if file_job.source_kind == "mask_set"
+            else trajectory.label_frames(file_job.source_labels)
+        )
         frames = file_job.frame_numbers(int(trajectory.metadata.frame_count or 1), available_frames=available_frames)
         if save_outputs and trajectory.store.has_observations(file_job.object_set) and not overwrite:
             summary.frames += len(frames)
@@ -251,13 +280,16 @@ def _run_file_job(
             )
             return
 
-        dependencies = snapshot_revisions(
-            trajectory.store,
-            [
-                "/metadata/celltraj2.json",
-                *[f"/labels/{file_job.source_labels}/frame_{int(frame)}" for frame in frames],
-            ],
-        )
+        source_family = "masks" if file_job.source_kind == "mask_set" else "labels"
+        dependency_paths = [
+            "/metadata/celltraj2.json",
+            *[f"/{source_family}/{file_job.source_name}/frame_{int(frame)}" for frame in frames],
+        ]
+        if file_job.source_kind == "mask_set":
+            dependency_paths.extend(
+                f"/labels/{file_job.source_labels}/frame_{int(frame)}" for frame in frames
+            )
+        dependencies = snapshot_revisions(trajectory.store, dependency_paths)
 
         def report_frame(frame_event: Mapping[str, Any]) -> None:
             emit(
@@ -270,17 +302,49 @@ def _run_file_job(
                 }
             )
 
-        result = index_object_set(
-            trajectory,
-            file_job.object_set,
-            source_label_set=file_job.source_labels,
-            frames=frames,
-            overwrite=overwrite,
-            save_outputs=False,
-            run_id=batch_job.job_id,
-            metadata={**batch_job.metadata, **file_job.metadata},
-            progress=report_frame,
-        )
+        derived_label_frames: dict[int, Any] = {}
+        provenance = {**batch_job.metadata, **file_job.metadata}
+        if file_job.source_kind == "mask_set":
+            derived_label_frames = {
+                int(frame): _mask_to_labels(
+                    trajectory.read_mask_frame(file_job.source_name, int(frame)),
+                    conversion=file_job.mask_conversion,
+                )
+                for frame in frames
+            }
+            parent_time = {
+                int(item["frame"]): int(item["parent_time_index"])
+                for item in trajectory.metadata.frame_map()
+            }
+            provenance.update(
+                {
+                    "source_kind": "mask_set",
+                    "source_mask_set": file_job.source_name,
+                    "mask_conversion": file_job.mask_conversion,
+                    "derived_label_set": file_job.source_labels,
+                }
+            )
+            result = index_label_arrays(
+                file_job.object_set,
+                file_job.source_labels,
+                derived_label_frames,
+                parent_time_indices=parent_time,
+                run_id=batch_job.job_id,
+                metadata=provenance,
+                progress=report_frame,
+            )
+        else:
+            result = index_object_set(
+                trajectory,
+                file_job.object_set,
+                source_label_set=file_job.source_labels,
+                frames=frames,
+                overwrite=overwrite,
+                save_outputs=False,
+                run_id=batch_job.job_id,
+                metadata=provenance,
+                progress=report_frame,
+            )
     lookup_paths: dict[int, str] = {}
     observations_path = None
     if save_outputs:
@@ -305,13 +369,26 @@ def _run_file_job(
                     }
                 )
                 return
+            if file_job.source_kind == "mask_set":
+                for frame in result.frames:
+                    trajectory.store.write_label_frame(
+                        result.source_label_set,
+                        frame,
+                        derived_label_frames[frame],
+                        overwrite=overwrite,
+                        attrs={
+                            "derived_from_kind": "mask_set",
+                            "derived_from_name": file_job.source_name,
+                            "mask_conversion": file_job.mask_conversion,
+                        },
+                    )
             observations_path = trajectory.store.write_observations(
                 result.object_set,
                 result.observations,
                 result.schema,
                 source_label_set=result.source_label_set,
                 overwrite=overwrite,
-                metadata={**batch_job.metadata, **file_job.metadata},
+                metadata=provenance,
             )
             if overwrite:
                 trajectory.store.clear_observation_lookup_frames(result.object_set)
@@ -332,12 +409,14 @@ def _run_file_job(
                     "h5_path": str(h5_path),
                     "object_set": result.object_set,
                     "source_label_set": result.source_label_set,
+                    "source_kind": file_job.source_kind,
+                    "source_name": file_job.source_name,
                     "frames": result.frames,
                     "observation_count": result.observation_count,
                     "frame_counts": result.frame_counts,
                     "observations_path": observations_path,
                     "dependencies": dependencies,
-                    "metadata": {**batch_job.metadata, **file_job.metadata},
+                    "metadata": provenance,
                 },
                 overwrite=True,
             )
@@ -377,3 +456,30 @@ def _parse_frame_values(value: Any) -> list[int]:
         else:
             frames.append(int(text))
     return frames
+
+
+def _mask_to_labels(mask: Any, *, conversion: str) -> Any:
+    try:
+        import numpy as np  # type: ignore
+    except ImportError as exc:
+        raise RuntimeError("Mask-to-object promotion requires numpy") from exc
+
+    foreground = np.asarray(mask, dtype=bool)
+    if foreground.ndim not in {2, 3}:
+        raise ValueError(
+            f"Mask-to-object promotion expects 2D YX or 3D ZYX masks; got {foreground.shape}"
+        )
+    mode = str(conversion or "whole_foreground").lower()
+    if mode == "whole_foreground":
+        return foreground.astype(np.uint8)
+    if mode != "connected_components":
+        raise ValueError(f"Unsupported mask conversion {conversion!r}")
+    try:
+        from scipy import ndimage  # type: ignore
+    except ImportError as exc:
+        raise RuntimeError(
+            "Connected-component mask promotion requires scipy. Install celltraj2 with the analysis extra."
+        ) from exc
+    structure = ndimage.generate_binary_structure(foreground.ndim, 1)
+    labels, _count = ndimage.label(foreground, structure=structure)
+    return labels.astype(np.uint32, copy=False)

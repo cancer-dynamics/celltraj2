@@ -54,6 +54,30 @@ def channel_indices_from_spec(spec: Mapping[str, Any]) -> list[int]:
     return [int(index) for index in values]
 
 
+def model_input_z_indices(
+    frame_data: Any,
+    *,
+    axes: Sequence[str] | None = None,
+    do_3d: bool = True,
+    z_index: int | None = None,
+) -> list[int | None]:
+    """Return the Z planes that must be composed for one segmentation frame.
+
+    Volumetric input and true 2D sources need one model call. Slice-wise 2D
+    input from a Z stack needs one call per Z plane unless an explicit
+    ``z_index`` requests a single plane.
+    """
+
+    arr = _require_numpy().asarray(frame_data)
+    frame_axes = normalized_frame_axes(axes, arr.ndim)
+    if do_3d or "Z" not in frame_axes:
+        return [None]
+    if z_index is not None:
+        return [int(z_index)]
+    z_axis = frame_axes.index("Z")
+    return list(range(int(arr.shape[z_axis])))
+
+
 def compose_model_input(
     frame_data: Any,
     *,

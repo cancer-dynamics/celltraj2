@@ -28,7 +28,9 @@ Current core capabilities:
   with stable entity/point ids;
 - calculate tissue-model-compatible `pcdiff` surface bases, curvature, CSR
   topology, and nearest external boundary interactions;
-- track with registered boundary optimal-transport costs while storing native
+- track with registered robust unbalanced/partial boundary transport, hard
+  physical displacement support, coverage diagnostics, and barycentric motion
+  summaries while storing native
   point correspondences and registration-versioned displacement maps;
 - query parents, children, histories, descendants, lineages, and maximal
   root-to-leaf trajectories, including scipy sparse trajectory membership;

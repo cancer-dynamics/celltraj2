@@ -21,6 +21,8 @@ from celltraj2.store import TrajectoryStore
 
 
 PROJECT_PATH_ANCHORS = ("roi_files", "rois", "cell_files", "segmentation", "analysis", "outputs", "manifests")
+ROI_RECORD_SUFFIX = ".roi.site.json"
+ROI_TOMBSTONE_SUFFIX = ".roi.deleted.json"
 
 
 def load_json(path: str | Path) -> dict[str, Any]:
@@ -58,6 +60,48 @@ def find_roi_record(roi_set: Mapping[str, Any], roi_id: str) -> dict[str, Any]:
         if str(roi.get("roi_id")) == str(roi_id):
             return dict(roi)
     raise KeyError(f"ROI id not found: {roi_id}")
+
+
+def load_roi_records(
+    roi_json_path: str | Path,
+    roi_set: Mapping[str, Any],
+    *,
+    project_root: str | Path | None = None,
+) -> list[dict[str, Any]]:
+    """Return legacy inline or SITE 0.2 sharded ROI records.
+
+    SITE 0.2 keeps acquisition-level metadata in ``*.rois.json`` and stores
+    each ROI in an independently synchronizable ``*.roi.site.json`` record.
+    This mirrors SITE's loader without importing the GUI package.
+    """
+
+    record_dir_value = roi_set.get("roi_record_dir")
+    if not record_dir_value:
+        return [dict(record) for record in roi_set.get("rois", []) or [] if isinstance(record, Mapping)]
+
+    root = Path(project_root) if project_root is not None else infer_project_root_from_roi_json(roi_json_path)
+    record_dir = Path(str(record_dir_value))
+    if not record_dir.is_absolute():
+        record_dir = root / record_dir
+    if not record_dir.exists():
+        return []
+
+    deleted = {
+        path.name[: -len(ROI_TOMBSTONE_SUFFIX)]
+        for path in record_dir.glob(f"*{ROI_TOMBSTONE_SUFFIX}")
+    }
+    records: list[dict[str, Any]] = []
+    for path in sorted(record_dir.glob(f"*{ROI_RECORD_SUFFIX}")):
+        roi_uuid = path.name[: -len(ROI_RECORD_SUFFIX)]
+        if roi_uuid in deleted:
+            continue
+        try:
+            record = load_json(path)
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(record, Mapping):
+            records.append(dict(record))
+    return records
 
 
 def resolve_site_path(path: str | Path | None, *, project_root: str | Path) -> Path | None:
@@ -181,7 +225,8 @@ def create_metadata_from_site_roi(
     root = Path(project_root) if project_root is not None else infer_project_root_from_roi_json(roi_json_path)
     if source_path not in (None, ""):
         roi_set_data["source_path"] = str(stored_site_path(source_path, project_root=root))
-    roi_record = find_roi_record(roi_set_data, roi_id)
+    roi_records = load_roi_records(roi_json_path, roi_set_data, project_root=root)
+    roi_record = find_roi_record({"rois": roi_records}, roi_id)
     dataset_id = dataset_id_from_roi_json(roi_json_path, roi_set_data)
     image_source = image_source_from_site_roi(roi_set=roi_set_data, roi_record=roi_record, project_root=root)
 

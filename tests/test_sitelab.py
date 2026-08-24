@@ -1,4 +1,6 @@
+import json
 from pathlib import Path
+from tempfile import TemporaryDirectory
 import unittest
 
 from celltraj2.sitelab import (
@@ -146,6 +148,54 @@ class SitelabHandoffTests(unittest.TestCase):
 
         self.assertEqual(metadata.image_source.path, Path("/current/sample.nd2"))
         self.assertEqual(metadata.roi.source_path, Path("/current/sample.nd2"))
+
+    def test_create_metadata_from_site_roi_reads_version_02_sharded_roi_record(self):
+        roi_id = "sample_XY001_ROI001_a1b2c3d4"
+        roi_uuid = "a1b2c3d4-1111-2222-3333-444455556666"
+        with TemporaryDirectory() as tmp:
+            project_root = Path(tmp)
+            roi_json_path = project_root / "rois" / "sample.rois.json"
+            record_dir = project_root / "rois" / "dataset-uuid"
+            record_dir.mkdir(parents=True)
+            roi_json_path.write_text(
+                json.dumps(
+                    {
+                        "roi_set_version": "0.2",
+                        "dataset_id": "sample",
+                        "dataset_uuid": "dataset-uuid",
+                        "source_path": "sample.nd2",
+                        "source_axes": ["T", "P", "C", "Y", "X"],
+                        "source_sizes": {"T": 3, "P": 1, "C": 1, "Y": 4, "X": 5},
+                        "roi_record_dir": "rois/dataset-uuid",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (record_dir / f"{roi_uuid}.roi.site.json").write_text(
+                json.dumps(
+                    {
+                        "roi_id": roi_id,
+                        "roi_uuid": roi_uuid,
+                        "position_index": 0,
+                        "time_start": 1,
+                        "time_stop": 3,
+                        "bounds": {"z_start": 0, "z_stop": 1, "y_start": 0, "y_stop": 4, "x_start": 0, "x_stop": 5},
+                        "storage_mode": "linked_nd2",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            metadata, _roi_set, roi_record, root, dataset_id = create_metadata_from_site_roi(
+                roi_json_path=roi_json_path,
+                roi_id=roi_id,
+            )
+
+        self.assertEqual(root, project_root)
+        self.assertEqual(dataset_id, "sample")
+        self.assertEqual(roi_record["roi_uuid"], roi_uuid)
+        self.assertEqual(metadata.roi_id, roi_id)
+        self.assertEqual(metadata.frame_count, 2)
 
 
 if __name__ == "__main__":

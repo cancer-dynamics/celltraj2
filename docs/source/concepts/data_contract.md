@@ -296,6 +296,10 @@ and binary mask surfaces without applying global registration:
   geometry/<geometry_set>/
   neighbors/<neighbor_set>/
   motion/<motion_set>/
+    links
+    transport/
+    source_summary/
+    target_summary/
 ```
 
 `boundary_entity_id` and `point_id` are one-based identities local to the
@@ -323,6 +327,14 @@ all downstream products. `schema.json/sampling` records the method, point
 spacing and unit, native Z/Y/X spacing, native candidate and retained counts,
 retention fraction, and per-source/per-frame summaries.
 
+A construction job may restrict a library to a one-based frame subset. The
+canonical `entities` and `points` tables then contain only those frames, so
+geometry and neighbor products are constrained automatically without carrying a
+second frame filter. Each `sources.json` record stores its resolved `frames`
+list; SITE additionally preserves the user's all/range/list selection in job
+metadata. Reusing a canonical library requires the stored resolved frames to
+match the requested source contract.
+
 Geometry sets are point-row-aligned and store oriented normals, tangent frames,
 principal/mean/Gaussian curvature, quality flags, and the surface kNN topology
 as CSR. The 3D surface backend follows the tissue-kinematic model: `pcdiff`
@@ -338,12 +350,21 @@ coordinates. Same-frame neighbor geometry is native and has no registration
 dependency.
 
 Between-frame boundary OT is different: candidate gating, transport cost, and
-displacement are calculated in registered physical coordinates. Motion sets
-retain native source and target `point_id` values, transport mass/cost, and the
-registered displacement
+displacement are calculated in registered physical coordinates. Robust motion
+uses common-density spatial sampling, weighted unbalanced or partial transport,
+an optional hard physical displacement gate, and mass-aware output
+sparsification. Motion sets retain native source and target `point_id` values,
+transport mass/cost, and the registered displacement
 `T_target(q_native) - T_source(p_native)`. Both the boundary set/digest and
 registration set/digest are recorded. Changing registration invalidates the
 derived track/motion set but never rewrites the boundary library.
+
+Boundary-motion v2 also stores source- and target-point barycentric summaries:
+matched mass/fraction, a confidence-weighted displacement, displacement
+variance, and mean edge distance. Link rows contain source/target coverage,
+full objective, matched mean cost, dropped numerical mass, and edge-distance
+quantiles. Raw edges remain for audit and v1 compatibility. See
+{doc}`boundary_transport` for solver semantics and parameter guidance.
 
 ## Sparse Lineage Graphs
 

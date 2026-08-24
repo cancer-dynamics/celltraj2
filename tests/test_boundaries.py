@@ -7,6 +7,7 @@ from celltraj2.boundaries import (
     BoundarySourceSpec,
     _sample_native_boundary_points,
     build_boundary_library,
+    common_density_point_samples,
     optimal_transport_plan,
 )
 from celltraj2.boundary_batch import BoundaryFileJob, run_batch_boundaries
@@ -73,6 +74,45 @@ class BoundaryLibraryTests(unittest.TestCase):
         self.assertEqual(plan.method, "numpy.sinkhorn")
         self.assertAlmostEqual(float(self.np.sum(plan.mass)), 1.0, places=7)
         self.assertAlmostEqual(plan.total_cost, 1.0, places=5)
+
+    def test_unbalanced_transport_leaves_distant_target_mass_unmatched(self):
+        theta = self.np.linspace(0.0, 2.0 * self.np.pi, 64, endpoint=False)
+        source = self.np.column_stack((self.np.cos(theta), self.np.sin(theta)))
+        target = source.copy()
+        target[0] = self.np.asarray([4.0, 0.0])
+        plan = optimal_transport_plan(
+            source,
+            target,
+            method="unbalanced",
+            regularization=0.05,
+            unbalanced_reach=2.0,
+            max_transport_distance=0.75,
+            relative_mass_tolerance=1e-3,
+            retained_mass_fraction=0.999,
+        )
+        self.assertIn(plan.method, {"numpy.sinkhorn_unbalanced_scaling", "numpy.sinkhorn_unbalanced_log"})
+        self.assertLess(plan.target_coverage, 1.0)
+        self.assertGreater(plan.target_coverage, 0.9)
+        self.assertLessEqual(float(self.np.max(plan.edge_cost)), 0.75)
+        self.assertGreater(plan.raw_edge_count, plan.mass.size)
+        self.assertGreater(plan.dropped_mass, 0.0)
+        self.assertTrue(self.np.isfinite(plan.objective))
+
+    def test_common_density_sampling_uses_one_physical_grid_and_density_weights(self):
+        theta = self.np.linspace(0.0, 2.0 * self.np.pi, 128, endpoint=False)
+        source = self.np.column_stack((self.np.cos(theta), self.np.sin(theta)))
+        target = source[::2] + self.np.asarray([0.1, 0.0])
+        source_sample, target_sample = common_density_point_samples(
+            source,
+            target,
+            32,
+        )
+        self.assertLessEqual(source_sample.rows.size, 32)
+        self.assertLessEqual(target_sample.rows.size, 32)
+        self.assertEqual(source_sample.voxel_spacing, target_sample.voxel_spacing)
+        self.assertGreater(source_sample.voxel_spacing, 0.0)
+        self.assertAlmostEqual(float(self.np.sum(source_sample.weights)), 1.0)
+        self.assertAlmostEqual(float(self.np.sum(target_sample.weights)), 1.0)
 
     def test_native_boundary_grid_sampling_is_deterministic_and_respects_pixel_floor(self):
         coordinates = self.np.column_stack(
@@ -509,6 +549,88 @@ class BoundaryLibraryTests(unittest.TestCase):
                 self.assertEqual(neighbor_schema["source_ids"], [1])
                 self.assertEqual(neighbor_schema["target_ids"], [2])
 
+    def test_boundary_batch_overwrite_builds_new_library_for_selected_frame_subset(self):
+        frame_1 = self.np.zeros((14, 14), dtype=self.np.uint16)
+        frame_1[2:7, 2:7] = 1
+        frame_2 = self.np.zeros((14, 14), dtype=self.np.uint16)
+        frame_2[5:11, 6:12] = 1
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "sample.ct2.h5"
+            self._create_indexed(path, [frame_1, frame_2])
+            events = []
+
+            summary = run_batch_boundaries(
+                {
+                    "job_id": "boundary_subset_run",
+                    "save_outputs": True,
+                    "overwrite_library": True,
+                    "files": [
+                        {
+                            "h5_path": str(path),
+                            "boundary_set": "selected_surface",
+                            "frames": [2],
+                            "sources": [
+                                {
+                                    "kind": "object_set",
+                                    "name": "cells",
+                                    "object_set": "cells",
+                                    "role": "cell",
+                                }
+                            ],
+                            "reuse_existing": True,
+                            "overwrite_library": True,
+                            "save_outputs": True,
+                        }
+                    ],
+                },
+                reporter=events.append,
+            )
+
+            self.assertEqual(summary.completed, 1)
+            self.assertEqual(summary.failed, 0)
+            with Trajectory(path, mode="r") as trajectory:
+                view = trajectory.boundary_library("selected_surface")
+                self.assertEqual(self.np.unique(view.entities["frame"]).tolist(), [2])
+                self.assertEqual(view.sources[0]["frames"], [2])
+            commit = [event for event in events if event.get("event") == "boundary_commit_completed"]
+            self.assertEqual(len(commit), 1)
+            self.assertTrue(commit[0]["saved"])
+            self.assertEqual(commit[0]["boundary_path"], "/boundaries/selected_surface")
+
+            reuse_events = []
+            reuse_summary = run_batch_boundaries(
+                {
+                    "job_id": "boundary_subset_mismatch",
+                    "save_outputs": False,
+                    "files": [
+                        {
+                            "h5_path": str(path),
+                            "boundary_set": "selected_surface",
+                            "frames": [1],
+                            "sources": [
+                                {
+                                    "kind": "object_set",
+                                    "name": "cells",
+                                    "object_set": "cells",
+                                    "role": "cell",
+                                }
+                            ],
+                            "reuse_existing": True,
+                        }
+                    ],
+                },
+                reporter=reuse_events.append,
+            )
+            self.assertEqual(reuse_summary.completed, 0)
+            self.assertEqual(reuse_summary.failed, 1)
+            self.assertTrue(
+                any(
+                    event.get("event") == "file_failed"
+                    and "different selected frames" in str(event.get("error"))
+                    for event in reuse_events
+                )
+            )
+
     def test_transient_boundary_tracking_and_independent_surface_motion(self):
         frame_1 = self.np.zeros((16, 16), dtype=self.np.uint16)
         frame_1[4:9, 3:8] = 1
@@ -525,8 +647,10 @@ class BoundaryLibraryTests(unittest.TestCase):
                     boundary_set=None,
                     max_distance=3.0,
                     track_set="transient_ot",
-                    ot_method="sinkhorn",
+                    ot_method="unbalanced",
                     sinkhorn_regularization=0.05,
+                    unbalanced_reach=2.0,
+                    max_transport_distance=3.0,
                     save_motion=False,
                     save_outputs=False,
                 )
@@ -563,8 +687,10 @@ class BoundaryLibraryTests(unittest.TestCase):
                     boundary_set="interaction_domain",
                     boundary_source_name="tracked_cells",
                     motion_set="centroid_surface_ot",
-                    ot_method="sinkhorn",
+                    ot_method="unbalanced",
                     sinkhorn_regularization=0.05,
+                    unbalanced_reach=2.0,
+                    max_transport_distance=3.0,
                 )
                 self.assertEqual(motion.link_count, 1)
                 self.assertGreater(motion.transport_edge_count, 0)
@@ -576,6 +702,16 @@ class BoundaryLibraryTests(unittest.TestCase):
                     "interaction_domain", "centroid_surface_ot"
                 )
                 self.assertEqual(stored["links"].shape[0], 1)
+                self.assertEqual(stored["schema"]["schema"], "celltraj2.boundary_motion.v2")
+                self.assertIn("source_summary", stored["point_summaries"])
+                source_summary = stored["point_summaries"]["source_summary"]
+                self.assertEqual(
+                    source_summary["point_id"].shape[0],
+                    int(stored["links"][0]["source_summary_count"]),
+                )
+                self.assertTrue(
+                    self.np.all(source_summary["matched_fraction"] <= 1.0)
+                )
             motion_events = []
             motion_summary = run_batch_surface_motion(
                 {

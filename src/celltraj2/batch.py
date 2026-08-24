@@ -8,7 +8,12 @@ from dataclasses import asdict, dataclass, field, is_dataclass, replace
 from pathlib import Path
 from typing import Any
 
-from celltraj2.model_input import compose_model_input, model_input_summary, normalized_frame_axes
+from celltraj2.model_input import (
+    compose_model_input,
+    model_input_summary,
+    model_input_z_indices,
+    normalized_frame_axes,
+)
 from celltraj2.h5_access import H5DependencyChangedError, snapshot_revisions, validate_revisions
 from celltraj2.reporting import JsonlReporter
 from celltraj2.schema import utc_now_iso
@@ -392,16 +397,53 @@ def _run_frame(
             )
             effective_do_3d = _effective_do_3d_for_frame(file_job, frame_axes)
             effective_file_job = _file_job_with_effective_do_3d(file_job, effective_do_3d)
-            model_input = compose_model_input(
+            z_indices = model_input_z_indices(
                 frame_data,
-                channel_specs=effective_file_job.channel_specs,
                 axes=frame_axes,
                 do_3d=effective_file_job.do_3d,
                 z_index=effective_file_job.z_index,
-                channel_index_map=trajectory.channel_index_map(),
             )
-        channel_axis = 1 if effective_file_job.do_3d and getattr(model_input, "ndim", 0) == 4 else 0 if (not effective_file_job.do_3d and getattr(model_input, "ndim", 0) == 3) else None
-        result = _coerce_segmentation_result(segmenter(model_input, effective_file_job, frame))
+            channel_index_map = trajectory.channel_index_map()
+            model_inputs = [
+                (
+                    z_index,
+                    compose_model_input(
+                        frame_data,
+                        channel_specs=effective_file_job.channel_specs,
+                        axes=frame_axes,
+                        do_3d=effective_file_job.do_3d,
+                        z_index=z_index,
+                        channel_index_map=channel_index_map,
+                    ),
+                )
+                for z_index in z_indices
+            ]
+        slice_wise_2d = bool(
+            not effective_file_job.do_3d
+            and "Z" in {str(axis).upper() for axis in frame_axes}
+            and effective_file_job.z_index is None
+        )
+        if slice_wise_2d:
+            model_input, result = _run_slice_wise_2d_segmentation(
+                model_inputs,
+                effective_file_job,
+                frame,
+                segmenter,
+                emit,
+                batch_job=batch_job,
+                h5_path=h5_path,
+            )
+            channel_axis = 1 if getattr(model_input, "ndim", 0) == 4 else None
+        else:
+            model_input = model_inputs[0][1]
+            result = _coerce_segmentation_result(segmenter(model_input, effective_file_job, frame))
+            channel_axis = (
+                1
+                if effective_file_job.do_3d and getattr(model_input, "ndim", 0) == 4
+                else 0
+                if not effective_file_job.do_3d and getattr(model_input, "ndim", 0) == 3
+                else None
+            )
         output_path = None
         if save_outputs:
             with Trajectory(
@@ -446,6 +488,8 @@ def _run_frame(
                     "frame_axes": list(frame_axes),
                     "requested_do_3D": bool(file_job.do_3d),
                     "effective_do_3D": bool(effective_file_job.do_3d),
+                    "slice_wise_2D": slice_wise_2d,
+                    "z_count": len(model_inputs) if slice_wise_2d else None,
                 },
             )
         summary.completed += 1
@@ -464,6 +508,8 @@ def _run_frame(
             "frame_axes": list(frame_axes),
             "requested_do_3D": bool(file_job.do_3d),
             "effective_do_3D": bool(effective_file_job.do_3d),
+            "slice_wise_2D": slice_wise_2d,
+            "z_count": len(model_inputs) if slice_wise_2d else None,
         }
         emit({"event": "frame_completed", "job_id": batch_job.job_id, "h5_path": str(h5_path), **record})
     except H5DependencyChangedError as exc:
@@ -517,6 +563,97 @@ def _coerce_segmentation_result(value: Any) -> SegmentationResult:
     return SegmentationResult(labels=value, metadata={})
 
 
+def _run_slice_wise_2d_segmentation(
+    model_inputs: Sequence[tuple[int | None, Any]],
+    file_job: SegmentationFileJob,
+    frame: int,
+    segmenter: Segmenter,
+    emit: Reporter,
+    *,
+    batch_job: SegmentationBatchJob,
+    h5_path: Path,
+) -> tuple[Any, SegmentationResult]:
+    """Segment every Z plane independently and stack globally unique labels."""
+
+    try:
+        import numpy as np
+    except ImportError as exc:
+        raise RuntimeError("Slice-wise 2D segmentation requires numpy") from exc
+
+    input_planes = []
+    label_planes = []
+    slice_records = []
+    label_offset = 0
+    for z_index, image in model_inputs:
+        if z_index is None:
+            raise ValueError("Slice-wise 2D segmentation requires concrete Z indices")
+        slice_job = _file_job_with_z_index(file_job, int(z_index))
+        emit(
+            {
+                "event": "z_slice_started",
+                "job_id": batch_job.job_id,
+                "h5_path": str(h5_path),
+                "frame": int(frame),
+                "z_index": int(z_index),
+                "z": int(z_index) + 1,
+            }
+        )
+        result = _coerce_segmentation_result(segmenter(image, slice_job, frame))
+        labels, label_offset = _offset_plane_labels(result.labels, label_offset, np=np)
+        input_planes.append(np.asarray(image))
+        label_planes.append(labels)
+        slice_record = {
+            "z_index": int(z_index),
+            "z": int(z_index) + 1,
+            "input_summary": model_input_summary(
+                image,
+                channel_axis=0 if getattr(image, "ndim", 0) == 3 else None,
+            ),
+            "label_summary": _label_summary(labels),
+            "backend_metadata": dict(result.metadata or {}),
+        }
+        slice_records.append(slice_record)
+        emit(
+            {
+                "event": "z_slice_completed",
+                "job_id": batch_job.job_id,
+                "h5_path": str(h5_path),
+                "frame": int(frame),
+                **slice_record,
+            }
+        )
+
+    if not input_planes:
+        raise ValueError("Slice-wise 2D segmentation found no Z planes")
+    metadata = dict(slice_records[0].get("backend_metadata") or {})
+    metadata.update(
+        {
+            "slice_wise_2D": True,
+            "z_count": len(slice_records),
+            "z_indices": [int(record["z_index"]) for record in slice_records],
+            "slice_results": slice_records,
+        }
+    )
+    return (
+        np.stack(input_planes, axis=0),
+        SegmentationResult(labels=np.stack(label_planes, axis=0), metadata=metadata),
+    )
+
+
+def _offset_plane_labels(labels: Any, label_offset: int, *, np: Any) -> tuple[Any, int]:
+    """Offset positive plane labels so separate Z slices cannot share an id."""
+
+    data = np.asarray(labels)
+    if data.ndim != 2:
+        raise ValueError(f"Slice-wise 2D segmentation must return Y/X labels; got shape {data.shape}")
+    output = data.astype(np.int64, copy=True)
+    positive = output > 0
+    if int(label_offset) and np.any(positive):
+        output[positive] += int(label_offset)
+    next_offset = max(int(label_offset), int(np.max(output)) if output.size else int(label_offset))
+    return output, next_offset
+
+
 def _effective_do_3d_for_frame(file_job: SegmentationFileJob, frame_axes: Sequence[str]) -> bool:
     """Return the executable dimensionality for a frame.
 
@@ -540,6 +677,11 @@ def _file_job_with_effective_do_3d(file_job: SegmentationFileJob, do_3d: bool) -
     backend["parameters"] = parameters
     model_input = {**dict(file_job.model_input or {}), "do_3D": bool(do_3d)}
     return replace(file_job, backend=backend, model_input=model_input)
+
+
+def _file_job_with_z_index(file_job: SegmentationFileJob, z_index: int) -> SegmentationFileJob:
+    model_input = {**dict(file_job.model_input or {}), "z_index": int(z_index)}
+    return replace(file_job, model_input=model_input)
 
 
 def _has_output_frame(trajectory: Trajectory, file_job: SegmentationFileJob, frame: int) -> bool:

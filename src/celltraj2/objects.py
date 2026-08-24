@@ -153,6 +153,69 @@ def observation_schema(
     }
 
 
+def index_label_arrays(
+    object_set: str,
+    source_label_set: str,
+    label_frames: Mapping[int, Any],
+    *,
+    parent_time_indices: Mapping[int, int] | None = None,
+    run_id: str | None = None,
+    metadata: Mapping[str, Any] | None = None,
+    progress: Callable[[Mapping[str, Any]], None] | None = None,
+) -> ObjectIndexResult:
+    """Index in-memory label frames without requiring them to be stored first."""
+
+    np = _require_numpy()
+    object_name = validate_name(object_set, kind="object set")
+    label_name = validate_name(source_label_set, kind="label set")
+    selected_frames = sorted(dict.fromkeys(int(frame) for frame in label_frames))
+    parent_time = {int(key): int(value) for key, value in dict(parent_time_indices or {}).items()}
+    records: list[tuple[Any, ...]] = []
+    lookups: dict[int, Any] = {}
+    frame_counts: dict[int, int] = {}
+    next_observation_id = 1
+    for frame in selected_frames:
+        labels = _normalize_label_frame(label_frames[frame], np=np)
+        frame_records, lookup, next_observation_id = _index_one_frame(
+            labels,
+            frame=frame,
+            parent_time_index=parent_time.get(frame, frame - 1),
+            first_observation_id=next_observation_id,
+            np=np,
+        )
+        records.extend(frame_records)
+        lookups[frame] = lookup
+        frame_counts[frame] = len(frame_records)
+        if progress is not None:
+            progress(
+                {
+                    "frame": int(frame),
+                    "object_set": object_name,
+                    "source_label_set": label_name,
+                    "observation_count": int(len(frame_records)),
+                }
+            )
+    observations = np.asarray(records, dtype=observation_dtype())
+    schema = observation_schema(
+        object_set=object_name,
+        source_label_set=label_name,
+        frames=selected_frames,
+        observation_count=int(observations.shape[0]),
+        metadata=metadata,
+    )
+    return ObjectIndexResult(
+        object_set=object_name,
+        source_label_set=label_name,
+        observations=observations,
+        lookups=lookups,
+        schema=schema,
+        frames=selected_frames,
+        frame_counts=frame_counts,
+        run_id=validate_name(run_id or default_object_index_run_id(), kind="object-indexing run"),
+        saved=False,
+    )
+
+
 def index_object_set(
     trajectory: Any,
     object_set: str,

@@ -1,6 +1,6 @@
 import unittest
 
-from celltraj2.model_input import compose_model_input
+from celltraj2.model_input import compose_model_input, model_input_z_indices
 
 
 class ModelInputTests(unittest.TestCase):
@@ -116,6 +116,26 @@ class ModelInputTests(unittest.TestCase):
             channel_specs=[{"channel_indices": [0], "normalization": "raw"}],
         )
         self.assertEqual(output.shape, (3, 4))
+
+    def test_2d_z_stack_expands_to_every_plane_unless_one_is_requested(self):
+        data = self.np.zeros((3, 4, 5, 1), dtype=self.np.uint16)
+
+        self.assertEqual(
+            model_input_z_indices(data, axes=("Z", "Y", "X", "C"), do_3d=False),
+            [0, 1, 2],
+        )
+        self.assertEqual(
+            model_input_z_indices(data, axes=("Z", "Y", "X", "C"), do_3d=False, z_index=1),
+            [1],
+        )
+        self.assertEqual(
+            model_input_z_indices(data, axes=("Z", "Y", "X", "C"), do_3d=True),
+            [None],
+        )
+        self.assertEqual(
+            model_input_z_indices(data[0], axes=("Y", "X", "C"), do_3d=False),
+            [None],
+        )
 
 
 if __name__ == "__main__":

@@ -12,8 +12,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run a celltraj2 boundary-library batch job.")
     parser.add_argument("job", type=Path, help="Path to a boundary job JSON file.")
     args = parser.parse_args(argv)
-    run_batch_boundaries(load_boundary_job(args.job), reporter=JsonlReporter())
-    return 0
+    summary = run_batch_boundaries(load_boundary_job(args.job), reporter=JsonlReporter())
+    return 1 if summary.failed else 0
 
 
 if __name__ == "__main__":

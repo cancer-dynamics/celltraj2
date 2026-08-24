@@ -406,6 +406,9 @@ def _motion_summary(context: Mapping[str, Any], *, feature: Mapping[str, Any], n
             product=f"Geometry set {geometry_set!r}",
         )
     prefix = _slug(feature.get("name") or feature.get("prefix") or "surface_motion")
+    mapped_mass_threshold = float(feature.get("mapped_mass_threshold", 0.01))
+    if not math.isfinite(mapped_mass_threshold) or mapped_mass_threshold < 0 or mapped_mass_threshold > 1:
+        raise ValueError("mapped_mass_threshold must be in [0, 1]")
     motion = _motion_product(context, motion_set=motion_set)
     columns: OrderedDict[str, dict[str, Any]] = OrderedDict()
     for metric in metrics:
@@ -413,6 +416,7 @@ def _motion_summary(context: Mapping[str, Any], *, feature: Mapping[str, Any], n
         product_dependency: dict[str, Any] = {
             "motion_set": motion_set,
             "direction": direction,
+            "mapped_mass_threshold": mapped_mass_threshold,
             "schema": motion["schema"],
         }
         if geometry_set:
@@ -438,7 +442,6 @@ def _motion_summary(context: Mapping[str, Any], *, feature: Mapping[str, Any], n
             np=np,
         )
         vectors = data["vectors"]
-        finite = np.all(np.isfinite(vectors), axis=1)
         magnitude = np.linalg.norm(vectors, axis=1)
         normal = data.get("normal_displacement")
         tangential = data.get("tangential_magnitude")
@@ -458,7 +461,16 @@ def _motion_summary(context: Mapping[str, Any], *, feature: Mapping[str, Any], n
             "normal_min": _statistic(normal, "min", np=np),
             "normal_max": _statistic(normal, "max", np=np),
             "tangential_magnitude_mean": _statistic(tangential, "mean", np=np),
-            "mapped_fraction": float(np.sum(finite) / vectors.shape[0]) if vectors.shape[0] else np.nan,
+            "mapped_fraction": (
+                float(
+                    np.sum(
+                        data["point_sampled"]
+                        & (data["point_coverage"] >= mapped_mass_threshold)
+                    )
+                    / np.sum(data["point_sampled"])
+                )
+                if np.any(data["point_sampled"]) else np.nan
+            ),
             "ot_cost_mean": _statistic(data["ot_cost"], "mean", np=np),
             "transported_mass_sum": float(np.nansum(data["transported_mass"])),
             "motion_link_count": float(data["link_count"]),
@@ -719,11 +731,44 @@ def _motion_point_data(
     positions = np.asarray(point_data["native_position_zyx"], dtype=float)
     weighted = np.zeros((point_ids.size, 3), dtype=float)
     weights = np.zeros(point_ids.size, dtype=float)
+    point_coverage = np.zeros(point_ids.size, dtype=float)
+    point_sampled = np.zeros(point_ids.size, dtype=bool)
     path = f"{product['path']}/transport"
     group = context["trajectory"].store.h5[path]
     ot_cost: list[float] = []
     transported_mass: list[float] = []
     for link, selected_direction in selected:
+        summary_name = "target_summary" if selected_direction == "incoming" else "source_summary"
+        summary_start_name = "target_summary_start" if selected_direction == "incoming" else "source_summary_start"
+        summary_count_name = "target_summary_count" if selected_direction == "incoming" else "source_summary_count"
+        if (
+            summary_name in context["trajectory"].store.h5[product["path"]]
+            and links.dtype.names
+            and summary_start_name in links.dtype.names
+            and summary_count_name in links.dtype.names
+        ):
+            summary_group = context["trajectory"].store.h5[f"{product['path']}/{summary_name}"]
+            start = int(link[summary_start_name])
+            stop = start + int(link[summary_count_name])
+            edge_ids = np.asarray(summary_group["point_id"][start:stop], dtype=np.int64)
+            mass = np.asarray(summary_group["matched_mass"][start:stop], dtype=float)
+            displacement = np.asarray(
+                summary_group["barycentric_displacement_zyx"][start:stop], dtype=float
+            )
+            coverage = np.asarray(summary_group["matched_fraction"][start:stop], dtype=float)
+            local = np.searchsorted(point_ids, edge_ids)
+            id_valid = (local >= 0) & (local < point_ids.size)
+            id_valid &= point_ids[np.clip(local, 0, max(0, point_ids.size - 1))] == edge_ids if point_ids.size else False
+            if np.any(id_valid):
+                point_sampled[local[id_valid]] = True
+                np.maximum.at(point_coverage, local[id_valid], coverage[id_valid])
+            valid = id_valid & np.all(np.isfinite(displacement), axis=1)
+            if np.any(valid):
+                np.add.at(weighted, local[valid], mass[valid, None] * displacement[valid])
+                np.add.at(weights, local[valid], mass[valid])
+            ot_cost.append(float(link["ot_cost"]))
+            transported_mass.append(float(link["transported_mass"]))
+            continue
         start = int(link["transport_start"])
         stop = start + int(link["transport_count"])
         id_column = "target_point_id" if selected_direction == "incoming" else "source_point_id"
@@ -734,8 +779,10 @@ def _motion_point_data(
         valid = (local >= 0) & (local < point_ids.size)
         valid &= point_ids[np.clip(local, 0, max(0, point_ids.size - 1))] == edge_ids if point_ids.size else False
         if np.any(valid):
+            point_sampled[local[valid]] = True
             np.add.at(weighted, local[valid], mass[valid, None] * displacement[valid])
             np.add.at(weights, local[valid], mass[valid])
+            point_coverage[local[valid]] = 1.0
         ot_cost.append(float(link["ot_cost"]))
         transported_mass.append(float(link["transported_mass"]))
     vectors = np.full((point_ids.size, 3), np.nan, dtype=float)
@@ -745,6 +792,8 @@ def _motion_point_data(
         "positions": positions,
         "vectors": vectors,
         "point_mass": weights,
+        "point_coverage": point_coverage,
+        "point_sampled": point_sampled,
         "ot_cost": np.asarray(ot_cost, dtype=float),
         "transported_mass": np.asarray(transported_mass, dtype=float),
         "link_count": len(selected),

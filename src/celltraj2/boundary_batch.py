@@ -14,6 +14,7 @@ from celltraj2.boundaries import (
     BoundaryLibraryResult,
     BoundaryNeighborResult,
     BoundarySourceSpec,
+    _resolve_source_specs,
     as_boundary_library_view,
     build_boundary_library,
     compute_boundary_geometry,
@@ -53,11 +54,29 @@ def _strings(value: Any) -> tuple[str, ...]:
     return tuple(str(item) for item in value if str(item))
 
 
+def _source_refs(value: Any) -> tuple[dict[str, str], ...]:
+    if value in (None, ""):
+        return ()
+    if isinstance(value, Mapping):
+        value = [value]
+    refs = []
+    for item in value:
+        if not isinstance(item, Mapping):
+            raise ValueError("Boundary source references must be mappings")
+        kind = str(item.get("kind") or "").strip()
+        name = str(item.get("name") or "").strip()
+        if kind not in {"object_set", "label_set", "mask_set"} or not name:
+            raise ValueError("Boundary source references require a valid kind and name")
+        refs.append({"kind": kind, "name": name})
+    return tuple(refs)
+
+
 @dataclass(frozen=True)
 class BoundaryGeometryJob:
     geometry_set: str = "surface_v1"
     knn: int = 40
     backend: str = "auto"
+    source_refs: tuple[dict[str, str], ...] = ()
     source_names: tuple[str, ...] = ()
     source_roles: tuple[str, ...] = ()
     enabled: bool = True
@@ -71,6 +90,7 @@ class BoundaryGeometryJob:
             geometry_set=str(payload.get("geometry_set") or "surface_v1"),
             knn=int(payload.get("knn", 40)),
             backend=str(payload.get("backend") or "auto").lower(),
+            source_refs=_source_refs(payload.get("source_refs")),
             source_names=_strings(payload.get("source_names")),
             source_roles=_strings(payload.get("source_roles")),
             enabled=bool(payload.get("enabled", True)),
@@ -83,10 +103,14 @@ class BoundaryGeometryJob:
 class BoundaryNeighborJob:
     neighbor_set: str = "nearest_external_v1"
     k: int = 1
+    source_refs: tuple[dict[str, str], ...] = ()
+    source_subset: dict[str, Any] = field(default_factory=lambda: {"mode": "whole"})
     source_names: tuple[str, ...] = ()
     source_roles: tuple[str, ...] = ()
     target_names: tuple[str, ...] = ()
     target_roles: tuple[str, ...] = ()
+    target_refs: tuple[dict[str, str], ...] = ()
+    target_subset: dict[str, Any] = field(default_factory=lambda: {"mode": "whole"})
     same_frame: bool = True
     exclude_same_entity: bool = True
     max_distance: float | None = None
@@ -103,10 +127,14 @@ class BoundaryNeighborJob:
         return cls(
             neighbor_set=str(payload.get("neighbor_set") or "nearest_external_v1"),
             k=int(payload.get("k", 1)),
+            source_refs=_source_refs(payload.get("source_refs")),
+            source_subset=dict(payload.get("source_subset") or {"mode": "whole"}),
             source_names=_strings(payload.get("source_names")),
             source_roles=_strings(payload.get("source_roles")),
             target_names=_strings(payload.get("target_names")),
             target_roles=_strings(payload.get("target_roles")),
+            target_refs=_source_refs(payload.get("target_refs")),
+            target_subset=dict(payload.get("target_subset") or {"mode": "whole"}),
             same_frame=bool(payload.get("same_frame", True)),
             exclude_same_entity=bool(payload.get("exclude_same_entity", True)),
             max_distance=None if max_distance in (None, "") else float(max_distance),
@@ -264,13 +292,17 @@ def load_boundary_job(path: str | Path) -> BoundaryBatchJob:
     return BoundaryBatchJob.load(path)
 
 
-def _validate_existing_sources(view: Any, requested: Sequence[BoundarySourceSpec]) -> None:
+def _validate_existing_sources(
+    view: Any,
+    requested: Sequence[BoundarySourceSpec],
+    expected_frames: Sequence[Sequence[int]],
+) -> None:
     existing = view.sources
     if len(existing) != len(requested):
         raise ValueError(
             f"Existing boundary library has {len(existing)} sources; requested {len(requested)}"
         )
-    for stored, wanted in zip(existing, requested):
+    for stored, wanted, frames in zip(existing, requested, expected_frames):
         for key, wanted_value in (
             ("kind", wanted.kind),
             ("name", wanted.name),
@@ -282,12 +314,30 @@ def _validate_existing_sources(view: Any, requested: Sequence[BoundarySourceSpec
                 raise ValueError(
                     f"Existing boundary source {stored.get('name')!r} does not match requested {key}={wanted_value!r}"
                 )
-        if wanted.frames and [int(value) for value in stored.get("frames", [])] != [
-            int(value) for value in wanted.frames
-        ]:
+        if [int(value) for value in stored.get("frames", [])] != [int(value) for value in frames]:
             raise ValueError(
                 f"Existing boundary source {stored.get('name')!r} has different selected frames"
             )
+
+
+def _resolved_source_frames(
+    trajectory: Any,
+    sources: Sequence[BoundarySourceSpec],
+    requested_frames: Sequence[int],
+) -> list[list[int]]:
+    resolved = []
+    file_frames = sorted(dict.fromkeys(int(value) for value in requested_frames))
+    for source in sources:
+        if source.frames:
+            frames = list(source.frames)
+        elif file_frames:
+            frames = file_frames
+        elif source.kind == "mask_set":
+            frames = trajectory.mask_frames(str(source.label_set))
+        else:
+            frames = trajectory.label_frames(str(source.label_set))
+        resolved.append(sorted(dict.fromkeys(int(value) for value in frames)))
+    return resolved
 
 
 def _validate_existing_sampling(view: Any, point_spacing: float | None) -> None:
@@ -468,6 +518,12 @@ def _run_boundary_file(
         operation="boundary_calculation",
         job_id=batch_job.job_id,
     ) as trajectory:
+        resolved_sources = _resolve_source_specs(trajectory, file_job.sources, None)
+        expected_source_frames = _resolved_source_frames(
+            trajectory,
+            resolved_sources,
+            file_job.frames,
+        )
         exists = trajectory.store.has_boundary_set(file_job.boundary_set)
         library_result: BoundaryLibraryResult | None = None
         reused = False
@@ -477,7 +533,7 @@ def _run_boundary_file(
         )
         if exists and file_job.reuse_existing and not overwrite_library:
             view = trajectory.boundary_library(file_job.boundary_set)
-            _validate_existing_sources(view, file_job.sources)
+            _validate_existing_sources(view, resolved_sources, expected_source_frames)
             _validate_existing_sampling(view, file_job.point_spacing)
             if file_job.coordinate_scale is not None:
                 import numpy as np
@@ -496,7 +552,7 @@ def _run_boundary_file(
             library_result = build_boundary_library(
                 trajectory,
                 file_job.boundary_set,
-                sources=file_job.sources,
+                sources=resolved_sources,
                 frames=file_job.frames or None,
                 coordinate_scale=file_job.coordinate_scale,
                 point_spacing=file_job.point_spacing,
@@ -534,6 +590,7 @@ def _run_boundary_file(
                 backend=geometry_job.backend,  # type: ignore[arg-type]
                 source_names=geometry_job.source_names or None,
                 source_roles=geometry_job.source_roles or None,
+                source_refs=geometry_job.source_refs or None,
                 library=view,
                 overwrite=overwrite,
                 save_outputs=False,
@@ -570,8 +627,19 @@ def _run_boundary_file(
                 continue
             source_names = neighbor_job.target_names if reverse else neighbor_job.source_names
             source_roles = neighbor_job.target_roles if reverse else neighbor_job.source_roles
+            source_refs = neighbor_job.target_refs if reverse else neighbor_job.source_refs
             target_names = neighbor_job.source_names if reverse else neighbor_job.target_names
             target_roles = neighbor_job.source_roles if reverse else neighbor_job.target_roles
+            target_refs = neighbor_job.source_refs if reverse else neighbor_job.target_refs
+            source_subset = neighbor_job.target_subset if reverse else neighbor_job.source_subset
+            target_subset = neighbor_job.source_subset if reverse else neighbor_job.target_subset
+            if str(source_subset.get("mode") or "whole") != "whole" or str(
+                target_subset.get("mode") or "whole"
+            ) != "whole":
+                raise ValueError(
+                    "Boundary entity subsets require a resolved classification/attribute selector; "
+                    "only mode='whole' is currently executable"
+                )
             result = compute_boundary_neighbors(
                 trajectory,
                 file_job.boundary_set,
@@ -579,8 +647,12 @@ def _run_boundary_file(
                 k=neighbor_job.k,
                 source_names=source_names or None,
                 source_roles=source_roles or None,
+                source_refs=source_refs or None,
                 target_names=target_names or None,
                 target_roles=target_roles or None,
+                target_refs=target_refs or None,
+                source_subset=source_subset,
+                target_subset=target_subset,
                 same_frame=neighbor_job.same_frame,
                 exclude_same_entity=neighbor_job.exclude_same_entity,
                 max_distance=neighbor_job.max_distance,
@@ -659,6 +731,35 @@ def _run_boundary_file(
                     "metadata": {**batch_job.metadata, **file_job.metadata},
                 },
                 overwrite=True,
+            )
+            if not trajectory.store.has_boundary_set(file_job.boundary_set):
+                raise RuntimeError(
+                    f"Boundary commit completed without creating /boundaries/{file_job.boundary_set}"
+                )
+            committed_view = trajectory.boundary_library(file_job.boundary_set)
+            missing_geometry = sorted(
+                result.geometry_set
+                for result, _overwrite in geometry_results
+                if result.geometry_set not in committed_view.geometry_sets()
+            )
+            missing_neighbors = sorted(
+                result.neighbor_set
+                for result, _overwrite in neighbor_results
+                if result.neighbor_set not in committed_view.neighbor_sets()
+            )
+            if missing_geometry or missing_neighbors:
+                raise RuntimeError(
+                    "Boundary commit verification failed: "
+                    f"missing geometry={missing_geometry}, missing neighbors={missing_neighbors}"
+                )
+            emit(
+                {
+                    **common,
+                    "event": "boundary_commit_completed",
+                    "boundary_path": f"/boundaries/{file_job.boundary_set}",
+                    "geometry_sets_written": [result.geometry_set for result, _overwrite in geometry_results],
+                    "neighbor_sets_written": [result.neighbor_set for result, _overwrite in neighbor_results],
+                }
             )
     summary.completed += 1
     summary.entities += entity_count

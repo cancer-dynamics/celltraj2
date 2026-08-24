@@ -49,10 +49,19 @@ class TrackingFileJob:
     boundary_source_name: str | None = None
     boundary_source_role: str | None = None
     ot_cost_cutoff: float = float("inf")
-    ot_method: str = "emd"
+    ot_method: str = "unbalanced"
     sinkhorn_regularization: float = 0.05
+    unbalanced_reach: float = 2.0
+    partial_mass: float = 0.9
+    max_transport_distance: float | None = 5.0
+    min_source_coverage: float = 0.5
+    min_target_coverage: float = 0.5
     max_boundary_points: int | None = 512
     mass_tolerance: float = 1e-12
+    relative_mass_tolerance: float = 1e-3
+    retained_mass_fraction: float = 0.999
+    mass_mode: str = "probability"
+    cost_prealign: str = "none"
     save_motion: bool = False
     enabled: bool = True
     overwrite: bool = False
@@ -112,12 +121,24 @@ class TrackingFileJob:
                 else str(payload.get("boundary_source_role"))
             ),
             ot_cost_cutoff=float(payload.get("ot_cost_cutoff", float("inf"))),
-            ot_method=str(payload.get("ot_method") or "emd").lower(),
+            ot_method=str(payload.get("ot_method") or "unbalanced").lower(),
             sinkhorn_regularization=float(payload.get("sinkhorn_regularization", 0.05)),
+            unbalanced_reach=float(payload.get("unbalanced_reach", 2.0)),
+            partial_mass=float(payload.get("partial_mass", 0.9)),
+            max_transport_distance=(
+                None if payload.get("max_transport_distance", 5.0) in (None, "")
+                else float(payload.get("max_transport_distance", 5.0))
+            ),
+            min_source_coverage=float(payload.get("min_source_coverage", payload.get("min_coverage", 0.5))),
+            min_target_coverage=float(payload.get("min_target_coverage", payload.get("min_coverage", 0.5))),
             max_boundary_points=(
                 None if max_boundary_points_value in (None, "") else int(max_boundary_points_value)
             ),
             mass_tolerance=float(payload.get("mass_tolerance", 1e-12)),
+            relative_mass_tolerance=float(payload.get("relative_mass_tolerance", 1e-3)),
+            retained_mass_fraction=float(payload.get("retained_mass_fraction", 0.999)),
+            mass_mode=str(payload.get("mass_mode") or "probability"),
+            cost_prealign=str(payload.get("cost_prealign") or "none"),
             save_motion=bool(payload.get("save_motion", False)),
             enabled=bool(payload.get("enabled", True)),
             overwrite=bool(payload.get("overwrite", False)),
@@ -335,8 +356,17 @@ def _run_file_job(
                 registration_set=file_job.registration_set,
                 ot_method=file_job.ot_method,
                 sinkhorn_regularization=file_job.sinkhorn_regularization,
+                unbalanced_reach=file_job.unbalanced_reach,
+                partial_mass=file_job.partial_mass,
+                max_transport_distance=file_job.max_transport_distance,
+                min_source_coverage=file_job.min_source_coverage,
+                min_target_coverage=file_job.min_target_coverage,
                 max_boundary_points=file_job.max_boundary_points,
                 mass_tolerance=file_job.mass_tolerance,
+                relative_mass_tolerance=file_job.relative_mass_tolerance,
+                retained_mass_fraction=file_job.retained_mass_fraction,
+                mass_mode=file_job.mass_mode,
+                cost_prealign=file_job.cost_prealign,
                 save_motion=file_job.save_motion,
                 overwrite=overwrite,
                 save_outputs=False,
@@ -383,6 +413,7 @@ def _run_file_job(
                     result.motion_result.motion_set,
                     links=result.motion_result.links,
                     transport=result.motion_result.transport,
+                    point_summaries=result.motion_result.point_summaries,
                     schema=result.motion_result.schema,
                     overwrite=overwrite,
                 )

@@ -121,6 +121,73 @@ class BatchSegmentationTests(unittest.TestCase):
             self.assertFalse(frame_event["effective_do_3D"])
             self.assertEqual(frame_event["frame_axes"], ["Y", "X", "C"])
 
+    def test_batch_2d_mode_segments_every_z_plane_and_stacks_unique_labels(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "sample_z_stack.ct2.h5"
+            metadata = TrajectoryMetadata(
+                roi_id="sample_XY001_ROI001",
+                dataset_id="sample",
+                frame_count=1,
+                image_source=ImageSourceSpec(source_type="embedded_h5", axes=("Z", "Y", "X", "C")),
+            )
+            with TrajectoryStore.create(path, metadata=metadata) as store:
+                frame = self.np.zeros((3, 4, 5, 1), dtype=self.np.uint16)
+                for z_index in range(3):
+                    frame[z_index, ..., 0] = z_index + 1
+                store.write_raw_frame(1, frame)
+
+            seen_z_indices = []
+
+            def fake_segmenter(image, file_job, frame):
+                self.assertEqual(frame, 1)
+                self.assertFalse(file_job.do_3d)
+                self.assertEqual(image.shape, (4, 5))
+                seen_z_indices.append(file_job.z_index)
+                labels = self.np.zeros((4, 5), dtype=self.np.int32)
+                labels[1:3, 1:4] = 1
+                return SegmentationResult(
+                    labels=labels,
+                    metadata={"engine": "fake", "z_index": file_job.z_index},
+                )
+
+            events = []
+            summary = run_batch_segmentation(
+                {
+                    "job_id": "seg_slice_wise",
+                    "files": [
+                        {
+                            "h5_path": str(path),
+                            "label_set": "cyto",
+                            "overwrite": True,
+                            "frames": {"mode": "all"},
+                            "backend": {"backend_id": "fake", "parameters": {"do_3D": False}},
+                            "model_input": {
+                                "do_3D": False,
+                                "channel_specs": [
+                                    {"channel_indices": [0], "normalization": "raw", "combination": "single"}
+                                ],
+                            },
+                        }
+                    ],
+                },
+                fake_segmenter,
+                reporter=lambda event: events.append(dict(event)),
+            )
+
+            self.assertEqual(summary.completed, 1)
+            self.assertEqual(seen_z_indices, [0, 1, 2])
+            with TrajectoryStore.open(path, mode="r") as store:
+                labels = store.read_label_frame("cyto", 1)
+            self.assertEqual(labels.shape, (3, 4, 5))
+            self.assertEqual(sorted(int(value) for value in self.np.unique(labels) if value > 0), [1, 2, 3])
+            slice_events = [event for event in events if event.get("event") == "z_slice_completed"]
+            self.assertEqual([event["z"] for event in slice_events], [1, 2, 3])
+            frame_event = next(event for event in events if event.get("event") == "frame_completed")
+            self.assertFalse(frame_event["effective_do_3D"])
+            self.assertTrue(frame_event["slice_wise_2D"])
+            self.assertEqual(frame_event["z_count"], 3)
+            self.assertEqual(frame_event["label_summary"]["shape"], [3, 4, 5])
+
     def test_batch_segmentation_skips_existing_labels_without_overwrite(self):
         with TemporaryDirectory() as tmp:
             path = Path(tmp) / "sample.ct2.h5"

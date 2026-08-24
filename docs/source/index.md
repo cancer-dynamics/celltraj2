@@ -24,6 +24,7 @@ getting_started/quickstart
 :caption: Concepts
 
 concepts/data_contract
+concepts/boundary_transport
 concepts/sitelab_handoff
 concepts/batch_segmentation
 concepts/h5_access_and_logging

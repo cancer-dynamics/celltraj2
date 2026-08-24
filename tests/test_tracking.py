@@ -173,6 +173,26 @@ class SparseTrackingTests(unittest.TestCase):
         self.assertEqual(job.files[0].max_distance, 7.5)
         self.assertEqual(job.files[0].coordinate_scale, (2.0, 1.0, 1.0))
         self.assertEqual(job.files[0].metadata["distance_unit"], "um")
+        robust = TrackingFileJob.from_dict(
+            {
+                "h5_path": "sample.h5",
+                "object_set": "cells",
+                "method": "boundary_ot",
+                "ot_method": "unbalanced",
+                "unbalanced_reach": 1.5,
+                "max_transport_distance": 4.0,
+                "min_coverage": 0.6,
+                "relative_mass_tolerance": 0.002,
+                "retained_mass_fraction": 0.995,
+            }
+        )
+        self.assertEqual(robust.ot_method, "unbalanced")
+        self.assertEqual(robust.unbalanced_reach, 1.5)
+        self.assertEqual(robust.max_transport_distance, 4.0)
+        self.assertEqual(robust.min_source_coverage, 0.6)
+        self.assertEqual(robust.min_target_coverage, 0.6)
+        self.assertEqual(robust.relative_mass_tolerance, 0.002)
+        self.assertEqual(robust.retained_mass_fraction, 0.995)
         with self.assertRaises(ValueError):
             TrackingFileJob.from_dict(
                 {"h5_path": "sample.h5", "object_set": "cells", "method": "optimal_transport"}

@@ -646,6 +646,7 @@ class TrajectoryStore:
         links: Any,
         transport: Mapping[str, Any],
         schema: Mapping[str, Any],
+        point_summaries: Mapping[str, Mapping[str, Any]] | None = None,
         overwrite: bool = False,
     ) -> str:
         """Write entity links and sparse point-level transport edges."""
@@ -677,6 +678,22 @@ class TrajectoryStore:
                 str(column_name), data=column_values, compression="gzip", shuffle=True
             )
             dataset.attrs["row_alignment"] = "transport_edge"
+        for summary_name, columns in dict(point_summaries or {}).items():
+            summary_group = group.require_group(str(summary_name))
+            summary_count: int | None = None
+            for column_name, column_values in columns.items():
+                actual = int(getattr(column_values, "shape", (0,))[0])
+                if summary_count is None:
+                    summary_count = actual
+                elif actual != summary_count:
+                    raise ValueError(
+                        f"Boundary {summary_name} column {column_name!r} has {actual} rows; "
+                        f"expected {summary_count}"
+                    )
+                dataset = summary_group.create_dataset(
+                    str(column_name), data=column_values, compression="gzip", shuffle=True
+                )
+                dataset.attrs["row_alignment"] = str(summary_name)
         self.write_json(f"/{group_path}/schema.json", dict(schema), overwrite=True)
         self._mark_mutation(group_path)
         return f"/{group_path}"
@@ -689,6 +706,14 @@ class TrajectoryStore:
         return {
             "links": group["links"][()],
             "transport": {str(key): group["transport"][key][()] for key in group["transport"].keys()},
+            "point_summaries": {
+                str(summary_name): {
+                    str(key): group[summary_name][key][()]
+                    for key in group[summary_name].keys()
+                }
+                for summary_name in ("source_summary", "target_summary")
+                if summary_name in group
+            },
             "schema": self.read_json(f"/{group_path}/schema.json"),
         }
 

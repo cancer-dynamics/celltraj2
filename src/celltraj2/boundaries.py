@@ -83,8 +83,24 @@ def boundary_motion_link_dtype() -> Any:
             ("target_frame", "<i4"),
             ("transport_start", "<i8"),
             ("transport_count", "<i8"),
+            ("source_summary_start", "<i8"),
+            ("source_summary_count", "<i8"),
+            ("target_summary_start", "<i8"),
+            ("target_summary_count", "<i8"),
             ("ot_cost", "<f8"),
+            ("transport_cost", "<f8"),
+            ("ot_objective", "<f8"),
+            ("matched_mean_cost", "<f8"),
             ("transported_mass", "<f8"),
+            ("source_coverage", "<f8"),
+            ("target_coverage", "<f8"),
+            ("dropped_mass", "<f8"),
+            ("edge_distance_p50", "<f8"),
+            ("edge_distance_p90", "<f8"),
+            ("edge_distance_p99", "<f8"),
+            ("edge_distance_max", "<f8"),
+            ("solver_iterations", "<i4"),
+            ("solver_converged", "u1"),
             ("quality_flags", "<u4"),
         ]
     )
@@ -201,7 +217,14 @@ class BoundaryNeighborResult:
 
 @dataclass(frozen=True)
 class BoundaryTransportPlan:
-    """Sparse representation of one optimal-transport plan."""
+    """Sparse transport edges plus diagnostics for one boundary pair.
+
+    ``total_cost`` is the score intended for comparing candidate object links.
+    It is the full regularized objective for unbalanced transport and the
+    matched mean distance for balanced or fixed-mass partial transport.
+    ``transport_cost`` always means ``sum(mass * edge_distance)`` before
+    output sparsification.
+    """
 
     source_rows: Any
     target_rows: Any
@@ -209,6 +232,36 @@ class BoundaryTransportPlan:
     edge_cost: Any
     total_cost: float
     method: str
+    transport_cost: float = 0.0
+    objective: float = 0.0
+    matched_mean_cost: float = float("nan")
+    source_total_mass: float = 0.0
+    target_total_mass: float = 0.0
+    transported_mass: float = 0.0
+    source_coverage: float = 0.0
+    target_coverage: float = 0.0
+    dropped_mass: float = 0.0
+    raw_edge_count: int = 0
+    edge_distance_p50: float = float("nan")
+    edge_distance_p90: float = float("nan")
+    edge_distance_p99: float = float("nan")
+    edge_distance_max: float = float("nan")
+    solver_iterations: int = 0
+    solver_converged: bool = True
+    source_weights: Any = None
+    target_weights: Any = None
+    source_matched_mass: Any = None
+    target_matched_mass: Any = None
+
+
+@dataclass(frozen=True)
+class BoundaryPointSample:
+    """Deterministic spatial sample rows and represented point multiplicity."""
+
+    rows: Any
+    weights: Any
+    voxel_spacing: float
+    original_count: int
 
 
 class BoundaryLibraryView:
@@ -479,6 +532,7 @@ def resolve_boundary_source_ids(
     library: BoundaryDataView,
     *,
     source_ids: Sequence[int] | None = None,
+    source_refs: Sequence[Mapping[str, Any]] | None = None,
     source_names: Sequence[str] | None = None,
     source_roles: Sequence[str] | None = None,
     require_one: bool = False,
@@ -490,7 +544,9 @@ def resolve_boundary_source_ids(
     error rather than a silently empty calculation.
     """
 
-    selectors_used = any(value is not None for value in (source_ids, source_names, source_roles))
+    selectors_used = any(
+        value is not None for value in (source_ids, source_refs, source_names, source_roles)
+    )
     if not selectors_used:
         if require_one:
             if len(library.sources) != 1:
@@ -500,6 +556,18 @@ def resolve_boundary_source_ids(
     selected = {int(value["source_id"]) for value in library.sources}
     if source_ids is not None:
         selected &= {int(value) for value in source_ids}
+    if source_refs is not None:
+        refs = {
+            (str(value.get("kind") or ""), str(value.get("name") or ""))
+            for value in source_refs
+        }
+        if any(not kind or not name for kind, name in refs):
+            raise ValueError("Boundary source references require kind and name")
+        selected &= {
+            int(value["source_id"])
+            for value in library.sources
+            if (str(value.get("kind") or ""), str(value.get("name") or "")) in refs
+        }
     if source_names is not None:
         names = {str(value) for value in source_names}
         selected &= {
@@ -1078,6 +1146,7 @@ def compute_boundary_geometry(
     knn: int = 40,
     backend: Literal["auto", "pcdiff", "local"] = "auto",
     source_ids: Sequence[int] | None = None,
+    source_refs: Sequence[Mapping[str, Any]] | None = None,
     source_names: Sequence[str] | None = None,
     source_roles: Sequence[str] | None = None,
     library: BoundaryLibraryResult | BoundaryDataView | None = None,
@@ -1096,6 +1165,7 @@ def compute_boundary_geometry(
     selected_source_ids = resolve_boundary_source_ids(
         view,
         source_ids=source_ids,
+        source_refs=source_refs,
         source_names=source_names,
         source_roles=source_roles,
     )
@@ -1205,6 +1275,7 @@ def compute_boundary_geometry(
         "selected_source_ids": (
             "all" if selected_source_ids is None else sorted(selected_source_ids)
         ),
+        "source_refs": None if source_refs is None else _json_safe(list(source_refs)),
         "normal_orientation": "mask_inside_to_outside_hint_with_centroid_fallback",
         "shape_operator": "minus_surface_gradient_of_oriented_normal",
         "curvature_sign": "positive_when_shape_operator_eigenvalue_is_positive_for_stored_outward_normal",
@@ -1315,11 +1386,15 @@ def compute_boundary_neighbors(
     source_entity_ids: Sequence[int] | None = None,
     target_entity_ids: Sequence[int] | None = None,
     source_ids: Sequence[int] | None = None,
+    source_refs: Sequence[Mapping[str, Any]] | None = None,
     source_names: Sequence[str] | None = None,
     source_roles: Sequence[str] | None = None,
     target_ids: Sequence[int] | None = None,
+    target_refs: Sequence[Mapping[str, Any]] | None = None,
     target_names: Sequence[str] | None = None,
     target_roles: Sequence[str] | None = None,
+    source_subset: Mapping[str, Any] | None = None,
+    target_subset: Mapping[str, Any] | None = None,
     same_frame: bool = True,
     exclude_same_entity: bool = True,
     max_distance: float | None = None,
@@ -1341,12 +1416,14 @@ def compute_boundary_neighbors(
     selected_source_ids = resolve_boundary_source_ids(
         view,
         source_ids=source_ids,
+        source_refs=source_refs,
         source_names=source_names,
         source_roles=source_roles,
     )
     selected_target_ids = resolve_boundary_source_ids(
         view,
         source_ids=target_ids,
+        source_refs=target_refs,
         source_names=target_names,
         source_roles=target_roles,
     )
@@ -1437,6 +1514,10 @@ def compute_boundary_neighbors(
         ),
         "source_ids": "all" if selected_source_ids is None else sorted(selected_source_ids),
         "target_ids": "all" if selected_target_ids is None else sorted(selected_target_ids),
+        "source_refs": None if source_refs is None else _json_safe(list(source_refs)),
+        "target_refs": None if target_refs is None else _json_safe(list(target_refs)),
+        "source_subset": _json_safe(dict(source_subset or {"mode": "whole"})),
+        "target_subset": _json_safe(dict(target_subset or {"mode": "whole"})),
         "edge_count": int(indices.shape[0]),
         "metadata": _json_safe(dict(metadata or {})),
     }
@@ -1481,23 +1562,67 @@ def optimal_transport_plan(
     source_points: Any,
     target_points: Any,
     *,
-    method: Literal["emd", "sinkhorn"] = "emd",
+    method: Literal["emd", "sinkhorn", "unbalanced", "partial"] = "emd",
     regularization: float = 0.05,
+    unbalanced_reach: float | Sequence[float] = 2.0,
+    partial_mass: float = 0.9,
+    max_transport_distance: float | None = None,
+    source_weights: Any | None = None,
+    target_weights: Any | None = None,
     mass_tolerance: float = 1e-12,
+    relative_mass_tolerance: float = 0.0,
+    retained_mass_fraction: float = 1.0,
     max_iterations: int = 10_000,
 ) -> BoundaryTransportPlan:
-    """Compute a uniform-mass OT plan and return only non-negligible edges."""
+    """Compute a balanced, unbalanced, or partial boundary transport plan.
+
+    ``unbalanced`` uses a log-domain generalized Sinkhorn iteration and can
+    leave unsupported source or target mass unmatched. ``partial`` transports
+    a fixed fraction of the smaller input mass. A finite
+    ``max_transport_distance`` is an exact support constraint for those two
+    unmatched-aware methods. Balanced methods deliberately reject that option
+    because a hard gate can make their marginal constraints infeasible.
+
+    Output sparsification happens after solving. It removes numerical tails by
+    absolute mass, mass relative to each source marginal, and retained
+    cumulative mass while reporting how much mass was omitted.
+    """
 
     np = _require_numpy()
     source = np.asarray(source_points, dtype=float)
     target = np.asarray(target_points, dtype=float)
+    if source.ndim != 2 or target.ndim != 2 or source.shape[1] != target.shape[1]:
+        raise ValueError("source_points and target_points must be N x D and M x D")
     if not source.shape[0] or not target.shape[0]:
         raise ValueError("Optimal transport requires non-empty source and target points")
     cost = pairwise_distance_matrix(source, target)
-    a = np.full(source.shape[0], 1.0 / source.shape[0], dtype=float)
-    b = np.full(target.shape[0], 1.0 / target.shape[0], dtype=float)
+    a = _transport_weights(source_weights, source.shape[0], name="source_weights", np=np)
+    b = _transport_weights(target_weights, target.shape[0], name="target_weights", np=np)
+    absolute_tolerance = float(mass_tolerance)
+    relative_tolerance = float(relative_mass_tolerance)
+    retained_fraction = float(retained_mass_fraction)
+    if not np.isfinite(absolute_tolerance) or absolute_tolerance < 0:
+        raise ValueError("mass_tolerance must be finite and >= 0")
+    if not np.isfinite(relative_tolerance) or relative_tolerance < 0:
+        raise ValueError("relative_mass_tolerance must be finite and >= 0")
+    if not np.isfinite(retained_fraction) or retained_fraction <= 0 or retained_fraction > 1:
+        raise ValueError("retained_mass_fraction must be in (0, 1]")
+    support = np.ones(cost.shape, dtype=bool)
+    if max_transport_distance is not None:
+        distance_limit = float(max_transport_distance)
+        if not np.isfinite(distance_limit) or distance_limit <= 0:
+            raise ValueError("max_transport_distance must be finite and > 0")
+        if method in {"emd", "sinkhorn"}:
+            raise ValueError(
+                "A hard max_transport_distance requires unbalanced or partial transport"
+            )
+        support = cost <= distance_limit
     selected_method = method
+    solver_iterations = 0
+    solver_converged = True
     if method == "emd":
+        if not np.isclose(np.sum(a), np.sum(b), rtol=1e-10, atol=1e-12):
+            raise ValueError("Balanced EMD requires equal source and target total mass")
         try:
             import ot  # type: ignore
 
@@ -1529,6 +1654,8 @@ def optimal_transport_plan(
             plan = solution.x.reshape(cost.shape)
             selected_method = "scipy.optimize.linprog_highs"
     elif method == "sinkhorn":
+        if not np.isclose(np.sum(a), np.sum(b), rtol=1e-10, atol=1e-12):
+            raise ValueError("Balanced Sinkhorn requires equal source and target total mass")
         epsilon = float(regularization)
         if not np.isfinite(epsilon) or epsilon <= 0:
             raise ValueError("regularization must be finite and > 0")
@@ -1536,27 +1663,481 @@ def optimal_transport_plan(
         kernel = np.maximum(kernel, np.finfo(float).tiny)
         u = np.ones_like(a)
         v = np.ones_like(b)
-        for _ in range(int(max_iterations)):
+        solver_converged = False
+        for iteration in range(int(max_iterations)):
             previous = u
             u = a / np.maximum(kernel @ v, np.finfo(float).tiny)
             v = b / np.maximum(kernel.T @ u, np.finfo(float).tiny)
             if np.max(np.abs(u - previous)) < 1e-10:
+                solver_converged = True
+                solver_iterations = iteration + 1
                 break
+        if not solver_converged:
+            solver_iterations = int(max_iterations)
         plan = (u[:, None] * kernel) * v[None, :]
         selected_method = "numpy.sinkhorn"
+    elif method == "unbalanced":
+        epsilon = float(regularization)
+        if not np.isfinite(epsilon) or epsilon <= 0:
+            raise ValueError("regularization must be finite and > 0")
+        reach_values = (
+            tuple(float(value) for value in unbalanced_reach)
+            if isinstance(unbalanced_reach, Sequence)
+            and not isinstance(unbalanced_reach, (str, bytes))
+            else (float(unbalanced_reach), float(unbalanced_reach))
+        )
+        if len(reach_values) != 2 or any(
+            not np.isfinite(value) or value <= 0 for value in reach_values
+        ):
+            raise ValueError("unbalanced_reach must contain one or two finite values > 0")
+        plan, solver_iterations, solver_converged, selected_method = _sinkhorn_unbalanced(
+            a,
+            b,
+            cost,
+            support=support,
+            regularization=epsilon,
+            source_reach=reach_values[0],
+            target_reach=reach_values[1],
+            max_iterations=max_iterations,
+            np=np,
+        )
+    elif method == "partial":
+        fraction = float(partial_mass)
+        if not np.isfinite(fraction) or fraction <= 0 or fraction > 1:
+            raise ValueError("partial_mass must be in (0, 1]")
+        transported = fraction * min(float(np.sum(a)), float(np.sum(b)))
+        plan, selected_method = _partial_transport_plan(
+            a,
+            b,
+            cost,
+            support=support,
+            transported_mass=transported,
+            max_iterations=max_iterations,
+            np=np,
+        )
     else:
         raise ValueError(f"Unsupported OT method {method!r}")
-    source_rows, target_rows = np.nonzero(plan > float(mass_tolerance))
+
+    plan = np.asarray(plan, dtype=float)
+    plan[~support] = 0.0
+    plan = np.maximum(plan, 0.0)
+    source_marginal = np.sum(plan, axis=1)
+    target_marginal = np.sum(plan, axis=0)
+    transported_mass = float(np.sum(plan))
+    source_coverage_mass = float(np.sum(np.minimum(source_marginal, a)))
+    target_coverage_mass = float(np.sum(np.minimum(target_marginal, b)))
+    transport_cost = float(np.sum(plan * cost))
+    matched_mean_cost = (
+        transport_cost / transported_mass if transported_mass > 0 else float("nan")
+    )
+    if method == "unbalanced":
+        source_reach, target_reach = reach_values
+        objective = float(
+            transport_cost
+            + float(regularization) * _generalized_kl_plan(plan, a, b, np=np)
+            + source_reach * _generalized_kl(source_marginal, a, np=np)
+            + target_reach * _generalized_kl(target_marginal, b, np=np)
+        )
+        score = objective
+    else:
+        objective = transport_cost
+        score = matched_mean_cost
+    source_rows, target_rows, dropped_mass, raw_edge_count = _sparsify_transport_plan(
+        plan,
+        mass_tolerance=absolute_tolerance,
+        relative_mass_tolerance=relative_tolerance,
+        retained_mass_fraction=retained_fraction,
+        np=np,
+    )
     masses = plan[source_rows, target_rows]
     edge_cost = cost[source_rows, target_rows]
+    quantiles = _weighted_quantiles(
+        cost[plan > 0],
+        plan[plan > 0],
+        (0.50, 0.90, 0.99),
+        np=np,
+    )
     return BoundaryTransportPlan(
         source_rows=source_rows.astype(np.int64),
         target_rows=target_rows.astype(np.int64),
         mass=masses.astype(np.float64),
         edge_cost=edge_cost.astype(np.float64),
-        total_cost=float(np.sum(masses * edge_cost)),
+        total_cost=float(score),
         method=selected_method,
+        transport_cost=transport_cost,
+        objective=objective,
+        matched_mean_cost=float(matched_mean_cost),
+        source_total_mass=float(np.sum(a)),
+        target_total_mass=float(np.sum(b)),
+        transported_mass=transported_mass,
+        source_coverage=(source_coverage_mass / float(np.sum(a))) if np.sum(a) > 0 else 0.0,
+        target_coverage=(target_coverage_mass / float(np.sum(b))) if np.sum(b) > 0 else 0.0,
+        dropped_mass=float(dropped_mass),
+        raw_edge_count=int(raw_edge_count),
+        edge_distance_p50=float(quantiles[0]),
+        edge_distance_p90=float(quantiles[1]),
+        edge_distance_p99=float(quantiles[2]),
+        edge_distance_max=float(np.max(cost[plan > 0])) if np.any(plan > 0) else float("nan"),
+        solver_iterations=int(solver_iterations),
+        solver_converged=bool(solver_converged),
+        source_weights=a,
+        target_weights=b,
+        source_matched_mass=source_marginal,
+        target_matched_mass=target_marginal,
     )
+
+
+def _transport_weights(values: Any | None, count: int, *, name: str, np: Any) -> Any:
+    if values is None:
+        return np.full(int(count), 1.0 / int(count), dtype=float)
+    result = np.asarray(values, dtype=float).reshape(-1)
+    if result.shape[0] != int(count):
+        raise ValueError(f"{name} must have {int(count)} rows")
+    if not np.all(np.isfinite(result)) or np.any(result < 0) or not np.any(result > 0):
+        raise ValueError(f"{name} must be finite, non-negative, and contain positive mass")
+    return result
+
+
+def _logsumexp(values: Any, *, axis: int, np: Any) -> Any:
+    maximum = np.max(values, axis=axis)
+    finite = np.isfinite(maximum)
+    safe_maximum = np.where(finite, maximum, 0.0)
+    shifted = values - np.expand_dims(safe_maximum, axis=axis)
+    total = np.sum(np.exp(shifted), axis=axis)
+    output = safe_maximum + np.log(np.maximum(total, np.finfo(float).tiny))
+    return np.where(finite, output, -np.inf)
+
+
+def _sinkhorn_unbalanced(
+    a: Any,
+    b: Any,
+    cost: Any,
+    *,
+    support: Any,
+    regularization: float,
+    source_reach: float,
+    target_reach: float,
+    max_iterations: int,
+    np: Any,
+) -> tuple[Any, int, bool, str]:
+    reference = a[:, None] * b[None, :]
+    kernel = np.where(
+        support,
+        reference * np.exp(np.maximum(-cost / float(regularization), -745.0)),
+        0.0,
+    )
+    # A supported edge that underflowed to zero cannot be recovered by matrix
+    # scaling. Use the slower log-domain path for that numerically difficult
+    # case instead of silently shrinking the hard support.
+    if np.any(support & (kernel == 0)):
+        plan, iterations, converged = _sinkhorn_unbalanced_log(
+            a,
+            b,
+            cost,
+            support=support,
+            regularization=regularization,
+            source_reach=source_reach,
+            target_reach=target_reach,
+            max_iterations=max_iterations,
+            np=np,
+        )
+        return plan, iterations, converged, "numpy.sinkhorn_unbalanced_log"
+    source_exponent = float(source_reach) / (float(source_reach) + float(regularization))
+    target_exponent = float(target_reach) / (float(target_reach) + float(regularization))
+    u = np.ones_like(a)
+    v = np.ones_like(b)
+    converged = False
+    iterations = int(max_iterations)
+    tiny = np.finfo(float).tiny
+    for iteration in range(int(max_iterations)):
+        previous_u = u.copy()
+        denominator = kernel @ v
+        u = np.zeros_like(a)
+        valid_source = denominator > tiny
+        u[valid_source] = (a[valid_source] / denominator[valid_source]) ** source_exponent
+        denominator = kernel.T @ u
+        v = np.zeros_like(b)
+        valid_target = denominator > tiny
+        v[valid_target] = (b[valid_target] / denominator[valid_target]) ** target_exponent
+        if not np.all(np.isfinite(u)) or not np.all(np.isfinite(v)):
+            break
+        relative_change = np.max(np.abs(u - previous_u) / np.maximum(1.0, np.abs(previous_u)))
+        if relative_change < 1e-8:
+            converged = True
+            iterations = iteration + 1
+            break
+    if converged:
+        return (u[:, None] * kernel) * v[None, :], iterations, True, "numpy.sinkhorn_unbalanced_scaling"
+    plan, log_iterations, log_converged = _sinkhorn_unbalanced_log(
+        a,
+        b,
+        cost,
+        support=support,
+        regularization=regularization,
+        source_reach=source_reach,
+        target_reach=target_reach,
+        max_iterations=max_iterations,
+        np=np,
+    )
+    return plan, log_iterations, log_converged, "numpy.sinkhorn_unbalanced_log_fallback"
+
+
+def _sinkhorn_unbalanced_log(
+    a: Any,
+    b: Any,
+    cost: Any,
+    *,
+    support: Any,
+    regularization: float,
+    source_reach: float,
+    target_reach: float,
+    max_iterations: int,
+    np: Any,
+) -> tuple[Any, int, bool]:
+    log_a = np.log(np.maximum(a, np.finfo(float).tiny))
+    log_b = np.log(np.maximum(b, np.finfo(float).tiny))
+    log_kernel = np.where(
+        support,
+        log_a[:, None] + log_b[None, :] - cost / float(regularization),
+        -np.inf,
+    )
+    source_exponent = float(source_reach) / (float(source_reach) + float(regularization))
+    target_exponent = float(target_reach) / (float(target_reach) + float(regularization))
+    log_u = np.zeros_like(a)
+    log_v = np.zeros_like(b)
+    converged = False
+    iterations = int(max_iterations)
+    for iteration in range(int(max_iterations)):
+        previous_u = log_u.copy()
+        source_lse = _logsumexp(log_kernel + log_v[None, :], axis=1, np=np)
+        log_u = np.where(
+            np.isfinite(source_lse),
+            source_exponent * (log_a - source_lse),
+            0.0,
+        )
+        target_lse = _logsumexp(log_kernel + log_u[:, None], axis=0, np=np)
+        log_v = np.where(
+            np.isfinite(target_lse),
+            target_exponent * (log_b - target_lse),
+            0.0,
+        )
+        if np.max(np.abs(log_u - previous_u)) < 1e-10:
+            converged = True
+            iterations = iteration + 1
+            break
+    log_plan = log_u[:, None] + log_kernel + log_v[None, :]
+    return np.where(support, np.exp(np.minimum(log_plan, 700.0)), 0.0), iterations, converged
+
+
+def _partial_transport_plan(
+    a: Any,
+    b: Any,
+    cost: Any,
+    *,
+    support: Any,
+    transported_mass: float,
+    max_iterations: int,
+    np: Any,
+) -> tuple[Any, str]:
+    valid_rows, valid_columns = np.nonzero(support)
+    if not valid_rows.size:
+        raise ValueError("Partial transport has no point pairs inside max_transport_distance")
+    try:
+        import ot  # type: ignore
+
+        finite_cost = cost[support]
+        penalty = float(np.max(finite_cost) + max(1.0, np.ptp(finite_cost)) * 1e6)
+        solver_cost = np.where(support, cost, penalty)
+        result = np.asarray(
+            ot.partial.partial_wasserstein(
+                a,
+                b,
+                solver_cost,
+                m=float(transported_mass),
+                nb_dummies=1,
+                numItermax=int(max_iterations),
+            ),
+            dtype=float,
+        )
+        if float(np.sum(result[~support])) <= max(1e-10, transported_mass * 1e-8):
+            result[~support] = 0.0
+            return result, "pot.partial_wasserstein"
+    except ImportError:
+        pass
+    try:
+        from scipy.optimize import linprog  # type: ignore
+        from scipy.sparse import lil_matrix  # type: ignore
+    except ImportError as exc:
+        raise RuntimeError(
+            "Partial boundary OT requires POT or scipy. Install celltraj2 with the analysis extra."
+        ) from exc
+    edge_count = int(valid_rows.size)
+    constraints = lil_matrix((a.size + b.size, edge_count), dtype=float)
+    for edge, (row, column) in enumerate(zip(valid_rows, valid_columns, strict=False)):
+        constraints[int(row), edge] = 1.0
+        constraints[a.size + int(column), edge] = 1.0
+    solution = linprog(
+        cost[valid_rows, valid_columns],
+        A_ub=constraints.tocsr(),
+        b_ub=np.concatenate([a, b]),
+        A_eq=np.ones((1, edge_count), dtype=float),
+        b_eq=np.asarray([transported_mass], dtype=float),
+        bounds=(0.0, None),
+        method="highs",
+    )
+    if not solution.success:
+        raise RuntimeError(f"Partial boundary OT linear program failed: {solution.message}")
+    result = np.zeros(cost.shape, dtype=float)
+    result[valid_rows, valid_columns] = solution.x
+    return result, "scipy.optimize.partial_linprog_highs"
+
+
+def _generalized_kl(values: Any, reference: Any, *, np: Any) -> float:
+    values = np.asarray(values, dtype=float)
+    reference = np.asarray(reference, dtype=float)
+    positive = values > 0
+    terms = reference - values
+    terms[positive] += values[positive] * np.log(
+        values[positive] / np.maximum(reference[positive], np.finfo(float).tiny)
+    )
+    return float(np.sum(terms))
+
+
+def _generalized_kl_plan(plan: Any, a: Any, b: Any, *, np: Any) -> float:
+    return _generalized_kl(plan, a[:, None] * b[None, :], np=np)
+
+
+def _sparsify_transport_plan(
+    plan: Any,
+    *,
+    mass_tolerance: float,
+    relative_mass_tolerance: float,
+    retained_mass_fraction: float,
+    np: Any,
+) -> tuple[Any, Any, float, int]:
+    keep = np.zeros(plan.shape, dtype=bool)
+    raw = plan > 0
+    raw_edge_count = int(np.sum(raw))
+    for row in range(plan.shape[0]):
+        columns = np.flatnonzero(raw[row])
+        if not columns.size:
+            continue
+        masses = plan[row, columns]
+        order = np.argsort(-masses, kind="stable")
+        columns = columns[order]
+        masses = masses[order]
+        row_mass = float(np.sum(masses))
+        cumulative_before = np.concatenate(([0.0], np.cumsum(masses)[:-1]))
+        selected = (
+            (masses > float(mass_tolerance))
+            & (masses >= float(relative_mass_tolerance) * row_mass)
+            & (cumulative_before < float(retained_mass_fraction) * row_mass)
+        )
+        if not np.any(selected):
+            selected[0] = True
+        keep[row, columns[selected]] = True
+    source_rows, target_rows = np.nonzero(keep)
+    dropped_mass = float(np.sum(plan[raw & ~keep]))
+    return source_rows, target_rows, dropped_mass, raw_edge_count
+
+
+def _weighted_quantiles(values: Any, weights: Any, quantiles: Sequence[float], *, np: Any) -> Any:
+    values = np.asarray(values, dtype=float).reshape(-1)
+    weights = np.asarray(weights, dtype=float).reshape(-1)
+    if not values.size or not np.any(weights > 0):
+        return np.full(len(tuple(quantiles)), np.nan, dtype=float)
+    order = np.argsort(values, kind="stable")
+    ordered_values = values[order]
+    ordered_weights = weights[order]
+    cumulative = np.cumsum(ordered_weights)
+    cumulative /= cumulative[-1]
+    return np.asarray(
+        [ordered_values[min(int(np.searchsorted(cumulative, value, side="left")), values.size - 1)] for value in quantiles],
+        dtype=float,
+    )
+
+
+def common_density_point_samples(
+    source_points: Any,
+    target_points: Any,
+    max_points: int | None,
+    *,
+    mass_mode: Literal["probability", "surface_measure"] = "probability",
+    point_measure: float = 1.0,
+) -> tuple[BoundaryPointSample, BoundaryPointSample]:
+    """Sample two surfaces on one physical voxel grid.
+
+    When a point cap is active, both surfaces use the same voxel spacing. Each
+    retained point is weighted by the number of canonical points represented
+    by its voxel, avoiding row-order bias and making the result substantially
+    less sensitive to unequal source/target point counts.
+    """
+
+    np = _require_numpy()
+    source = np.asarray(source_points, dtype=float)
+    target = np.asarray(target_points, dtype=float)
+    if source.ndim != 2 or target.ndim != 2 or source.shape[1] != target.shape[1]:
+        raise ValueError("source_points and target_points must be N x D and M x D")
+    if mass_mode not in {"probability", "surface_measure"}:
+        raise ValueError("mass_mode must be 'probability' or 'surface_measure'")
+    if not np.isfinite(float(point_measure)) or float(point_measure) <= 0:
+        raise ValueError("point_measure must be finite and > 0")
+    if max_points is None or (
+        source.shape[0] <= int(max_points) and target.shape[0] <= int(max_points)
+    ):
+        spacing = 0.0
+    else:
+        if int(max_points) < 2:
+            raise ValueError("max_points must be >= 2 when provided")
+        spacing = _shared_voxel_spacing(source, target, int(max_points), np=np)
+    source_rows, source_counts = _voxel_sample_rows(source, spacing, np=np)
+    target_rows, target_counts = _voxel_sample_rows(target, spacing, np=np)
+
+    def weights(counts: Any) -> Any:
+        result = np.asarray(counts, dtype=float)
+        if mass_mode == "probability":
+            return result / np.sum(result)
+        return result * float(point_measure)
+
+    return (
+        BoundaryPointSample(source_rows, weights(source_counts), spacing, int(source.shape[0])),
+        BoundaryPointSample(target_rows, weights(target_counts), spacing, int(target.shape[0])),
+    )
+
+
+def _voxel_sample_rows(points: Any, spacing: float, *, np: Any) -> tuple[Any, Any]:
+    count = int(points.shape[0])
+    if spacing <= 0 or count == 0:
+        return np.arange(count, dtype=np.int64), np.ones(count, dtype=np.int64)
+    voxel = np.floor(points / float(spacing)).astype(np.int64)
+    _keys, first, inverse = np.unique(voxel, axis=0, return_index=True, return_inverse=True)
+    order = np.argsort(first, kind="stable")
+    rows = first[order].astype(np.int64)
+    counts = np.bincount(inverse, minlength=first.size)[order].astype(np.int64)
+    return rows, counts
+
+
+def _shared_voxel_spacing(source: Any, target: Any, max_points: int, *, np: Any) -> float:
+    combined = np.concatenate((source, target), axis=0)
+    extent = float(np.max(np.ptp(combined, axis=0))) if combined.size else 1.0
+    high = max(extent / max(1, int(max_points)), np.finfo(float).eps)
+
+    def fits(spacing: float) -> bool:
+        return (
+            _voxel_sample_rows(source, spacing, np=np)[0].size <= int(max_points)
+            and _voxel_sample_rows(target, spacing, np=np)[0].size <= int(max_points)
+        )
+
+    while not fits(high):
+        high *= 2.0
+    low = 0.0
+    for _ in range(40):
+        middle = (low + high) / 2.0
+        if fits(middle):
+            high = middle
+        else:
+            low = middle
+    return float(high)
 
 
 def deterministic_point_sample(point_count: int, max_points: int | None) -> Any:
@@ -1577,6 +2158,7 @@ __all__ = [
     "BoundaryLibraryView",
     "InMemoryBoundaryLibraryView",
     "BoundaryNeighborResult",
+    "BoundaryPointSample",
     "BoundarySourceSpec",
     "BoundaryTransportPlan",
     "boundary_entity_dtype",
@@ -1585,6 +2167,7 @@ __all__ = [
     "build_boundary_library",
     "compute_boundary_geometry",
     "compute_boundary_neighbors",
+    "common_density_point_samples",
     "resolve_boundary_source_ids",
     "deterministic_point_sample",
     "optimal_transport_plan",

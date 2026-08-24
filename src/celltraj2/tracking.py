@@ -290,6 +290,7 @@ class BoundaryMotionResult:
     transport: dict[str, Any]
     schema: dict[str, Any]
     saved: bool
+    point_summaries: dict[str, dict[str, Any]] = field(default_factory=dict)
     motion_path: str | None = None
     frame_counts: dict[int, dict[str, Any]] = field(default_factory=dict)
 
@@ -301,6 +302,11 @@ class BoundaryMotionResult:
     def transport_edge_count(self) -> int:
         return int(self.transport["mass"].shape[0])
 
+    @property
+    def source_summary_count(self) -> int:
+        values = self.point_summaries.get("source_summary", {}).get("point_id")
+        return int(values.shape[0]) if hasattr(values, "shape") else 0
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "object_set": self.object_set,
@@ -309,6 +315,7 @@ class BoundaryMotionResult:
             "motion_set": self.motion_set,
             "link_count": self.link_count,
             "transport_edge_count": self.transport_edge_count,
+            "source_summary_count": self.source_summary_count,
             "motion_path": self.motion_path,
             "saved": self.saved,
             "frame_counts": {str(key): dict(value) for key, value in self.frame_counts.items()},
@@ -585,6 +592,123 @@ def track_minimum_centroid_distance(
     )
 
 
+def _transport_pair_samples(
+    source_points: Mapping[str, Any],
+    target_points: Mapping[str, Any],
+    *,
+    max_boundary_points: int | None,
+    mass_mode: str,
+    point_measure: float,
+    cost_prealign: str,
+    np: Any,
+) -> dict[str, Any]:
+    from celltraj2.boundaries import common_density_point_samples
+
+    source_sample, target_sample = common_density_point_samples(
+        source_points["registered"],
+        target_points["registered"],
+        max_boundary_points,
+        mass_mode=mass_mode,  # type: ignore[arg-type]
+        point_measure=point_measure,
+    )
+    source_cost = np.asarray(source_points["registered"][source_sample.rows], dtype=float)
+    target_cost = np.asarray(target_points["registered"][target_sample.rows], dtype=float)
+    if cost_prealign == "centroid":
+        source_cost = source_cost - np.average(
+            source_cost, axis=0, weights=source_sample.weights
+        )
+        target_cost = target_cost - np.average(
+            target_cost, axis=0, weights=target_sample.weights
+        )
+    elif cost_prealign != "none":
+        raise ValueError("cost_prealign must be 'none' or 'centroid'")
+    return {
+        "source": source_sample,
+        "target": target_sample,
+        "source_cost": source_cost,
+        "target_cost": target_cost,
+        "voxel_spacing": max(source_sample.voxel_spacing, target_sample.voxel_spacing),
+    }
+
+
+def _transport_point_summary(
+    plan: Any,
+    *,
+    point_ids: Any,
+    displacement: Any,
+    direction: str,
+    np: Any,
+) -> dict[str, Any]:
+    """Return one confidence-weighted barycentric vector per sampled point."""
+
+    if direction == "source":
+        edge_rows = np.asarray(plan.source_rows, dtype=np.int64)
+        point_weights = np.asarray(plan.source_weights, dtype=float)
+        matched_mass = np.asarray(plan.source_matched_mass, dtype=float)
+    elif direction == "target":
+        edge_rows = np.asarray(plan.target_rows, dtype=np.int64)
+        point_weights = np.asarray(plan.target_weights, dtype=float)
+        matched_mass = np.asarray(plan.target_matched_mass, dtype=float)
+    else:
+        raise ValueError("direction must be source or target")
+    ids = np.asarray(point_ids, dtype=np.int64)
+    edge_mass = np.asarray(plan.mass, dtype=float)
+    weighted = np.zeros((ids.size, 3), dtype=float)
+    retained_mass = np.zeros(ids.size, dtype=float)
+    if edge_rows.size:
+        np.add.at(weighted, edge_rows, edge_mass[:, None] * displacement)
+        np.add.at(retained_mass, edge_rows, edge_mass)
+    vectors = np.full((ids.size, 3), np.nan, dtype=float)
+    mapped = retained_mass > 0
+    vectors[mapped] = weighted[mapped] / retained_mass[mapped, None]
+    variance_sum = np.zeros(ids.size, dtype=float)
+    distance_sum = np.zeros(ids.size, dtype=float)
+    if edge_rows.size:
+        residual = displacement - vectors[edge_rows]
+        np.add.at(variance_sum, edge_rows, edge_mass * np.sum(residual * residual, axis=1))
+        np.add.at(distance_sum, edge_rows, edge_mass * np.asarray(plan.edge_cost, dtype=float))
+    variance = np.full(ids.size, np.nan, dtype=float)
+    mean_distance = np.full(ids.size, np.nan, dtype=float)
+    variance[mapped] = variance_sum[mapped] / retained_mass[mapped]
+    mean_distance[mapped] = distance_sum[mapped] / retained_mass[mapped]
+    matched_fraction = np.divide(
+        matched_mass,
+        point_weights,
+        out=np.zeros_like(matched_mass),
+        where=point_weights > 0,
+    )
+    matched_fraction = np.clip(matched_fraction, 0.0, 1.0)
+    return {
+        "point_id": ids,
+        "point_mass": point_weights.astype(np.float64),
+        "matched_mass": matched_mass.astype(np.float64),
+        "matched_fraction": matched_fraction.astype(np.float32),
+        "barycentric_displacement_zyx": vectors.astype(np.float32),
+        "displacement_variance": variance.astype(np.float32),
+        "edge_distance_mean": mean_distance.astype(np.float32),
+        "quality_flags": np.zeros(ids.size, dtype=np.uint32),
+    }
+
+
+def _append_columns(destination: dict[str, list[Any]], values: Mapping[str, Any]) -> None:
+    for key, value in values.items():
+        destination.setdefault(str(key), []).append(value)
+
+
+def _concatenate_column_blocks(columns: Mapping[str, list[Any]], *, np: Any) -> dict[str, Any]:
+    output: dict[str, Any] = {}
+    for key, blocks in columns.items():
+        if blocks:
+            output[key] = np.concatenate(blocks, axis=0)
+        elif key in {"registered_displacement_zyx", "barycentric_displacement_zyx"}:
+            output[key] = np.empty((0, 3), dtype=np.float32)
+        elif key.endswith("point_id") or key == "quality_flags":
+            output[key] = np.empty(0, dtype=np.int64 if key.endswith("point_id") else np.uint32)
+        else:
+            output[key] = np.empty(0, dtype=np.float64)
+    return output
+
+
 def compute_boundary_motion(
     trajectory: Any,
     object_set: str,
@@ -596,10 +720,19 @@ def compute_boundary_motion(
     boundary_source_name: str | None = None,
     boundary_source_role: str | None = None,
     registration_set: str | None = None,
-    ot_method: str = "emd",
+    ot_method: str = "unbalanced",
     sinkhorn_regularization: float = 0.05,
+    unbalanced_reach: float = 2.0,
+    partial_mass: float = 0.9,
+    max_transport_distance: float | None = 5.0,
+    min_source_coverage: float = 0.5,
+    min_target_coverage: float = 0.5,
     max_boundary_points: int | None = 512,
     mass_tolerance: float = 1e-12,
+    relative_mass_tolerance: float = 1e-3,
+    retained_mass_fraction: float = 0.999,
+    mass_mode: str = "probability",
+    cost_prealign: str = "none",
     overwrite: bool = False,
     save_outputs: bool = True,
     metadata: Mapping[str, Any] | None = None,
@@ -615,7 +748,6 @@ def compute_boundary_motion(
     from celltraj2.boundaries import (
         BoundaryLibraryView,
         boundary_motion_link_dtype,
-        deterministic_point_sample,
         optimal_transport_plan,
         resolve_boundary_source_ids,
     )
@@ -625,8 +757,14 @@ def compute_boundary_motion(
     track_name = validate_name(track_set, kind="track set")
     boundary_name = validate_name(boundary_set, kind="boundary set")
     motion_name = validate_name(motion_set, kind="boundary motion set")
-    if ot_method not in {"emd", "sinkhorn"}:
-        raise ValueError("ot_method must be 'emd' or 'sinkhorn'")
+    if ot_method not in {"emd", "sinkhorn", "unbalanced", "partial"}:
+        raise ValueError("ot_method must be emd, sinkhorn, unbalanced, or partial")
+    for name, value in (
+        ("min_source_coverage", min_source_coverage),
+        ("min_target_coverage", min_target_coverage),
+    ):
+        if not np.isfinite(float(value)) or float(value) < 0 or float(value) > 1:
+            raise ValueError(f"{name} must be in [0, 1]")
 
     graph = trajectory.store.read_track_graph(object_name, track_name)
     boundary = BoundaryLibraryView(trajectory.store, boundary_name)
@@ -734,7 +872,6 @@ def compute_boundary_motion(
             "point_id": np.asarray(point_data["point_id"], dtype=np.int64),
             "native": native,
             "registered": registered,
-            "sample": deterministic_point_sample(native.shape[0], max_boundary_points),
         }
         point_cache[entity_id] = result
         return result
@@ -747,9 +884,17 @@ def compute_boundary_motion(
         "edge_cost": [],
         "registered_displacement_zyx": [],
     }
+    source_summary_columns: dict[str, list[Any]] = {}
+    target_summary_columns: dict[str, list[Any]] = {}
     frame_counts: dict[int, dict[str, Any]] = {}
     transport_start = 0
+    source_summary_start = 0
+    target_summary_start = 0
     selected_methods: set[str] = set()
+    sampling = dict(boundary.schema.get("sampling") or {})
+    canonical_spacing = float(sampling.get("effective_point_spacing") or sampling.get("point_spacing") or 1.0)
+    spatial_ndim = int(boundary.schema.get("spatial_ndim") or 3)
+    point_measure = canonical_spacing ** max(1, spatial_ndim - 1)
     for motion_link_id, link in enumerate(graph.links, start=1):
         parent_observation_id = int(link["parent_observation_id"])
         child_observation_id = int(link["child_observation_id"])
@@ -762,24 +907,58 @@ def compute_boundary_motion(
         child_entity_id = entity_by_observation[child_observation_id]
         parent_points = registered_entity_points(parent_entity_id)
         child_points = registered_entity_points(child_entity_id)
-        if not parent_points["sample"].size or not child_points["sample"].size:
+        if not parent_points["native"].shape[0] or not child_points["native"].shape[0]:
             raise ValueError(
                 f"Track link {parent_observation_id}->{child_observation_id} has an empty boundary"
             )
+        pair = _transport_pair_samples(
+            parent_points,
+            child_points,
+            max_boundary_points=max_boundary_points,
+            mass_mode=mass_mode,
+            point_measure=point_measure,
+            cost_prealign=cost_prealign,
+            np=np,
+        )
         plan = optimal_transport_plan(
-            parent_points["registered"][parent_points["sample"]],
-            child_points["registered"][child_points["sample"]],
+            pair["source_cost"],
+            pair["target_cost"],
             method=ot_method,  # type: ignore[arg-type]
             regularization=sinkhorn_regularization,
+            unbalanced_reach=unbalanced_reach,
+            partial_mass=partial_mass,
+            max_transport_distance=(
+                max_transport_distance if ot_method in {"unbalanced", "partial"} else None
+            ),
+            source_weights=pair["source"].weights,
+            target_weights=pair["target"].weights,
             mass_tolerance=mass_tolerance,
+            relative_mass_tolerance=relative_mass_tolerance,
+            retained_mass_fraction=retained_mass_fraction,
         )
         selected_methods.add(str(plan.method))
-        source_local = parent_points["sample"][plan.source_rows]
-        target_local = child_points["sample"][plan.target_rows]
+        source_local = pair["source"].rows[plan.source_rows]
+        target_local = pair["target"].rows[plan.target_rows]
         source_point_ids = parent_points["point_id"][source_local]
         target_point_ids = child_points["point_id"][target_local]
         displacement = child_points["registered"][target_local] - parent_points["registered"][source_local]
+        source_summary = _transport_point_summary(
+            plan,
+            point_ids=parent_points["point_id"][pair["source"].rows],
+            displacement=displacement,
+            direction="source",
+            np=np,
+        )
+        target_summary = _transport_point_summary(
+            plan,
+            point_ids=child_points["point_id"][pair["target"].rows],
+            displacement=displacement,
+            direction="target",
+            np=np,
+        )
         transport_count = int(plan.mass.shape[0])
+        source_summary_count = int(pair["source"].rows.size)
+        target_summary_count = int(pair["target"].rows.size)
         source_frame = int(link["source_frame"])
         target_frame = int(link["target_frame"])
         motion_links.append(
@@ -794,9 +973,27 @@ def compute_boundary_motion(
                 target_frame,
                 transport_start,
                 transport_count,
+                source_summary_start,
+                source_summary_count,
+                target_summary_start,
+                target_summary_count,
                 float(plan.total_cost),
-                float(np.sum(plan.mass)),
-                0,
+                float(plan.transport_cost),
+                float(plan.objective),
+                float(plan.matched_mean_cost),
+                float(plan.transported_mass),
+                float(plan.source_coverage),
+                float(plan.target_coverage),
+                float(plan.dropped_mass),
+                float(plan.edge_distance_p50),
+                float(plan.edge_distance_p90),
+                float(plan.edge_distance_p99),
+                float(plan.edge_distance_max),
+                int(plan.solver_iterations),
+                int(bool(plan.solver_converged)),
+                (1 if float(plan.source_coverage) < float(min_source_coverage) else 0)
+                | (2 if float(plan.target_coverage) < float(min_target_coverage) else 0)
+                | (4 if not plan.solver_converged else 0),
             )
         )
         transport_columns["source_point_id"].append(source_point_ids.astype(np.int64))
@@ -804,7 +1001,11 @@ def compute_boundary_motion(
         transport_columns["mass"].append(np.asarray(plan.mass, dtype=np.float64))
         transport_columns["edge_cost"].append(np.asarray(plan.edge_cost, dtype=np.float32))
         transport_columns["registered_displacement_zyx"].append(np.asarray(displacement, dtype=np.float32))
+        _append_columns(source_summary_columns, source_summary)
+        _append_columns(target_summary_columns, target_summary)
         transport_start += transport_count
+        source_summary_start += source_summary_count
+        target_summary_start += target_summary_count
         frame_summary = frame_counts.setdefault(
             target_frame,
             {
@@ -814,12 +1015,20 @@ def compute_boundary_motion(
                 "transport_edge_count": 0,
                 "transported_mass": 0.0,
                 "ot_cost_sum": 0.0,
+                "source_coverage_sum": 0.0,
+                "target_coverage_sum": 0.0,
+                "dropped_mass": 0.0,
+                "nonconverged_link_count": 0,
             },
         )
         frame_summary["link_count"] += 1
         frame_summary["transport_edge_count"] += transport_count
-        frame_summary["transported_mass"] += float(np.sum(plan.mass))
+        frame_summary["transported_mass"] += float(plan.transported_mass)
         frame_summary["ot_cost_sum"] += float(plan.total_cost)
+        frame_summary["source_coverage_sum"] += float(plan.source_coverage)
+        frame_summary["target_coverage_sum"] += float(plan.target_coverage)
+        frame_summary["dropped_mass"] += float(plan.dropped_mass)
+        frame_summary["nonconverged_link_count"] += int(not plan.solver_converged)
         if progress is not None:
             progress(
                 {
@@ -833,27 +1042,36 @@ def compute_boundary_motion(
                     "source_point_count": int(parent_points["native"].shape[0]),
                     "target_point_count": int(child_points["native"].shape[0]),
                     "transport_edge_count": transport_count,
-                    "transported_mass": float(np.sum(plan.mass)),
+                    "raw_transport_edge_count": int(plan.raw_edge_count),
+                    "transported_mass": float(plan.transported_mass),
+                    "source_coverage": float(plan.source_coverage),
+                    "target_coverage": float(plan.target_coverage),
+                    "dropped_mass": float(plan.dropped_mass),
+                    "edge_distance_p99": float(plan.edge_distance_p99),
+                    "edge_distance_max": float(plan.edge_distance_max),
+                    "solver_iterations": int(plan.solver_iterations),
+                    "solver_converged": bool(plan.solver_converged),
                     "ot_cost": float(plan.total_cost),
                 }
             )
 
-    transport = {
-        key: (
-            np.concatenate(blocks, axis=0)
-            if blocks
-            else np.empty((0, 3), dtype=np.float32)
-            if key == "registered_displacement_zyx"
-            else np.empty(0, dtype=np.int64 if key.endswith("point_id") else np.float64)
-        )
-        for key, blocks in transport_columns.items()
+    transport = _concatenate_column_blocks(transport_columns, np=np)
+    point_summaries = {
+        "source_summary": _concatenate_column_blocks(source_summary_columns, np=np),
+        "target_summary": _concatenate_column_blocks(target_summary_columns, np=np),
     }
     for counts in frame_counts.values():
         counts["mean_ot_cost"] = (
             counts.pop("ot_cost_sum") / counts["link_count"] if counts["link_count"] else None
         )
+        counts["mean_source_coverage"] = (
+            counts.pop("source_coverage_sum") / counts["link_count"] if counts["link_count"] else None
+        )
+        counts["mean_target_coverage"] = (
+            counts.pop("target_coverage_sum") / counts["link_count"] if counts["link_count"] else None
+        )
     schema = {
-        "schema": "celltraj2.boundary_motion.v1",
+        "schema": "celltraj2.boundary_motion.v2",
         "boundary_set": boundary_name,
         "motion_set": motion_name,
         "created_at": utc_now_iso(),
@@ -866,9 +1084,45 @@ def compute_boundary_motion(
         "displacement_definition": "T_target(q_native)-T_source(p_native)",
         "ot_method_requested": ot_method,
         "transport_methods": sorted(selected_methods),
+        "solver": {
+            "max_iterations": 10000,
+            "scaling_relative_tolerance": 1e-8,
+            "log_absolute_tolerance": 1e-10,
+            "underflow_fallback": "log_domain",
+        },
         "sinkhorn_regularization": float(sinkhorn_regularization),
+        "unbalanced_reach": float(unbalanced_reach),
+        "partial_mass": float(partial_mass),
+        "max_transport_distance": (
+            None if max_transport_distance is None or ot_method not in {"unbalanced", "partial"}
+            else float(max_transport_distance)
+        ),
+        "minimum_coverage": {
+            "source": float(min_source_coverage),
+            "target": float(min_target_coverage),
+        },
         "mass_tolerance": float(mass_tolerance),
+        "relative_mass_tolerance": float(relative_mass_tolerance),
+        "retained_mass_fraction": float(retained_mass_fraction),
+        "mass_mode": str(mass_mode),
+        "cost_prealign": str(cost_prealign),
         "max_boundary_points": max_boundary_points,
+        "sampling": {
+            "method": "shared_physical_voxel_grid",
+            "canonical_point_spacing": canonical_spacing,
+            "point_measure": point_measure,
+        },
+        "point_summary": {
+            "source_group": "source_summary",
+            "target_group": "target_summary",
+            "vector": "mass_weighted_barycentric_displacement",
+            "confidence": "matched_fraction",
+        },
+        "link_quality_flags": {
+            "1": "source_coverage_below_threshold",
+            "2": "target_coverage_below_threshold",
+            "4": "solver_not_converged",
+        },
         "motion_link_count": len(motion_links),
         "transport_edge_count": int(transport_start),
         "metadata": dict(metadata or {}),
@@ -881,6 +1135,7 @@ def compute_boundary_motion(
             motion_name,
             links=links,
             transport=transport,
+            point_summaries=point_summaries,
             schema=schema,
             overwrite=overwrite,
         )
@@ -891,6 +1146,7 @@ def compute_boundary_motion(
         motion_set=motion_name,
         links=links,
         transport=transport,
+        point_summaries=point_summaries,
         schema=schema,
         saved=bool(save_outputs),
         motion_path=motion_path,
@@ -911,10 +1167,19 @@ def track_minimum_boundary_ot_cost(
     track_set: str = "boundary_ot",
     motion_set: str | None = None,
     registration_set: str | None = None,
-    ot_method: str = "emd",
+    ot_method: str = "unbalanced",
     sinkhorn_regularization: float = 0.05,
+    unbalanced_reach: float = 2.0,
+    partial_mass: float = 0.9,
+    max_transport_distance: float | None = 5.0,
+    min_source_coverage: float = 0.5,
+    min_target_coverage: float = 0.5,
     max_boundary_points: int | None = 512,
     mass_tolerance: float = 1e-12,
+    relative_mass_tolerance: float = 1e-3,
+    retained_mass_fraction: float = 0.999,
+    mass_mode: str = "probability",
+    cost_prealign: str = "none",
     save_motion: bool = True,
     overwrite: bool = False,
     save_outputs: bool = True,
@@ -934,7 +1199,6 @@ def track_minimum_boundary_ot_cost(
         as_boundary_library_view,
         boundary_motion_link_dtype,
         build_boundary_library,
-        deterministic_point_sample,
         optimal_transport_plan,
         resolve_boundary_source_ids,
     )
@@ -952,8 +1216,14 @@ def track_minimum_boundary_ot_cost(
         raise ValueError("max_distance must be finite and > 0")
     if np.isnan(ot_cutoff) or ot_cutoff <= 0:
         raise ValueError("ot_cost_cutoff must be > 0 and may be infinity")
-    if ot_method not in {"emd", "sinkhorn"}:
-        raise ValueError("ot_method must be 'emd' or 'sinkhorn'")
+    if ot_method not in {"emd", "sinkhorn", "unbalanced", "partial"}:
+        raise ValueError("ot_method must be emd, sinkhorn, unbalanced, or partial")
+    for name, value in (
+        ("min_source_coverage", min_source_coverage),
+        ("min_target_coverage", min_target_coverage),
+    ):
+        if not np.isfinite(float(value)) or float(value) < 0 or float(value) > 1:
+            raise ValueError(f"{name} must be in [0, 1]")
     if boundary_set is None and save_motion and save_outputs:
         raise ValueError(
             "Persistent boundary motion requires a stored boundary_set; "
@@ -1079,18 +1349,20 @@ def track_minimum_boundary_ot_cost(
                 native,
                 np.full(native.shape[0], int(entity["frame"]), dtype=np.int64),
             )
-        sample = deterministic_point_sample(native.shape[0], max_boundary_points)
         result = {
             "point_id": np.asarray(point_data["point_id"], dtype=np.int64),
             "native": native,
             "registered": registered,
-            "sample": sample,
         }
         point_cache[entity_id] = result
         return result
 
     edge_records: list[tuple[Any, ...]] = []
     accepted_plans: list[dict[str, Any]] = []
+    sampling = dict(boundary_schema.get("sampling") or {})
+    canonical_spacing = float(sampling.get("effective_point_spacing") or sampling.get("point_spacing") or 1.0)
+    spatial_ndim = int(boundary_schema.get("spatial_ndim") or 3)
+    point_measure = canonical_spacing ** max(1, spatial_ndim - 1)
     link_id = 1
     if progress is not None and np.any(frames == 1):
         progress(
@@ -1128,7 +1400,7 @@ def track_minimum_boundary_ot_cost(
             child_observation_id = child_row + 1
             child_entity_id = entity_by_observation[child_observation_id]
             child_points = registered_entity_points(child_entity_id)
-            if not child_points["sample"].size:
+            if not child_points["native"].shape[0]:
                 continue
             best: dict[str, Any] | None = None
             for candidate in candidates:
@@ -1136,15 +1408,40 @@ def track_minimum_boundary_ot_cost(
                 parent_observation_id = parent_row + 1
                 parent_entity_id = entity_by_observation[parent_observation_id]
                 parent_points = registered_entity_points(parent_entity_id)
-                if not parent_points["sample"].size:
+                if not parent_points["native"].shape[0]:
                     continue
+                pair = _transport_pair_samples(
+                    parent_points,
+                    child_points,
+                    max_boundary_points=max_boundary_points,
+                    mass_mode=mass_mode,
+                    point_measure=point_measure,
+                    cost_prealign=cost_prealign,
+                    np=np,
+                )
                 plan = optimal_transport_plan(
-                    parent_points["registered"][parent_points["sample"]],
-                    child_points["registered"][child_points["sample"]],
+                    pair["source_cost"],
+                    pair["target_cost"],
                     method=ot_method,  # type: ignore[arg-type]
                     regularization=sinkhorn_regularization,
+                    unbalanced_reach=unbalanced_reach,
+                    partial_mass=partial_mass,
+                    max_transport_distance=(
+                        max_transport_distance if ot_method in {"unbalanced", "partial"} else None
+                    ),
+                    source_weights=pair["source"].weights,
+                    target_weights=pair["target"].weights,
                     mass_tolerance=mass_tolerance,
+                    relative_mass_tolerance=relative_mass_tolerance,
+                    retained_mass_fraction=retained_mass_fraction,
                 )
+                if not plan.solver_converged:
+                    continue
+                if (
+                    float(plan.source_coverage) < float(min_source_coverage)
+                    or float(plan.target_coverage) < float(min_target_coverage)
+                ):
+                    continue
                 candidate_result = {
                     "parent_row": parent_row,
                     "parent_observation_id": parent_observation_id,
@@ -1155,6 +1452,7 @@ def track_minimum_boundary_ot_cost(
                     "plan": plan,
                     "parent_points": parent_points,
                     "child_points": child_points,
+                    "pair": pair,
                 }
                 if best is None or plan.total_cost < best["plan"].total_cost:
                     best = candidate_result
@@ -1169,7 +1467,7 @@ def track_minimum_boundary_ot_cost(
                     frame,
                     best["centroid_distance"],
                     float(best["plan"].total_cost),
-                    np.nan,
+                    float(min(best["plan"].source_coverage, best["plan"].target_coverage)),
                     0,
                 )
             )
@@ -1206,10 +1504,39 @@ def track_minimum_boundary_ot_cost(
         "boundary_source_id": selected_source_id,
         "boundary_source_name": str(source_record.get("name") or ""),
         "ot_method_requested": ot_method,
+        "solver": {
+            "max_iterations": 10000,
+            "scaling_relative_tolerance": 1e-8,
+            "log_absolute_tolerance": 1e-10,
+            "underflow_fallback": "log_domain",
+        },
         "sinkhorn_regularization": float(sinkhorn_regularization),
+        "unbalanced_reach": float(unbalanced_reach),
+        "partial_mass": float(partial_mass),
+        "max_transport_distance": (
+            None if max_transport_distance is None or ot_method not in {"unbalanced", "partial"}
+            else float(max_transport_distance)
+        ),
+        "minimum_coverage": {
+            "source": float(min_source_coverage),
+            "target": float(min_target_coverage),
+        },
         "max_boundary_points": max_boundary_points,
         "mass_tolerance": float(mass_tolerance),
-        "ot_cost": "uniform_mass_mean_euclidean_transport_distance",
+        "relative_mass_tolerance": float(relative_mass_tolerance),
+        "retained_mass_fraction": float(retained_mass_fraction),
+        "mass_mode": str(mass_mode),
+        "cost_prealign": str(cost_prealign),
+        "sampling": {
+            "method": "shared_physical_voxel_grid",
+            "canonical_point_spacing": canonical_spacing,
+            "point_measure": point_measure,
+        },
+        "ot_cost": (
+            "full_unbalanced_regularized_objective"
+            if ot_method == "unbalanced"
+            else "matched_mean_euclidean_transport_distance"
+        ),
         "frame_linkage": "immediately_previous_local_frame_only",
         "parent_invariant": "at_most_one_parent_per_child",
         "child_cardinality": "zero_or_more_children_per_parent",
@@ -1256,6 +1583,27 @@ def track_minimum_boundary_ot_cost(
             registration_dependency=registration_dependency,
             track_digest=schema["track_digest"],
             max_boundary_points=max_boundary_points,
+            transport_settings={
+                "ot_method_requested": ot_method,
+                "solver": dict(schema["solver"]),
+                "sinkhorn_regularization": float(sinkhorn_regularization),
+                "unbalanced_reach": float(unbalanced_reach),
+                "partial_mass": float(partial_mass),
+                "max_transport_distance": (
+                    None if max_transport_distance is None or ot_method not in {"unbalanced", "partial"}
+                    else float(max_transport_distance)
+                ),
+                "minimum_coverage": {
+                    "source": float(min_source_coverage),
+                    "target": float(min_target_coverage),
+                },
+                "mass_tolerance": float(mass_tolerance),
+                "relative_mass_tolerance": float(relative_mass_tolerance),
+                "retained_mass_fraction": float(retained_mass_fraction),
+                "mass_mode": str(mass_mode),
+                "cost_prealign": str(cost_prealign),
+                "sampling": dict(schema["sampling"]),
+            },
             frame_counts=frame_counts,
             np=np,
         )
@@ -1276,6 +1624,7 @@ def track_minimum_boundary_ot_cost(
                 motion_name,
                 links=motion_result.links,
                 transport=motion_result.transport,
+                point_summaries=motion_result.point_summaries,
                 schema=motion_result.schema,
                 overwrite=overwrite,
             )
@@ -1344,6 +1693,7 @@ def _tracking_motion_from_plans(
     registration_dependency: Mapping[str, Any] | None,
     track_digest: str,
     max_boundary_points: int | None,
+    transport_settings: Mapping[str, Any],
     frame_counts: dict[int, dict[str, int]],
     np: Any,
 ) -> BoundaryMotionResult:
@@ -1357,17 +1707,38 @@ def _tracking_motion_from_plans(
         "edge_cost": [],
         "registered_displacement_zyx": [],
     }
+    source_summary_columns: dict[str, list[Any]] = {}
+    target_summary_columns: dict[str, list[Any]] = {}
     transport_start = 0
+    source_summary_start = 0
+    target_summary_start = 0
     selected_methods: set[str] = set()
     for motion_link_id, accepted in enumerate(accepted_plans, start=1):
         plan = accepted["plan"]
         selected_methods.add(str(plan.method))
         parent_points = accepted["parent_points"]
         child_points = accepted["child_points"]
-        source_local = parent_points["sample"][plan.source_rows]
-        target_local = child_points["sample"][plan.target_rows]
+        pair = accepted["pair"]
+        source_local = pair["source"].rows[plan.source_rows]
+        target_local = pair["target"].rows[plan.target_rows]
         displacement = child_points["registered"][target_local] - parent_points["registered"][source_local]
+        source_summary = _transport_point_summary(
+            plan,
+            point_ids=parent_points["point_id"][pair["source"].rows],
+            displacement=displacement,
+            direction="source",
+            np=np,
+        )
+        target_summary = _transport_point_summary(
+            plan,
+            point_ids=child_points["point_id"][pair["target"].rows],
+            displacement=displacement,
+            direction="target",
+            np=np,
+        )
         transport_count = int(plan.mass.shape[0])
+        source_summary_count = int(pair["source"].rows.size)
+        target_summary_count = int(pair["target"].rows.size)
         motion_links.append(
             (
                 motion_link_id,
@@ -1380,8 +1751,24 @@ def _tracking_motion_from_plans(
                 int(observations[accepted["child_observation_id"] - 1]["frame"]),
                 transport_start,
                 transport_count,
+                source_summary_start,
+                source_summary_count,
+                target_summary_start,
+                target_summary_count,
                 float(plan.total_cost),
-                float(np.sum(plan.mass)),
+                float(plan.transport_cost),
+                float(plan.objective),
+                float(plan.matched_mean_cost),
+                float(plan.transported_mass),
+                float(plan.source_coverage),
+                float(plan.target_coverage),
+                float(plan.dropped_mass),
+                float(plan.edge_distance_p50),
+                float(plan.edge_distance_p90),
+                float(plan.edge_distance_p99),
+                float(plan.edge_distance_max),
+                int(plan.solver_iterations),
+                int(bool(plan.solver_converged)),
                 0,
             )
         )
@@ -1390,19 +1777,18 @@ def _tracking_motion_from_plans(
         transport_columns["mass"].append(np.asarray(plan.mass, dtype=np.float64))
         transport_columns["edge_cost"].append(np.asarray(plan.edge_cost, dtype=np.float32))
         transport_columns["registered_displacement_zyx"].append(np.asarray(displacement, dtype=np.float32))
+        _append_columns(source_summary_columns, source_summary)
+        _append_columns(target_summary_columns, target_summary)
         transport_start += transport_count
-    transport = {
-        key: (
-            np.concatenate(blocks, axis=0)
-            if blocks
-            else np.empty((0, 3), dtype=np.float32)
-            if key == "registered_displacement_zyx"
-            else np.empty(0, dtype=np.int64 if key.endswith("point_id") else np.float64)
-        )
-        for key, blocks in transport_columns.items()
+        source_summary_start += source_summary_count
+        target_summary_start += target_summary_count
+    transport = _concatenate_column_blocks(transport_columns, np=np)
+    point_summaries = {
+        "source_summary": _concatenate_column_blocks(source_summary_columns, np=np),
+        "target_summary": _concatenate_column_blocks(target_summary_columns, np=np),
     }
     motion_schema = {
-        "schema": "celltraj2.boundary_motion.v1",
+        "schema": "celltraj2.boundary_motion.v2",
         "boundary_set": boundary_name,
         "motion_set": motion_name,
         "created_at": utc_now_iso(),
@@ -1415,6 +1801,18 @@ def _tracking_motion_from_plans(
         "displacement_definition": "T_target(q_native)-T_source(p_native)",
         "transport_methods": sorted(selected_methods),
         "max_boundary_points": max_boundary_points,
+        **dict(transport_settings),
+        "point_summary": {
+            "source_group": "source_summary",
+            "target_group": "target_summary",
+            "vector": "mass_weighted_barycentric_displacement",
+            "confidence": "matched_fraction",
+        },
+        "link_quality_flags": {
+            "1": "source_coverage_below_threshold",
+            "2": "target_coverage_below_threshold",
+            "4": "solver_not_converged",
+        },
         "transport_edge_count": int(transport_start),
     }
     return BoundaryMotionResult(
@@ -1424,6 +1822,7 @@ def _tracking_motion_from_plans(
         motion_set=motion_name,
         links=np.asarray(motion_links, dtype=boundary_motion_link_dtype()),
         transport=transport,
+        point_summaries=point_summaries,
         schema=motion_schema,
         saved=False,
         frame_counts={int(key): dict(value) for key, value in frame_counts.items()},
