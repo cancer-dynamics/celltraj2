@@ -272,6 +272,13 @@ Supported feature block kinds are `regionprops`, `intensity`,
 `SITE Signaling` block that expands to compact `site_cyto`, `site_nuc`, and
 `site_ratio` columns inside the default `site_v1` feature set.
 
+Intensity `stats` may contain `mean`, `sum`, `median`, `min`, `max`, `std`,
+`area`, or the bundle token `percentiles`. `area` counts finite pixels/voxels.
+`percentiles` expands to levels 0, 1, 10, 20, 30, 40, 50, 60, 70, 80, 90, 99,
+and 100, with one `percentile_<level>` feature column and schema entry per
+level. The SITE Featurize dialog presents these as checkboxes and stores the
+bundle token in its workflow JSON.
+
 Mask and label inputs are referenced by source name and kind, not by H5 path.
 The worker resolves those names to `/masks/<name>/frame_<n>` or
 `/labels/<name>/frame_<n>` for the active frame. The same source selection is

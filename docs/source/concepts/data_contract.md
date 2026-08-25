@@ -310,6 +310,16 @@ positive `source_label_id`; masks become explicitly named surface entities.
 State, cell type, biological role, and other classifications are row-aligned
 entity attributes, never overloaded identity numbers.
 
+Mask sources can be promoted to the observation spine when they need tracking,
+object-level features, or classification. Promotion materializes
+`/labels/<derived_label_set>/frame_<n>` and indexes it under
+`/object_sets/<object_set>/`. `whole_foreground` assigns label 1 to every
+foreground pixel/voxel and therefore creates at most one object per frame;
+`connected_components` assigns one label per face-connected region. The object
+metadata and indexing run record store `source_kind=mask_set`, the source mask
+name, conversion rule, and derived label-set name. The original mask remains
+unchanged and independently addressable.
+
 Point columns are stored independently so consumers can read only the fields
 and entity spans needed from libraries containing millions of points. Native
 index coordinates retain the original array grid. Native positions apply the
@@ -348,6 +358,25 @@ back to boundary point and entity metadata, allowing interactions to be sliced
 by source, mask role, cell type, state, or frame without duplicating target
 coordinates. Same-frame neighbor geometry is native and has no registration
 dependency.
+
+Source-scoped geometry and neighbor jobs use exact source references:
+
+```json
+{"kind": "object_set", "name": "cells"}
+```
+
+`kind` is one of `object_set`, `label_set`, or `mask_set`. Exact refs are stored
+as `source_refs` and, for directed neighbor products, `target_refs`. Legacy
+`source_names`/`source_roles` selectors remain accepted for backward
+compatibility, but new launchers should emit refs so overlapping names and
+editable semantic roles cannot select the wrong source.
+
+Directed neighbor schemas also store `source_subset` and `target_subset`.
+`{"mode": "whole"}` is the currently executable contract. Future classification
+subsets will name a versioned object classification/attribute set and selected
+state/type values, resolve them to `boundary_entity_id` rows, and retain that
+dependency in the neighbor schema. Until that resolver is implemented, any
+non-whole mode is rejected explicitly rather than treated as the whole source.
 
 Between-frame boundary OT is different: candidate gating, transport cost, and
 displacement are calculated in registered physical coordinates. Robust motion
@@ -488,6 +517,19 @@ multiple ordered values, use one compound-dataset column per component, with
 the stable suffix convention `<feature_name>-1`, `<feature_name>-2`,
 `<feature_name>-3`, and so on. The full feature details remain in
 `schema.json`, so column names should stay readable but compact.
+
+Intensity blocks support `mean`, `sum`, `median`, `min`, `max`, `std`, and
+`area`. Here `area` is the number of finite image pixels or voxels in the
+selected compartment, not a calibrated physical area or volume. The
+`percentiles` option expands, in stable order, to `percentile_0`,
+`percentile_1`, `percentile_10`, `percentile_20`, `percentile_30`,
+`percentile_40`, `percentile_50`, `percentile_60`, `percentile_70`,
+`percentile_80`, `percentile_90`, `percentile_99`, and `percentile_100`.
+Programmatic specs may also request one valid `percentile_<level>` directly.
+An explicitly named single-statistic block keeps its feature name; a block that
+returns multiple statistics appends each statistic, for example
+`signal_mean` and `signal_percentile_50`. Each expanded percentile is recorded
+separately in the compound dataset and column schema.
 
 Compartments are described with stored label or mask sources rather than raw H5
 paths. A compartment can start from the object set's source labels and then

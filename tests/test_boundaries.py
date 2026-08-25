@@ -1,13 +1,18 @@
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
+from unittest.mock import patch
 
 from celltraj2.boundaries import (
     GEOMETRY_QUALITY_NOT_SELECTED,
+    BoundaryLibraryView,
     BoundarySourceSpec,
+    _materialize_transport_plan,
+    _optimal_transport_score,
     _sample_native_boundary_points,
     build_boundary_library,
     common_density_point_samples,
+    compute_boundary_neighbors,
     optimal_transport_plan,
 )
 from celltraj2.boundary_batch import BoundaryFileJob, run_batch_boundaries
@@ -74,6 +79,29 @@ class BoundaryLibraryTests(unittest.TestCase):
         self.assertEqual(plan.method, "numpy.sinkhorn")
         self.assertAlmostEqual(float(self.np.sum(plan.mass)), 1.0, places=7)
         self.assertAlmostEqual(plan.total_cost, 1.0, places=5)
+
+    def test_score_only_transport_materializes_the_same_selected_plan(self):
+        source = self.np.asarray([[0.0, 0.0], [1.0, 0.0]])
+        target = self.np.asarray([[0.0, 1.0], [1.0, 1.0]])
+        score = _optimal_transport_score(
+            source,
+            target,
+            method="sinkhorn",
+            regularization=0.01,
+        )
+        selected = _materialize_transport_plan(score, mass_tolerance=1e-8)
+        direct = optimal_transport_plan(
+            source,
+            target,
+            method="sinkhorn",
+            regularization=0.01,
+            mass_tolerance=1e-8,
+        )
+
+        self.assertAlmostEqual(selected.total_cost, direct.total_cost)
+        self.np.testing.assert_array_equal(selected.source_rows, direct.source_rows)
+        self.np.testing.assert_array_equal(selected.target_rows, direct.target_rows)
+        self.np.testing.assert_allclose(selected.mass, direct.mass)
 
     def test_unbalanced_transport_leaves_distant_target_mass_unmatched(self):
         theta = self.np.linspace(0.0, 2.0 * self.np.pi, 64, endpoint=False)
@@ -220,11 +248,31 @@ class BoundaryLibraryTests(unittest.TestCase):
                 "sources": [
                     {"kind": "object_set", "name": "cells", "object_set": "cells"}
                 ],
+                "geometries": [
+                    {
+                        "geometry_set": "surface",
+                        "source_refs": [{"kind": "object_set", "name": "cells"}],
+                    }
+                ],
+                "neighbors": [
+                    {
+                        "neighbor_set": "cell_pairs",
+                        "source_refs": [{"kind": "object_set", "name": "cells"}],
+                        "source_subset": {"mode": "whole"},
+                        "target_refs": [{"kind": "object_set", "name": "cells"}],
+                        "target_subset": {"mode": "whole"},
+                    }
+                ],
             }
         )
 
         self.assertEqual(job.point_spacing, 1.0)
         self.assertEqual(job.to_dict()["point_spacing"], 1.0)
+        self.assertEqual(
+            job.to_dict()["geometries"][0]["source_refs"],
+            [{"kind": "object_set", "name": "cells"}],
+        )
+        self.assertEqual(job.to_dict()["neighbors"][0]["source_subset"], {"mode": "whole"})
         with self.assertRaisesRegex(ValueError, "point_spacing"):
             BoundaryFileJob.from_dict(
                 {
@@ -424,18 +472,28 @@ class BoundaryLibraryTests(unittest.TestCase):
                 )
                 trajectory.store.write_registration_set(registration)
                 trajectory.store.set_active_registration("drift_corrected", reason="test")
-                result = trajectory.track_minimum_boundary_ot_cost(
-                    "cells",
-                    boundary_set="native",
-                    max_distance=0.5,
-                    ot_cost_cutoff=0.05,
-                    track_set="boundary_ot",
-                    ot_method="sinkhorn",
-                    sinkhorn_regularization=0.01,
-                    mass_tolerance=1e-7,
-                    max_boundary_points=None,
-                )
+                point_reads: list[dict[str, object]] = []
+                original_read_points = BoundaryLibraryView.read_points
+
+                def counted_read_points(view, *args, **kwargs):
+                    point_reads.append(dict(kwargs))
+                    return original_read_points(view, *args, **kwargs)
+
+                with patch.object(BoundaryLibraryView, "read_points", counted_read_points):
+                    result = trajectory.track_minimum_boundary_ot_cost(
+                        "cells",
+                        boundary_set="native",
+                        max_distance=0.5,
+                        ot_cost_cutoff=0.05,
+                        track_set="boundary_ot",
+                        ot_method="sinkhorn",
+                        sinkhorn_regularization=0.01,
+                        mass_tolerance=1e-7,
+                        max_boundary_points=None,
+                    )
                 self.assertEqual(result.link_count, 1)
+                self.assertEqual(len(point_reads), 2)
+                self.assertTrue(all(isinstance(call.get("rows"), slice) for call in point_reads))
                 self.assertIsNotNone(result.motion_path)
                 self.assertEqual(
                     result.graph.schema["registration_dependency"]["registration_digest"], digest
@@ -500,14 +558,22 @@ class BoundaryLibraryTests(unittest.TestCase):
                                 "geometry_set": "cell_surface",
                                 "backend": "local",
                                 "knn": 6,
-                                "source_roles": ["cell"],
+                                "source_refs": [
+                                    {"kind": "object_set", "name": "cells"}
+                                ],
                             }
                         ],
                         "neighbors": [
                             {
                                 "neighbor_set": "cell_to_matrix",
-                                "source_roles": ["cell"],
-                                "target_roles": ["basement_membrane"],
+                                "source_refs": [
+                                    {"kind": "object_set", "name": "cells"}
+                                ],
+                                "source_subset": {"mode": "whole"},
+                                "target_refs": [
+                                    {"kind": "mask_set", "name": "basement"}
+                                ],
+                                "target_subset": {"mode": "whole"},
                                 "k": 1,
                             }
                         ],
@@ -548,6 +614,25 @@ class BoundaryLibraryTests(unittest.TestCase):
                 )
                 self.assertEqual(neighbor_schema["source_ids"], [1])
                 self.assertEqual(neighbor_schema["target_ids"], [2])
+                self.assertEqual(
+                    neighbor_schema["source_refs"],
+                    [{"kind": "object_set", "name": "cells"}],
+                )
+                self.assertEqual(neighbor_schema["target_subset"], {"mode": "whole"})
+                with self.assertRaisesRegex(ValueError, "only mode='whole'"):
+                    compute_boundary_neighbors(
+                        trajectory,
+                        "cells_and_matrix",
+                        neighbor_set="future_state_pair",
+                        source_refs=[{"kind": "object_set", "name": "cells"}],
+                        target_refs=[{"kind": "mask_set", "name": "basement"}],
+                        source_subset={
+                            "mode": "classification",
+                            "classification_set": "cell_type_v1",
+                            "values": ["epithelial"],
+                        },
+                        save_outputs=False,
+                    )
 
     def test_boundary_batch_overwrite_builds_new_library_for_selected_frame_subset(self):
         frame_1 = self.np.zeros((14, 14), dtype=self.np.uint16)
@@ -681,6 +766,38 @@ class BoundaryLibraryTests(unittest.TestCase):
                     "cells", max_distance=3.0, track_set="centroid"
                 )
                 self.assertEqual(tracked.link_count, 1)
+                split_tracking = trajectory.track_minimum_boundary_ot_cost(
+                    "cells",
+                    boundary_set="interaction_domain",
+                    boundary_source_name="tracked_cells",
+                    max_distance=3.0,
+                    track_set="split_ot",
+                    score_ot_method="emd",
+                    winner_ot_method="unbalanced",
+                    sinkhorn_regularization=0.05,
+                    unbalanced_reach=2.0,
+                    max_transport_distance=3.0,
+                    save_motion=True,
+                    save_outputs=False,
+                )
+                self.assertEqual(split_tracking.link_count, 1)
+                self.assertEqual(
+                    split_tracking.graph.schema["score_ot_method_requested"], "emd"
+                )
+                self.assertEqual(
+                    split_tracking.graph.schema["winner_ot_method_requested"],
+                    "unbalanced",
+                )
+                self.assertIsNotNone(split_tracking.motion_result)
+                assert split_tracking.motion_result is not None
+                self.assertEqual(
+                    split_tracking.motion_result.schema["ot_method_requested"],
+                    "unbalanced",
+                )
+                self.assertIn(
+                    "unbalanced",
+                    split_tracking.motion_result.schema["transport_methods"][0],
+                )
                 motion = trajectory.compute_boundary_motion(
                     "cells",
                     "centroid",

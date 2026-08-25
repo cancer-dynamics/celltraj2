@@ -13,8 +13,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("job", type=Path, help="Path to a celltraj2 object-indexing job JSON file.")
     args = parser.parse_args(argv)
     job = load_object_index_job(args.job)
-    run_batch_object_indexing(job, reporter=JsonlReporter())
-    return 0
+    summary = run_batch_object_indexing(job, reporter=JsonlReporter())
+    return 1 if summary.failed else 0
 
 
 if __name__ == "__main__":

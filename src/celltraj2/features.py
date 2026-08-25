@@ -13,6 +13,68 @@ from celltraj2.paths import validate_name
 from celltraj2.schema import utc_now_iso
 
 
+INTENSITY_SCALAR_STATISTICS = (
+    "mean",
+    "sum",
+    "median",
+    "min",
+    "max",
+    "std",
+    "area",
+)
+INTENSITY_PERCENTILE_LEVELS = (
+    0,
+    1,
+    10,
+    20,
+    30,
+    40,
+    50,
+    60,
+    70,
+    80,
+    90,
+    99,
+    100,
+)
+INTENSITY_PERCENTILE_STATISTICS = tuple(
+    f"percentile_{level}" for level in INTENSITY_PERCENTILE_LEVELS
+)
+INTENSITY_STATISTIC_OPTIONS = (*INTENSITY_SCALAR_STATISTICS, "percentiles")
+
+
+def expand_intensity_statistics(stats: Sequence[str] | str | None = None) -> list[str]:
+    """Expand and validate intensity statistics in stable output-column order."""
+
+    if stats is None:
+        requested = ["mean"]
+    else:
+        requested = [stats] if isinstance(stats, str) else list(stats)
+    expanded: list[str] = []
+    for item in requested:
+        name = str(item).strip().lower()
+        if not name:
+            continue
+        values = INTENSITY_PERCENTILE_STATISTICS if name == "percentiles" else (name,)
+        for statistic in values:
+            if statistic in INTENSITY_SCALAR_STATISTICS:
+                pass
+            elif statistic.startswith("percentile_"):
+                try:
+                    percentile = float(statistic.rsplit("_", 1)[-1])
+                except ValueError as exc:
+                    raise ValueError(f"Unsupported intensity statistic: {statistic}") from exc
+                if not 0.0 <= percentile <= 100.0:
+                    raise ValueError(f"Intensity percentile must be within 0..100: {statistic}")
+            else:
+                raise ValueError(f"Unsupported intensity statistic: {statistic}")
+            if statistic not in expanded:
+                expanded.append(statistic)
+    if not expanded:
+        raise ValueError("Intensity feature requires at least one statistic.")
+    return expanded
+
+
 def _require_numpy() -> Any:
     try:
         import numpy as np  # type: ignore
@@ -577,7 +639,7 @@ def _compute_intensity(
         background=feature.get("background"),
         np=np,
     )
-    stats = [str(item) for item in feature.get("stats", ["mean"])]
+    stats = expand_intensity_statistics(feature.get("stats", ["mean"]))
     per_label = _per_label_stats(compartment["labels"], image, stats, np=np)
     values_by_label: dict[int, dict[str, float]] = {}
     columns: OrderedDict[str, dict[str, Any]] = OrderedDict()

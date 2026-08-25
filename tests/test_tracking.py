@@ -4,7 +4,11 @@ import unittest
 
 from celltraj2.schema import ImageSourceSpec, TrajectoryMetadata
 from celltraj2.store import TrajectoryStore
-from celltraj2.tracking import track_minimum_centroid_distance
+from celltraj2.tracking import (
+    _centroid_knn_candidates,
+    track_minimum_boundary_ot_cost,
+    track_minimum_centroid_distance,
+)
 from celltraj2.tracking_batch import TrackingBatchJob, TrackingFileJob, run_batch_tracking
 from celltraj2.trajectory import Trajectory
 
@@ -184,15 +188,38 @@ class SparseTrackingTests(unittest.TestCase):
                 "min_coverage": 0.6,
                 "relative_mass_tolerance": 0.002,
                 "retained_mass_fraction": 0.995,
+                "candidate_k": 3,
             }
         )
         self.assertEqual(robust.ot_method, "unbalanced")
+        self.assertEqual(robust.score_ot_method, "unbalanced")
+        self.assertEqual(robust.winner_ot_method, "unbalanced")
         self.assertEqual(robust.unbalanced_reach, 1.5)
         self.assertEqual(robust.max_transport_distance, 4.0)
         self.assertEqual(robust.min_source_coverage, 0.6)
         self.assertEqual(robust.min_target_coverage, 0.6)
         self.assertEqual(robust.relative_mass_tolerance, 0.002)
         self.assertEqual(robust.retained_mass_fraction, 0.995)
+        self.assertEqual(robust.candidate_k, 3)
+        split_defaults = TrackingFileJob.from_dict(
+            {
+                "h5_path": "sample.h5",
+                "object_set": "cells",
+                "method": "boundary_ot",
+            }
+        )
+        self.assertIsNone(split_defaults.ot_method)
+        self.assertEqual(split_defaults.score_ot_method, "emd")
+        self.assertEqual(split_defaults.winner_ot_method, "unbalanced")
+        with self.assertRaisesRegex(ValueError, "candidate_k"):
+            TrackingFileJob.from_dict(
+                {
+                    "h5_path": "sample.h5",
+                    "object_set": "cells",
+                    "method": "boundary_ot",
+                    "candidate_k": 0,
+                }
+            )
         with self.assertRaises(ValueError):
             TrackingFileJob.from_dict(
                 {"h5_path": "sample.h5", "object_set": "cells", "method": "optimal_transport"}
@@ -230,6 +257,64 @@ class SparseTrackingTests(unittest.TestCase):
             with Trajectory(path, mode="r") as trajectory:
                 self.assertEqual(trajectory.boundary_sets(), [])
                 self.assertEqual(trajectory.track_sets("cells"), [])
+
+    def test_centroid_knn_candidates_apply_k_and_distance_together(self):
+        centroids = self.np.asarray(
+            [
+                [0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [0.0, 2.0, 0.0],
+                [0.0, 3.0, 0.0],
+                [0.0, 1.1, 0.0],
+            ]
+        )
+        candidates = _centroid_knn_candidates(
+            self.np.asarray([4]),
+            self.np.asarray([0, 1, 2, 3]),
+            centroids,
+            k=2,
+            max_distance=10.0,
+            np=self.np,
+        )
+        self.assertEqual([row for row, _distance in candidates[4]], [1, 2])
+        gated = _centroid_knn_candidates(
+            self.np.asarray([4]),
+            self.np.asarray([0, 1, 2, 3]),
+            centroids,
+            k=5,
+            max_distance=0.5,
+            np=self.np,
+        )
+        self.assertEqual([row for row, _distance in gated[4]], [1])
+
+    def test_boundary_ot_tracking_reports_k_limited_candidate_counts(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "sample.ct2.h5"
+            self._create_indexed_h5(path)
+            events = []
+            with Trajectory(path, mode="r") as trajectory:
+                result = track_minimum_boundary_ot_cost(
+                    trajectory,
+                    "cells",
+                    max_distance=20.0,
+                    candidate_k=1,
+                    ot_method="sinkhorn",
+                    max_boundary_points=None,
+                    save_motion=False,
+                    save_outputs=False,
+                    metadata={"distance_unit": "pixel"},
+                    progress=events.append,
+                )
+
+            self.assertEqual(result.graph.schema["candidate_k"], 1)
+            self.assertEqual(
+                result.graph.schema["candidate_selection"]["method"],
+                "registered_centroid_knn_within_radius",
+            )
+            scored_frames = [event for event in events if int(event["frame"]) > 1]
+            self.assertEqual(sum(int(event["candidate_count"]) for event in scored_frames), 6)
+            self.assertEqual(sum(int(event["ot_score_count"]) for event in scored_frames), 6)
+            self.assertTrue(all(int(event["full_plan_count"]) == 0 for event in scored_frames))
 
     def test_batch_tracking_dry_run_and_saved_provenance(self):
         with TemporaryDirectory() as tmp:

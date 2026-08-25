@@ -42,6 +42,7 @@ class TrackingFileJob:
     track_set: str = "centroid_mindist"
     method: str = "minimum_centroid_distance"
     max_distance: float = 5.0
+    candidate_k: int = 5
     coordinate_scale: tuple[float, float, float] = (1.0, 1.0, 1.0)
     registration_set: str | None = None
     boundary_set: str | None = None
@@ -49,7 +50,11 @@ class TrackingFileJob:
     boundary_source_name: str | None = None
     boundary_source_role: str | None = None
     ot_cost_cutoff: float = float("inf")
-    ot_method: str = "unbalanced"
+    # ``ot_method`` is the legacy single-method setting. New jobs should set
+    # the score and accepted-winner methods independently.
+    ot_method: str | None = None
+    score_ot_method: str | None = None
+    winner_ot_method: str | None = None
     sinkhorn_regularization: float = 0.05
     unbalanced_reach: float = 2.0
     partial_mass: float = 0.9
@@ -94,6 +99,29 @@ class TrackingFileJob:
             raise ValueError("coordinate_scale must contain Z,Y,X values")
         scale = tuple(float(value) for value in scale_value)
         max_distance = float(payload.get("max_distance", payload.get("distcut", 5.0)))
+        candidate_k = int(payload.get("candidate_k", 5))
+        if candidate_k < 1:
+            raise ValueError("candidate_k must be >= 1")
+        legacy_ot_method = (
+            None
+            if payload.get("ot_method") in (None, "")
+            else str(payload.get("ot_method")).lower()
+        )
+        score_ot_method = str(
+            payload.get("score_ot_method") or legacy_ot_method or "emd"
+        ).lower()
+        winner_ot_method = str(
+            payload.get("winner_ot_method") or legacy_ot_method or "unbalanced"
+        ).lower()
+        valid_ot_methods = {"emd", "sinkhorn", "unbalanced", "partial"}
+        if score_ot_method not in valid_ot_methods:
+            raise ValueError(
+                "score_ot_method must be emd, sinkhorn, unbalanced, or partial"
+            )
+        if winner_ot_method not in valid_ot_methods:
+            raise ValueError(
+                "winner_ot_method must be emd, sinkhorn, unbalanced, or partial"
+            )
         max_boundary_points_value = payload.get("max_boundary_points", 512)
         return cls(
             h5_path=Path(path_value),
@@ -101,6 +129,7 @@ class TrackingFileJob:
             track_set=str(payload.get("track_set") or "centroid_mindist"),
             method=method,
             max_distance=max_distance,
+            candidate_k=candidate_k,
             coordinate_scale=(scale[0], scale[1], scale[2]),
             registration_set=(
                 None if payload.get("registration_set") in (None, "") else str(payload.get("registration_set"))
@@ -121,7 +150,9 @@ class TrackingFileJob:
                 else str(payload.get("boundary_source_role"))
             ),
             ot_cost_cutoff=float(payload.get("ot_cost_cutoff", float("inf"))),
-            ot_method=str(payload.get("ot_method") or "unbalanced").lower(),
+            ot_method=legacy_ot_method,
+            score_ot_method=score_ot_method,
+            winner_ot_method=winner_ot_method,
             sinkhorn_regularization=float(payload.get("sinkhorn_regularization", 0.05)),
             unbalanced_reach=float(payload.get("unbalanced_reach", 2.0)),
             partial_mass=float(payload.get("partial_mass", 0.9)),
@@ -248,12 +279,27 @@ def run_batch_tracking(
                 "track_set": file_job.track_set,
                 "method": file_job.method,
                 "max_distance": file_job.max_distance,
+                "candidate_k": (
+                    file_job.candidate_k
+                    if file_job.method == "minimum_registered_boundary_ot_cost" else None
+                ),
                 "coordinate_scale": list(file_job.coordinate_scale),
                 "distance_unit": str(file_job.metadata.get("distance_unit") or "scaled_coordinate_unit"),
                 "registration_set": file_job.registration_set,
                 "boundary_set": file_job.boundary_set,
                 "boundary_source_name": file_job.boundary_source_name,
-                "ot_method": file_job.ot_method if file_job.method == "minimum_registered_boundary_ot_cost" else None,
+                "ot_method": (
+                    file_job.score_ot_method or file_job.ot_method or "emd"
+                    if file_job.method == "minimum_registered_boundary_ot_cost" else None
+                ),
+                "score_ot_method": (
+                    file_job.score_ot_method or file_job.ot_method or "emd"
+                    if file_job.method == "minimum_registered_boundary_ot_cost" else None
+                ),
+                "winner_ot_method": (
+                    file_job.winner_ot_method or file_job.ot_method or "unbalanced"
+                    if file_job.method == "minimum_registered_boundary_ot_cost" else None
+                ),
                 "max_boundary_points": (
                     file_job.max_boundary_points
                     if file_job.method == "minimum_registered_boundary_ot_cost" else None
@@ -351,10 +397,13 @@ def _run_file_job(
                 boundary_source_name=file_job.boundary_source_name,
                 boundary_source_role=file_job.boundary_source_role,
                 max_distance=file_job.max_distance,
+                candidate_k=file_job.candidate_k,
                 ot_cost_cutoff=file_job.ot_cost_cutoff,
                 track_set=file_job.track_set,
                 registration_set=file_job.registration_set,
                 ot_method=file_job.ot_method,
+                score_ot_method=file_job.score_ot_method,
+                winner_ot_method=file_job.winner_ot_method,
                 sinkhorn_regularization=file_job.sinkhorn_regularization,
                 unbalanced_reach=file_job.unbalanced_reach,
                 partial_mass=file_job.partial_mass,

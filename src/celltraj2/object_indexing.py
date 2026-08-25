@@ -279,6 +279,17 @@ def _run_file_job(
                 }
             )
             return
+        if save_outputs and file_job.source_kind == "mask_set" and not overwrite:
+            existing_derived = [
+                int(frame)
+                for frame in frames
+                if trajectory.store.has_label_frame(file_job.source_labels, int(frame))
+            ]
+            if existing_derived:
+                raise FileExistsError(
+                    f"Derived label frames already exist for {file_job.source_labels!r}: "
+                    f"{existing_derived}. Enable overwrite or choose a new derived label-set name."
+                )
 
         source_family = "masks" if file_job.source_kind == "mask_set" else "labels"
         dependency_paths = [
@@ -376,7 +387,7 @@ def _run_file_job(
                         frame,
                         derived_label_frames[frame],
                         overwrite=overwrite,
-                        attrs={
+                        metadata={
                             "derived_from_kind": "mask_set",
                             "derived_from_name": file_job.source_name,
                             "mask_conversion": file_job.mask_conversion,

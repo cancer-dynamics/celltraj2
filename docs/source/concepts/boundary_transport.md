@@ -119,14 +119,37 @@ partial and balanced modes, the comparison score is matched transport cost
 divided by transported mass. Candidate boundary links must also satisfy the
 configured minimum source and target coverage.
 
-Centroid distance remains the first, inexpensive candidate gate. Registration
-is applied before centroid gating and boundary cost evaluation. Optional
-centroid cost prealignment compares residual shape after translation; when it
-is used, centroid distance remains separately present in the object-link row.
+Registered centroid distance remains the first, inexpensive candidate gate.
+For each child, tracking queries one parent-centroid tree and evaluates boundary
+OT for at most `candidate_k` nearest parents that also lie inside
+`max_distance`. The default `candidate_k` is five; the radius remains a hard
+outer safety gate, while `k` prevents a broad 10--20 micron search radius from
+turning every nearby cell into an OT solve. Optional centroid cost prealignment
+compares residual shape after translation; when it is used, centroid distance
+remains separately present in the object-link row.
 
-For surface motion along an already accepted object link, low coverage does not
-delete or change the object link. The motion-link `quality_flags` marks source
-or target coverage below the configured warning threshold.
+Tracking has two independent OT method settings. `score_ot_method` ranks all
+centroid-gated candidates and determines the track-link `ot_cost`, coverage
+acceptance, and `ot_cost_cutoff`; it defaults to exact balanced `emd`, the
+inexpensive scoring path at the capped boundary sample sizes. After a parent is
+accepted, `winner_ot_method` defaults to robust `unbalanced` and is run once to
+construct saved point correspondences and surface displacement. This winner
+calculation does not retroactively change link identity. If motion is disabled
+or boundaries are transient, it is not run. The legacy `ot_method` argument
+still assigns one method to both stages so old saved jobs retain their behavior.
+
+Stored boundary points for the two participating frames are read as contiguous
+frame blocks and registered once in memory. Candidate scoring retains the dense
+solver result only long enough to identify the best parent. Numerical edge
+sparsification, distance quantiles, and point-level motion summaries are
+materialized only for that winning link, and only when accepted boundary motion
+is requested. If the score and winner methods differ, the winning pair is
+solved again with the winner method before that materialization.
+
+For surface motion along an already accepted object link, low coverage or a
+winner-solver convergence warning does not delete or change the object link.
+The motion-link `quality_flags` records those conditions independently from the
+candidate acceptance decision.
 
 ## Numerical sparsification
 

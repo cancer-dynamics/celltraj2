@@ -2,7 +2,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
 
-from celltraj2.object_indexing import run_batch_object_indexing
+from celltraj2.object_indexing import ObjectIndexFileJob, _mask_to_labels, run_batch_object_indexing
 from celltraj2.schema import ImageSourceSpec, RoiSpec, TrajectoryMetadata
 from celltraj2.store import TrajectoryStore
 from celltraj2.trajectory import Trajectory
@@ -132,6 +132,138 @@ class ObjectIndexingTests(unittest.TestCase):
             with TrajectoryStore.open(path, mode="r") as store:
                 self.assertEqual(store.list_object_sets(), [])
                 self.assertEqual(store.list_object_indexing_runs(), [])
+
+    def test_mask_source_job_round_trips_typed_source_and_conversion(self):
+        job = ObjectIndexFileJob.from_dict(
+            {
+                "h5_path": "sample.ct2.h5",
+                "object_set": "basement_objects",
+                "source_kind": "mask_set",
+                "source_mask_set": "basement",
+                "derived_label_set": "basement_object_labels",
+                "mask_conversion": "connected_components",
+            }
+        )
+
+        self.assertEqual(job.source_name, "basement")
+        self.assertEqual(job.source_labels, "basement_object_labels")
+        self.assertEqual(job.to_dict()["source_kind"], "mask_set")
+        self.assertEqual(job.to_dict()["mask_conversion"], "connected_components")
+
+    def test_mask_whole_foreground_promotion_materializes_labels_and_provenance(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "sample.ct2.h5"
+            self._create_labeled_h5(path)
+            mask_1 = self.np.zeros((5, 6), dtype=bool)
+            mask_1[1, 1] = True
+            mask_1[3, 4] = True
+            mask_2 = self.np.zeros((5, 6), dtype=bool)
+            mask_2[2, 1:5] = True
+            with TrajectoryStore.open(path, mode="r+") as store:
+                store.write_mask_frame("basement", 1, mask_1)
+                store.write_mask_frame("basement", 2, mask_2)
+
+            dry_summary = run_batch_object_indexing(
+                {
+                    "job_id": "promote_mask_preview",
+                    "save_outputs": False,
+                    "files": [
+                        {
+                            "h5_path": str(path),
+                            "object_set": "basement_objects",
+                            "source_kind": "mask_set",
+                            "source_mask_set": "basement",
+                            "source_label_set": "basement_object_labels",
+                            "mask_conversion": "whole_foreground",
+                        }
+                    ],
+                }
+            )
+            self.assertEqual(dry_summary.observations, 2)
+            with TrajectoryStore.open(path, mode="r") as store:
+                self.assertNotIn("labels/basement_object_labels", store.h5)
+                self.assertNotIn("object_sets/basement_objects", store.h5)
+
+            events = []
+            saved_summary = run_batch_object_indexing(
+                {
+                    "job_id": "promote_mask",
+                    "save_outputs": True,
+                    "files": [
+                        {
+                            "h5_path": str(path),
+                            "object_set": "basement_objects",
+                            "source_kind": "mask_set",
+                            "source_mask_set": "basement",
+                            "source_label_set": "basement_object_labels",
+                            "mask_conversion": "whole_foreground",
+                        }
+                    ],
+                },
+                reporter=lambda event: events.append(dict(event)),
+            )
+            self.assertEqual(saved_summary.observations, 2, events)
+            with TrajectoryStore.open(path, mode="r") as store:
+                derived = store.h5["labels/basement_object_labels/frame_1"][()]
+                self.assertEqual(sorted(self.np.unique(derived).tolist()), [0, 1])
+                self.assertEqual(store.observation_count("basement_objects"), 2)
+                metadata = store.read_json(
+                    "/object_sets/basement_objects/object_set.json"
+                )["metadata"]
+                self.assertEqual(metadata["source_kind"], "mask_set")
+                self.assertEqual(metadata["source_mask_set"], "basement")
+                self.assertEqual(metadata["derived_label_set"], "basement_object_labels")
+
+    def test_connected_component_mask_promotion_assigns_one_label_per_region(self):
+        try:
+            import scipy  # noqa: F401
+        except ImportError:
+            self.skipTest("scipy is not installed")
+        mask = self.np.zeros((6, 6), dtype=bool)
+        mask[1:3, 1:3] = True
+        mask[4, 4] = True
+
+        labels = _mask_to_labels(mask, conversion="connected_components")
+
+        self.assertEqual(sorted(self.np.unique(labels).tolist()), [0, 1, 2])
+
+    def test_mask_promotion_refuses_existing_derived_frames_before_commit(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "sample.ct2.h5"
+            self._create_labeled_h5(path)
+            mask = self.np.zeros((4, 4), dtype=bool)
+            mask[1:3, 1:3] = True
+            sentinel = self.np.full((4, 4), 7, dtype=self.np.uint16)
+            with TrajectoryStore.open(path, mode="r+") as store:
+                store.write_mask_frame("basement", 1, mask)
+                store.write_mask_frame("basement", 2, mask)
+                store.write_label_frame("basement_object_labels", 1, sentinel)
+
+            events = []
+            summary = run_batch_object_indexing(
+                {
+                    "job_id": "promote_mask_collision",
+                    "files": [
+                        {
+                            "h5_path": str(path),
+                            "object_set": "basement_objects",
+                            "source_kind": "mask_set",
+                            "source_mask_set": "basement",
+                            "source_label_set": "basement_object_labels",
+                        }
+                    ],
+                },
+                reporter=lambda event: events.append(dict(event)),
+            )
+
+            self.assertEqual(summary.failed, 1)
+            self.assertTrue(any("Derived label frames already exist" in str(event) for event in events))
+            with TrajectoryStore.open(path, mode="r") as store:
+                self.np.testing.assert_array_equal(
+                    store.read_label_frame("basement_object_labels", 1), sentinel
+                )
+                self.assertNotIn("labels/basement_object_labels/frame_2", store.h5)
+                self.assertNotIn("object_sets/basement_objects", store.h5)
 
 
 if __name__ == "__main__":

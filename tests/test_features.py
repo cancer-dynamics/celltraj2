@@ -5,10 +5,31 @@ import unittest
 from celltraj2.boundaries import BoundarySourceSpec
 from celltraj2.boundary_features import boundary_multipole_magnitudes
 from celltraj2.feature_extraction import run_batch_feature_extraction
-from celltraj2.features import regionprops_v1_spec, site_signaling_v1_spec
+from celltraj2.features import (
+    INTENSITY_PERCENTILE_STATISTICS,
+    expand_intensity_statistics,
+    regionprops_v1_spec,
+    site_signaling_v1_spec,
+)
 from celltraj2.schema import ChannelSpec, ImageSourceSpec, TrajectoryMetadata
 from celltraj2.store import TrajectoryStore
 from celltraj2.trajectory import Trajectory
+
+
+class IntensityStatisticContractTests(unittest.TestCase):
+    def test_percentiles_bundle_expands_in_stable_order(self):
+        self.assertEqual(
+            expand_intensity_statistics(["mean", "percentiles"]),
+            ["mean", *INTENSITY_PERCENTILE_STATISTICS],
+        )
+
+    def test_intensity_statistics_reject_invalid_values(self):
+        with self.assertRaisesRegex(ValueError, "at least one statistic"):
+            expand_intensity_statistics([])
+        with self.assertRaisesRegex(ValueError, "Unsupported intensity statistic"):
+            expand_intensity_statistics(["mode"])
+        with self.assertRaisesRegex(ValueError, "within 0..100"):
+            expand_intensity_statistics(["percentile_101"])
 
 
 class FeatureExtractionTests(unittest.TestCase):
@@ -349,6 +370,50 @@ class FeatureExtractionTests(unittest.TestCase):
                 self.assertEqual(column_schema["background"]["source_name"], "background")
                 self.assertEqual(column_schema["background"]["region"], "inside")
                 self.assertEqual(column_schema["background"]["mode"], "mean")
+
+    def test_intensity_percentiles_bundle_writes_named_columns_and_schema(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "sample.ct2.h5"
+            self._create_feature_h5(path)
+
+            with Trajectory(path, mode="r+") as trajectory:
+                spec = {
+                    "feature_set": "intensity_percentiles",
+                    "object_set": "cyto",
+                    "source_label_set": "cyto",
+                    "features": [
+                        {
+                            "kind": "intensity",
+                            "name": "signal",
+                            "channel": {"readout": "erk"},
+                            "compartment": {"label_set": "cyto", "name": "cell"},
+                            "stats": ["percentiles"],
+                        }
+                    ],
+                }
+                result = trajectory.extract_features(spec, run_id="features_percentiles")
+                values = trajectory.object_set("cyto").read_features("intensity_percentiles")
+                schema = trajectory.object_set("cyto").read_feature_schema("intensity_percentiles")
+
+                expected_names = [
+                    f"signal_{stat}" for stat in INTENSITY_PERCENTILE_STATISTICS
+                ]
+                self.assertEqual(result.feature_count, len(expected_names))
+                self.assertEqual(
+                    list(values.dtype.names or ()),
+                    ["observation_id", *expected_names],
+                )
+                self.np.testing.assert_allclose(values["signal_percentile_0"], [2.0, 5.0])
+                self.np.testing.assert_allclose(values["signal_percentile_50"], [3.0, 5.0])
+                self.np.testing.assert_allclose(values["signal_percentile_100"], [4.0, 10.0])
+                self.assertEqual(
+                    [
+                        column["statistic"]
+                        for column in schema["columns"]
+                        if "statistic" in column
+                    ],
+                    list(INTENSITY_PERCENTILE_STATISTICS),
+                )
 
     def test_ratio_can_subtract_mean_background_from_inverse_label_region(self):
         with TemporaryDirectory() as tmp:

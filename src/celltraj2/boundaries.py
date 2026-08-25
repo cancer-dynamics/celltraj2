@@ -255,6 +255,30 @@ class BoundaryTransportPlan:
 
 
 @dataclass(frozen=True)
+class _BoundaryTransportScore:
+    """Dense solver result retained only long enough to rank one candidate set."""
+
+    transport_matrix: Any
+    cost_matrix: Any
+    total_cost: float
+    method: str
+    transport_cost: float
+    objective: float
+    matched_mean_cost: float
+    source_total_mass: float
+    target_total_mass: float
+    transported_mass: float
+    source_coverage: float
+    target_coverage: float
+    solver_iterations: int
+    solver_converged: bool
+    source_weights: Any
+    target_weights: Any
+    source_matched_mass: Any
+    target_matched_mass: Any
+
+
+@dataclass(frozen=True)
 class BoundaryPointSample:
     """Deterministic spatial sample rows and represented point multiplicity."""
 
@@ -1412,6 +1436,15 @@ def compute_boundary_neighbors(
         raise ValueError("k must be >= 1")
     if max_distance is not None and (not np.isfinite(max_distance) or float(max_distance) <= 0):
         raise ValueError("max_distance must be finite and > 0")
+    source_subset_payload = dict(source_subset or {"mode": "whole"})
+    target_subset_payload = dict(target_subset or {"mode": "whole"})
+    if str(source_subset_payload.get("mode") or "whole") != "whole" or str(
+        target_subset_payload.get("mode") or "whole"
+    ) != "whole":
+        raise ValueError(
+            "Boundary entity subsets require a resolved classification/attribute selector; "
+            "only mode='whole' is currently executable"
+        )
     view = as_boundary_library_view(trajectory, boundary_name, library)
     selected_source_ids = resolve_boundary_source_ids(
         view,
@@ -1516,8 +1549,8 @@ def compute_boundary_neighbors(
         "target_ids": "all" if selected_target_ids is None else sorted(selected_target_ids),
         "source_refs": None if source_refs is None else _json_safe(list(source_refs)),
         "target_refs": None if target_refs is None else _json_safe(list(target_refs)),
-        "source_subset": _json_safe(dict(source_subset or {"mode": "whole"})),
-        "target_subset": _json_safe(dict(target_subset or {"mode": "whole"})),
+        "source_subset": _json_safe(source_subset_payload),
+        "target_subset": _json_safe(target_subset_payload),
         "edge_count": int(indices.shape[0]),
         "metadata": _json_safe(dict(metadata or {})),
     }
@@ -1558,7 +1591,7 @@ def pairwise_distance_matrix(source_points: Any, target_points: Any) -> Any:
     return np.sqrt(np.sum(delta * delta, axis=2))
 
 
-def optimal_transport_plan(
+def _optimal_transport_score(
     source_points: Any,
     target_points: Any,
     *,
@@ -1569,12 +1602,9 @@ def optimal_transport_plan(
     max_transport_distance: float | None = None,
     source_weights: Any | None = None,
     target_weights: Any | None = None,
-    mass_tolerance: float = 1e-12,
-    relative_mass_tolerance: float = 0.0,
-    retained_mass_fraction: float = 1.0,
     max_iterations: int = 10_000,
-) -> BoundaryTransportPlan:
-    """Compute a balanced, unbalanced, or partial boundary transport plan.
+) -> _BoundaryTransportScore:
+    """Solve one transport pair without materializing sparse output edges.
 
     ``unbalanced`` uses a log-domain generalized Sinkhorn iteration and can
     leave unsupported source or target mass unmatched. ``partial`` transports
@@ -1582,10 +1612,6 @@ def optimal_transport_plan(
     ``max_transport_distance`` is an exact support constraint for those two
     unmatched-aware methods. Balanced methods deliberately reject that option
     because a hard gate can make their marginal constraints infeasible.
-
-    Output sparsification happens after solving. It removes numerical tails by
-    absolute mass, mass relative to each source marginal, and retained
-    cumulative mass while reporting how much mass was omitted.
     """
 
     np = _require_numpy()
@@ -1598,15 +1624,6 @@ def optimal_transport_plan(
     cost = pairwise_distance_matrix(source, target)
     a = _transport_weights(source_weights, source.shape[0], name="source_weights", np=np)
     b = _transport_weights(target_weights, target.shape[0], name="target_weights", np=np)
-    absolute_tolerance = float(mass_tolerance)
-    relative_tolerance = float(relative_mass_tolerance)
-    retained_fraction = float(retained_mass_fraction)
-    if not np.isfinite(absolute_tolerance) or absolute_tolerance < 0:
-        raise ValueError("mass_tolerance must be finite and >= 0")
-    if not np.isfinite(relative_tolerance) or relative_tolerance < 0:
-        raise ValueError("relative_mass_tolerance must be finite and >= 0")
-    if not np.isfinite(retained_fraction) or retained_fraction <= 0 or retained_fraction > 1:
-        raise ValueError("retained_mass_fraction must be in (0, 1]")
     support = np.ones(cost.shape, dtype=bool)
     if max_transport_distance is not None:
         distance_limit = float(max_transport_distance)
@@ -1742,26 +1759,9 @@ def optimal_transport_plan(
     else:
         objective = transport_cost
         score = matched_mean_cost
-    source_rows, target_rows, dropped_mass, raw_edge_count = _sparsify_transport_plan(
-        plan,
-        mass_tolerance=absolute_tolerance,
-        relative_mass_tolerance=relative_tolerance,
-        retained_mass_fraction=retained_fraction,
-        np=np,
-    )
-    masses = plan[source_rows, target_rows]
-    edge_cost = cost[source_rows, target_rows]
-    quantiles = _weighted_quantiles(
-        cost[plan > 0],
-        plan[plan > 0],
-        (0.50, 0.90, 0.99),
-        np=np,
-    )
-    return BoundaryTransportPlan(
-        source_rows=source_rows.astype(np.int64),
-        target_rows=target_rows.astype(np.int64),
-        mass=masses.astype(np.float64),
-        edge_cost=edge_cost.astype(np.float64),
+    return _BoundaryTransportScore(
+        transport_matrix=plan,
+        cost_matrix=cost,
         total_cost=float(score),
         method=selected_method,
         transport_cost=transport_cost,
@@ -1772,18 +1772,117 @@ def optimal_transport_plan(
         transported_mass=transported_mass,
         source_coverage=(source_coverage_mass / float(np.sum(a))) if np.sum(a) > 0 else 0.0,
         target_coverage=(target_coverage_mass / float(np.sum(b))) if np.sum(b) > 0 else 0.0,
-        dropped_mass=float(dropped_mass),
-        raw_edge_count=int(raw_edge_count),
-        edge_distance_p50=float(quantiles[0]),
-        edge_distance_p90=float(quantiles[1]),
-        edge_distance_p99=float(quantiles[2]),
-        edge_distance_max=float(np.max(cost[plan > 0])) if np.any(plan > 0) else float("nan"),
         solver_iterations=int(solver_iterations),
         solver_converged=bool(solver_converged),
         source_weights=a,
         target_weights=b,
         source_matched_mass=source_marginal,
         target_matched_mass=target_marginal,
+    )
+
+
+def _materialize_transport_plan(
+    score: _BoundaryTransportScore,
+    *,
+    mass_tolerance: float = 1e-12,
+    relative_mass_tolerance: float = 0.0,
+    retained_mass_fraction: float = 1.0,
+) -> BoundaryTransportPlan:
+    """Materialize sparse edges and diagnostics for one selected OT score."""
+
+    np = _require_numpy()
+    absolute_tolerance = float(mass_tolerance)
+    relative_tolerance = float(relative_mass_tolerance)
+    retained_fraction = float(retained_mass_fraction)
+    if not np.isfinite(absolute_tolerance) or absolute_tolerance < 0:
+        raise ValueError("mass_tolerance must be finite and >= 0")
+    if not np.isfinite(relative_tolerance) or relative_tolerance < 0:
+        raise ValueError("relative_mass_tolerance must be finite and >= 0")
+    if not np.isfinite(retained_fraction) or retained_fraction <= 0 or retained_fraction > 1:
+        raise ValueError("retained_mass_fraction must be in (0, 1]")
+    dense = np.asarray(score.transport_matrix, dtype=float)
+    cost = np.asarray(score.cost_matrix, dtype=float)
+    source_rows, target_rows, dropped_mass, raw_edge_count = _sparsify_transport_plan(
+        dense,
+        mass_tolerance=absolute_tolerance,
+        relative_mass_tolerance=relative_tolerance,
+        retained_mass_fraction=retained_fraction,
+        np=np,
+    )
+    masses = dense[source_rows, target_rows]
+    edge_cost = cost[source_rows, target_rows]
+    positive = dense > 0
+    quantiles = _weighted_quantiles(
+        cost[positive],
+        dense[positive],
+        (0.50, 0.90, 0.99),
+        np=np,
+    )
+    return BoundaryTransportPlan(
+        source_rows=source_rows.astype(np.int64),
+        target_rows=target_rows.astype(np.int64),
+        mass=masses.astype(np.float64),
+        edge_cost=edge_cost.astype(np.float64),
+        total_cost=float(score.total_cost),
+        method=str(score.method),
+        transport_cost=float(score.transport_cost),
+        objective=float(score.objective),
+        matched_mean_cost=float(score.matched_mean_cost),
+        source_total_mass=float(score.source_total_mass),
+        target_total_mass=float(score.target_total_mass),
+        transported_mass=float(score.transported_mass),
+        source_coverage=float(score.source_coverage),
+        target_coverage=float(score.target_coverage),
+        dropped_mass=float(dropped_mass),
+        raw_edge_count=int(raw_edge_count),
+        edge_distance_p50=float(quantiles[0]),
+        edge_distance_p90=float(quantiles[1]),
+        edge_distance_p99=float(quantiles[2]),
+        edge_distance_max=float(np.max(cost[positive])) if np.any(positive) else float("nan"),
+        solver_iterations=int(score.solver_iterations),
+        solver_converged=bool(score.solver_converged),
+        source_weights=score.source_weights,
+        target_weights=score.target_weights,
+        source_matched_mass=score.source_matched_mass,
+        target_matched_mass=score.target_matched_mass,
+    )
+
+
+def optimal_transport_plan(
+    source_points: Any,
+    target_points: Any,
+    *,
+    method: Literal["emd", "sinkhorn", "unbalanced", "partial"] = "emd",
+    regularization: float = 0.05,
+    unbalanced_reach: float | Sequence[float] = 2.0,
+    partial_mass: float = 0.9,
+    max_transport_distance: float | None = None,
+    source_weights: Any | None = None,
+    target_weights: Any | None = None,
+    mass_tolerance: float = 1e-12,
+    relative_mass_tolerance: float = 0.0,
+    retained_mass_fraction: float = 1.0,
+    max_iterations: int = 10_000,
+) -> BoundaryTransportPlan:
+    """Compute and materialize one balanced, unbalanced, or partial OT plan."""
+
+    score = _optimal_transport_score(
+        source_points,
+        target_points,
+        method=method,
+        regularization=regularization,
+        unbalanced_reach=unbalanced_reach,
+        partial_mass=partial_mass,
+        max_transport_distance=max_transport_distance,
+        source_weights=source_weights,
+        target_weights=target_weights,
+        max_iterations=max_iterations,
+    )
+    return _materialize_transport_plan(
+        score,
+        mass_tolerance=mass_tolerance,
+        relative_mass_tolerance=relative_mass_tolerance,
+        retained_mass_fraction=retained_mass_fraction,
     )
 
 

@@ -436,6 +436,9 @@ def track_minimum_centroid_distance(
                 "object_count": int(np.sum(frames == 1)),
                 "linked_count": 0,
                 "unlinked_count": int(np.sum(frames == 1)),
+                "candidate_count": 0,
+                "ot_score_count": 0,
+                "full_plan_count": 0,
             }
         )
     for frame in sorted(int(value) for value in np.unique(frames)):
@@ -629,6 +632,86 @@ def _transport_pair_samples(
         "target_cost": target_cost,
         "voxel_spacing": max(source_sample.voxel_spacing, target_sample.voxel_spacing),
     }
+
+
+def _centroid_knn_candidates(
+    child_rows: Any,
+    parent_rows: Any,
+    centroids: Any,
+    *,
+    k: int,
+    max_distance: float,
+    np: Any,
+) -> dict[int, list[tuple[int, float]]]:
+    """Return at most ``k`` nearest registered-centroid parents per child."""
+
+    child_values = np.asarray(child_rows, dtype=np.int64)
+    parent_values = np.asarray(parent_rows, dtype=np.int64)
+    result = {int(row): [] for row in child_values}
+    if not child_values.size or not parent_values.size:
+        return result
+    parent_positions = np.asarray(centroids[parent_values], dtype=float)
+    child_positions = np.asarray(centroids[child_values], dtype=float)
+    valid_parent = np.all(np.isfinite(parent_positions), axis=1)
+    valid_child = np.all(np.isfinite(child_positions), axis=1)
+    valid_parent_rows = parent_values[valid_parent]
+    valid_parent_positions = parent_positions[valid_parent]
+    valid_child_rows = child_values[valid_child]
+    valid_child_positions = child_positions[valid_child]
+    if not valid_parent_rows.size or not valid_child_rows.size:
+        return result
+    neighbor_count = min(int(k), int(valid_parent_rows.size))
+    try:
+        from scipy.spatial import cKDTree  # type: ignore
+
+        tree = cKDTree(valid_parent_positions)
+        try:
+            distances, local_rows = tree.query(
+                valid_child_positions,
+                k=neighbor_count,
+                distance_upper_bound=float(max_distance),
+                workers=1,
+            )
+        except TypeError:
+            distances, local_rows = tree.query(
+                valid_child_positions,
+                k=neighbor_count,
+                distance_upper_bound=float(max_distance),
+            )
+        distances = np.asarray(distances)
+        local_rows = np.asarray(local_rows)
+        if neighbor_count == 1:
+            distances = distances[:, None]
+            local_rows = local_rows[:, None]
+        for child_row, child_distances, child_local_rows in zip(
+            valid_child_rows, distances, local_rows, strict=False
+        ):
+            candidates = [
+                (int(valid_parent_rows[int(local_row)]), float(distance))
+                for distance, local_row in zip(child_distances, child_local_rows, strict=False)
+                if int(local_row) < int(valid_parent_rows.size)
+                and np.isfinite(distance)
+                and float(distance) < float(max_distance)
+            ]
+            candidates.sort(key=lambda value: (value[1], value[0]))
+            result[int(child_row)] = candidates
+        return result
+    except ImportError:
+        pass
+
+    for child_row, child_position in zip(valid_child_rows, valid_child_positions, strict=False):
+        delta = valid_parent_positions - child_position
+        distances = np.sqrt(np.sum(delta * delta, axis=1))
+        eligible = np.flatnonzero(np.isfinite(distances) & (distances < float(max_distance)))
+        order = sorted(
+            (int(local_row) for local_row in eligible),
+            key=lambda local_row: (float(distances[local_row]), int(valid_parent_rows[local_row])),
+        )[:neighbor_count]
+        result[int(child_row)] = [
+            (int(valid_parent_rows[local_row]), float(distances[local_row]))
+            for local_row in order
+        ]
+    return result
 
 
 def _transport_point_summary(
@@ -1163,11 +1246,14 @@ def track_minimum_boundary_ot_cost(
     boundary_source_name: str | None = None,
     boundary_source_role: str | None = None,
     max_distance: float,
+    candidate_k: int = 5,
     ot_cost_cutoff: float = float("inf"),
     track_set: str = "boundary_ot",
     motion_set: str | None = None,
     registration_set: str | None = None,
-    ot_method: str = "unbalanced",
+    ot_method: str | None = None,
+    score_ot_method: str | None = None,
+    winner_ot_method: str | None = None,
     sinkhorn_regularization: float = 0.05,
     unbalanced_reach: float = 2.0,
     partial_mass: float = 0.9,
@@ -1189,17 +1275,19 @@ def track_minimum_boundary_ot_cost(
 ) -> TrackingResult:
     """Track observations by registered boundary OT cost after centroid gating.
 
-    Candidate parents are restricted to the immediately preceding local frame
-    and a registered physical-coordinate centroid radius. Point identities and
-    stored boundary coordinates remain native; only the cost and displacement
-    calculations use the selected registration.
+    Candidate parents are restricted to the ``candidate_k`` nearest registered
+    centroids inside the physical-coordinate radius in the immediately
+    preceding local frame. Point identities and stored boundary coordinates
+    remain native; only the cost and displacement calculations use the selected
+    registration.
     """
 
     from celltraj2.boundaries import (
+        _materialize_transport_plan,
+        _optimal_transport_score,
         as_boundary_library_view,
         boundary_motion_link_dtype,
         build_boundary_library,
-        optimal_transport_plan,
         resolve_boundary_source_ids,
     )
 
@@ -1211,13 +1299,25 @@ def track_minimum_boundary_ot_cost(
     )
     motion_name = validate_name(motion_set or track_name, kind="boundary motion set")
     cutoff = float(max_distance)
+    centroid_candidate_k = int(candidate_k)
     ot_cutoff = float(ot_cost_cutoff)
     if not np.isfinite(cutoff) or cutoff <= 0:
         raise ValueError("max_distance must be finite and > 0")
+    if centroid_candidate_k < 1:
+        raise ValueError("candidate_k must be >= 1")
     if np.isnan(ot_cutoff) or ot_cutoff <= 0:
         raise ValueError("ot_cost_cutoff must be > 0 and may be infinity")
-    if ot_method not in {"emd", "sinkhorn", "unbalanced", "partial"}:
-        raise ValueError("ot_method must be emd, sinkhorn, unbalanced, or partial")
+    candidate_ot_method = str(score_ot_method or ot_method or "emd").lower()
+    accepted_winner_ot_method = str(winner_ot_method or ot_method or "unbalanced").lower()
+    valid_ot_methods = {"emd", "sinkhorn", "unbalanced", "partial"}
+    if candidate_ot_method not in valid_ot_methods:
+        raise ValueError(
+            "score_ot_method must be emd, sinkhorn, unbalanced, or partial"
+        )
+    if accepted_winner_ot_method not in valid_ot_methods:
+        raise ValueError(
+            "winner_ot_method must be emd, sinkhorn, unbalanced, or partial"
+        )
     for name, value in (
         ("min_source_coverage", min_source_coverage),
         ("min_target_coverage", min_target_coverage),
@@ -1271,9 +1371,11 @@ def track_minimum_boundary_ot_cost(
         raise ValueError(f"Boundary set {boundary_name!r} has invalid coordinate_scale_zyx")
     distance_unit = str(boundary_schema.get("distance_unit") or "scaled_coordinate_unit")
     entity_by_observation: dict[int, int] = {}
+    source_entities_by_frame: dict[int, list[Any]] = {}
     for entity in boundary.entities:
         if int(entity["source_id"]) != selected_source_id:
             continue
+        source_entities_by_frame.setdefault(int(entity["frame"]), []).append(entity)
         observation_id = int(entity["observation_id"])
         if observation_id <= 0:
             continue
@@ -1332,30 +1434,90 @@ def track_minimum_boundary_ot_cost(
         "source_name": str(source_record.get("name") or ""),
     }
 
-    point_cache: dict[int, dict[str, Any]] = {}
+    frame_point_cache: dict[int, dict[str, Any]] = {}
 
-    def registered_entity_points(entity_id: int) -> dict[str, Any]:
-        if entity_id in point_cache:
-            return point_cache[entity_id]
-        entity = boundary.entity(entity_id)
-        point_data = boundary.read_points(
-            entity_id,
-            fields=("point_id", "native_position_zyx"),
+    def registered_frame_points(frame: int) -> dict[str, Any]:
+        frame_value = int(frame)
+        if frame_value in frame_point_cache:
+            return frame_point_cache[frame_value]
+        entities = sorted(
+            source_entities_by_frame.get(frame_value, ()),
+            key=lambda value: (int(value["point_start"]), int(value["boundary_entity_id"])),
         )
-        native = np.asarray(point_data["native_position_zyx"], dtype=float)
+        entity_slices: dict[int, slice] = {}
+        nonempty = [entity for entity in entities if int(entity["point_count"]) > 0]
+        if not nonempty:
+            result = {
+                "point_id": np.empty(0, dtype=np.int64),
+                "native": np.empty((0, 3), dtype=float),
+                "registered": np.empty((0, 3), dtype=float),
+                "entity_slices": {
+                    int(entity["boundary_entity_id"]): slice(0, 0) for entity in entities
+                },
+            }
+            frame_point_cache[frame_value] = result
+            return result
+
+        block_start = min(int(entity["point_start"]) for entity in nonempty)
+        block_stop = max(
+            int(entity["point_start"]) + int(entity["point_count"])
+            for entity in nonempty
+        )
+        expected_count = sum(int(entity["point_count"]) for entity in entities)
+        if block_stop - block_start == expected_count:
+            point_data = boundary.read_points(
+                rows=slice(block_start, block_stop),
+                fields=("point_id", "native_position_zyx"),
+            )
+            point_ids = np.asarray(point_data["point_id"], dtype=np.int64)
+            native = np.asarray(point_data["native_position_zyx"], dtype=float)
+            for entity in entities:
+                local_start = int(entity["point_start"]) - block_start
+                entity_slices[int(entity["boundary_entity_id"])] = slice(
+                    local_start,
+                    local_start + int(entity["point_count"]),
+                )
+        else:
+            point_id_blocks: list[Any] = []
+            native_blocks: list[Any] = []
+            local_start = 0
+            for entity in entities:
+                entity_id = int(entity["boundary_entity_id"])
+                count = int(entity["point_count"])
+                entity_slices[entity_id] = slice(local_start, local_start + count)
+                if count:
+                    point_data = boundary.read_points(
+                        entity_id,
+                        fields=("point_id", "native_position_zyx"),
+                    )
+                    point_id_blocks.append(np.asarray(point_data["point_id"], dtype=np.int64))
+                    native_blocks.append(np.asarray(point_data["native_position_zyx"], dtype=float))
+                    local_start += count
+            point_ids = np.concatenate(point_id_blocks) if point_id_blocks else np.empty(0, dtype=np.int64)
+            native = np.concatenate(native_blocks, axis=0) if native_blocks else np.empty((0, 3), dtype=float)
         registered = native
-        if registration is not None:
+        if registration is not None and native.shape[0]:
             registered = registration.apply_zyx(
                 native,
-                np.full(native.shape[0], int(entity["frame"]), dtype=np.int64),
+                np.full(native.shape[0], frame_value, dtype=np.int64),
             )
         result = {
-            "point_id": np.asarray(point_data["point_id"], dtype=np.int64),
+            "point_id": point_ids,
             "native": native,
             "registered": registered,
+            "entity_slices": entity_slices,
         }
-        point_cache[entity_id] = result
+        frame_point_cache[frame_value] = result
         return result
+
+    def registered_entity_points(entity_id: int, frame: int) -> dict[str, Any]:
+        frame_points = registered_frame_points(frame)
+        rows = frame_points["entity_slices"].get(int(entity_id), slice(0, 0))
+        return {
+            "point_id": frame_points["point_id"][rows],
+            "native": frame_points["native"][rows],
+            "registered": frame_points["registered"][rows],
+        }
 
     edge_records: list[tuple[Any, ...]] = []
     accepted_plans: list[dict[str, Any]] = []
@@ -1386,28 +1548,41 @@ def track_minimum_boundary_ot_cost(
                         "object_count": int(child_rows.size),
                         "linked_count": 0,
                         "unlinked_count": int(child_rows.size),
+                        "candidate_count": 0,
+                        "ot_score_count": 0,
+                        "full_plan_count": 0,
                     }
                 )
             continue
-        parent_centroids = centroids[parent_rows]
+        candidates_by_child = _centroid_knn_candidates(
+            child_rows,
+            parent_rows,
+            centroids,
+            k=centroid_candidate_k,
+            max_distance=cutoff,
+            np=np,
+        )
+        frame_candidate_count = sum(len(values) for values in candidates_by_child.values())
+        frame_ot_score_count = 0
+        frame_full_plan_count = 0
+        if frame_candidate_count:
+            registered_frame_points(frame - 1)
+            registered_frame_points(frame)
         for child_row_value in child_rows:
             child_row = int(child_row_value)
-            centroid_delta = parent_centroids - centroids[child_row]
-            centroid_distance = np.sqrt(np.sum(centroid_delta * centroid_delta, axis=1))
-            candidates = np.flatnonzero(np.isfinite(centroid_distance) & (centroid_distance < cutoff))
-            if not candidates.size:
+            candidates = candidates_by_child.get(child_row, ())
+            if not candidates:
                 continue
             child_observation_id = child_row + 1
             child_entity_id = entity_by_observation[child_observation_id]
-            child_points = registered_entity_points(child_entity_id)
+            child_points = registered_entity_points(child_entity_id, frame)
             if not child_points["native"].shape[0]:
                 continue
             best: dict[str, Any] | None = None
-            for candidate in candidates:
-                parent_row = int(parent_rows[int(candidate)])
+            for parent_row, centroid_distance in candidates:
                 parent_observation_id = parent_row + 1
                 parent_entity_id = entity_by_observation[parent_observation_id]
-                parent_points = registered_entity_points(parent_entity_id)
+                parent_points = registered_entity_points(parent_entity_id, frame - 1)
                 if not parent_points["native"].shape[0]:
                     continue
                 pair = _transport_pair_samples(
@@ -1419,27 +1594,27 @@ def track_minimum_boundary_ot_cost(
                     cost_prealign=cost_prealign,
                     np=np,
                 )
-                plan = optimal_transport_plan(
+                score = _optimal_transport_score(
                     pair["source_cost"],
                     pair["target_cost"],
-                    method=ot_method,  # type: ignore[arg-type]
+                    method=candidate_ot_method,  # type: ignore[arg-type]
                     regularization=sinkhorn_regularization,
                     unbalanced_reach=unbalanced_reach,
                     partial_mass=partial_mass,
                     max_transport_distance=(
-                        max_transport_distance if ot_method in {"unbalanced", "partial"} else None
+                        max_transport_distance
+                        if candidate_ot_method in {"unbalanced", "partial"}
+                        else None
                     ),
                     source_weights=pair["source"].weights,
                     target_weights=pair["target"].weights,
-                    mass_tolerance=mass_tolerance,
-                    relative_mass_tolerance=relative_mass_tolerance,
-                    retained_mass_fraction=retained_mass_fraction,
                 )
-                if not plan.solver_converged:
+                frame_ot_score_count += 1
+                if not score.solver_converged:
                     continue
                 if (
-                    float(plan.source_coverage) < float(min_source_coverage)
-                    or float(plan.target_coverage) < float(min_target_coverage)
+                    float(score.source_coverage) < float(min_source_coverage)
+                    or float(score.target_coverage) < float(min_target_coverage)
                 ):
                     continue
                 candidate_result = {
@@ -1448,16 +1623,17 @@ def track_minimum_boundary_ot_cost(
                     "parent_entity_id": parent_entity_id,
                     "child_observation_id": child_observation_id,
                     "child_entity_id": child_entity_id,
-                    "centroid_distance": float(centroid_distance[int(candidate)]),
-                    "plan": plan,
+                    "centroid_distance": float(centroid_distance),
+                    "score": score,
                     "parent_points": parent_points,
                     "child_points": child_points,
                     "pair": pair,
                 }
-                if best is None or plan.total_cost < best["plan"].total_cost:
+                if best is None or score.total_cost < best["score"].total_cost:
                     best = candidate_result
-            if best is None or float(best["plan"].total_cost) >= ot_cutoff:
+            if best is None or float(best["score"].total_cost) >= ot_cutoff:
                 continue
+            best_score = best["score"]
             edge_records.append(
                 (
                     link_id,
@@ -1466,13 +1642,68 @@ def track_minimum_boundary_ot_cost(
                     frame - 1,
                     frame,
                     best["centroid_distance"],
-                    float(best["plan"].total_cost),
-                    float(min(best["plan"].source_coverage, best["plan"].target_coverage)),
+                    float(best_score.total_cost),
+                    float(min(best_score.source_coverage, best_score.target_coverage)),
                     0,
                 )
             )
-            best["track_link_id"] = link_id
-            accepted_plans.append(best)
+            if save_motion and boundary_set is not None:
+                winner_score = best_score
+                if accepted_winner_ot_method != candidate_ot_method:
+                    pair = best["pair"]
+                    winner_score = _optimal_transport_score(
+                        pair["source_cost"],
+                        pair["target_cost"],
+                        method=accepted_winner_ot_method,  # type: ignore[arg-type]
+                        regularization=sinkhorn_regularization,
+                        unbalanced_reach=unbalanced_reach,
+                        partial_mass=partial_mass,
+                        max_transport_distance=(
+                            max_transport_distance
+                            if accepted_winner_ot_method in {"unbalanced", "partial"}
+                            else None
+                        ),
+                        source_weights=pair["source"].weights,
+                        target_weights=pair["target"].weights,
+                    )
+                plan = _materialize_transport_plan(
+                    winner_score,
+                    mass_tolerance=mass_tolerance,
+                    relative_mass_tolerance=relative_mass_tolerance,
+                    retained_mass_fraction=retained_mass_fraction,
+                )
+                pair = best["pair"]
+                parent_points = best["parent_points"]
+                child_points = best["child_points"]
+                accepted_plans.append(
+                    {
+                        "track_link_id": link_id,
+                        "parent_row": best["parent_row"],
+                        "parent_observation_id": best["parent_observation_id"],
+                        "parent_entity_id": best["parent_entity_id"],
+                        "child_observation_id": best["child_observation_id"],
+                        "child_entity_id": best["child_entity_id"],
+                        "plan": plan,
+                        "quality_flags": (
+                            (1 if float(winner_score.source_coverage) < float(min_source_coverage) else 0)
+                            | (2 if float(winner_score.target_coverage) < float(min_target_coverage) else 0)
+                            | (4 if not winner_score.solver_converged else 0)
+                        ),
+                        "source_point_id": np.asarray(
+                            parent_points["point_id"][pair["source"].rows], dtype=np.int64
+                        ).copy(),
+                        "target_point_id": np.asarray(
+                            child_points["point_id"][pair["target"].rows], dtype=np.int64
+                        ).copy(),
+                        "source_registered": np.asarray(
+                            parent_points["registered"][pair["source"].rows], dtype=float
+                        ).copy(),
+                        "target_registered": np.asarray(
+                            child_points["registered"][pair["target"].rows], dtype=float
+                        ).copy(),
+                    }
+                )
+                frame_full_plan_count += 1
             link_id += 1
         if progress is not None:
             object_count = int(child_rows.size)
@@ -1483,8 +1714,14 @@ def track_minimum_boundary_ot_cost(
                     "object_count": object_count,
                     "linked_count": int(linked_count),
                     "unlinked_count": object_count - int(linked_count),
+                    "candidate_count": int(frame_candidate_count),
+                    "ot_score_count": int(frame_ot_score_count),
+                    "full_plan_count": int(frame_full_plan_count),
                 }
             )
+        for cached_frame in tuple(frame_point_cache):
+            if int(cached_frame) != int(frame):
+                del frame_point_cache[cached_frame]
 
     links = np.asarray(edge_records, dtype=link_dtype())
     adjacency = _csr_from_links(observation_count, links, np=np)
@@ -1495,6 +1732,12 @@ def track_minimum_boundary_ot_cost(
         "track_set": track_name,
         "method": "minimum_registered_boundary_ot_cost",
         "max_distance": cutoff,
+        "candidate_k": centroid_candidate_k,
+        "candidate_selection": {
+            "method": "registered_centroid_knn_within_radius",
+            "k": centroid_candidate_k,
+            "max_distance": cutoff,
+        },
         "ot_cost_cutoff": None if not np.isfinite(ot_cutoff) else ot_cutoff,
         "distance_unit": distance_unit,
         "coordinate_order": ["z", "y", "x"],
@@ -1503,7 +1746,37 @@ def track_minimum_boundary_ot_cost(
         "boundary_dependency": boundary_dependency,
         "boundary_source_id": selected_source_id,
         "boundary_source_name": str(source_record.get("name") or ""),
-        "ot_method_requested": ot_method,
+        # Backward-compatible alias: graph link costs and acceptance use the
+        # candidate-scoring method, while saved motion may use another method.
+        "ot_method_requested": candidate_ot_method,
+        "score_ot_method_requested": candidate_ot_method,
+        "winner_ot_method_requested": accepted_winner_ot_method,
+        "candidate_scoring": {
+            "ot_method_requested": candidate_ot_method,
+            "determines": ["parent_ranking", "track_link_ot_cost", "ot_cost_cutoff"],
+            "max_transport_distance": (
+                None
+                if max_transport_distance is None
+                or candidate_ot_method not in {"unbalanced", "partial"}
+                else float(max_transport_distance)
+            ),
+            "minimum_coverage": {
+                "source": float(min_source_coverage),
+                "target": float(min_target_coverage),
+            },
+        },
+        "winner_motion": {
+            "ot_method_requested": accepted_winner_ot_method,
+            "enabled": bool(save_motion and boundary_set is not None),
+            "executed_plan_count": len(accepted_plans),
+            "affects_track_selection": False,
+            "max_transport_distance": (
+                None
+                if max_transport_distance is None
+                or accepted_winner_ot_method not in {"unbalanced", "partial"}
+                else float(max_transport_distance)
+            ),
+        },
         "solver": {
             "max_iterations": 10000,
             "scaling_relative_tolerance": 1e-8,
@@ -1514,7 +1787,9 @@ def track_minimum_boundary_ot_cost(
         "unbalanced_reach": float(unbalanced_reach),
         "partial_mass": float(partial_mass),
         "max_transport_distance": (
-            None if max_transport_distance is None or ot_method not in {"unbalanced", "partial"}
+            None
+            if max_transport_distance is None
+            or candidate_ot_method not in {"unbalanced", "partial"}
             else float(max_transport_distance)
         ),
         "minimum_coverage": {
@@ -1534,7 +1809,7 @@ def track_minimum_boundary_ot_cost(
         },
         "ot_cost": (
             "full_unbalanced_regularized_objective"
-            if ot_method == "unbalanced"
+            if candidate_ot_method == "unbalanced"
             else "matched_mean_euclidean_transport_distance"
         ),
         "frame_linkage": "immediately_previous_local_frame_only",
@@ -1584,13 +1859,15 @@ def track_minimum_boundary_ot_cost(
             track_digest=schema["track_digest"],
             max_boundary_points=max_boundary_points,
             transport_settings={
-                "ot_method_requested": ot_method,
+                "ot_method_requested": accepted_winner_ot_method,
                 "solver": dict(schema["solver"]),
                 "sinkhorn_regularization": float(sinkhorn_regularization),
                 "unbalanced_reach": float(unbalanced_reach),
                 "partial_mass": float(partial_mass),
                 "max_transport_distance": (
-                    None if max_transport_distance is None or ot_method not in {"unbalanced", "partial"}
+                    None
+                    if max_transport_distance is None
+                    or accepted_winner_ot_method not in {"unbalanced", "partial"}
                     else float(max_transport_distance)
                 ),
                 "minimum_coverage": {
@@ -1642,6 +1919,9 @@ def track_minimum_boundary_ot_cost(
             "track_set": track_name,
             "method": "minimum_registered_boundary_ot_cost",
             "max_distance": cutoff,
+            "candidate_k": centroid_candidate_k,
+            "score_ot_method": candidate_ot_method,
+            "winner_ot_method": accepted_winner_ot_method,
             "ot_cost_cutoff": None if not np.isfinite(ot_cutoff) else ot_cutoff,
             "distance_unit": distance_unit,
             "registration_dependency": registration_dependency,
@@ -1716,29 +1996,28 @@ def _tracking_motion_from_plans(
     for motion_link_id, accepted in enumerate(accepted_plans, start=1):
         plan = accepted["plan"]
         selected_methods.add(str(plan.method))
-        parent_points = accepted["parent_points"]
-        child_points = accepted["child_points"]
-        pair = accepted["pair"]
-        source_local = pair["source"].rows[plan.source_rows]
-        target_local = pair["target"].rows[plan.target_rows]
-        displacement = child_points["registered"][target_local] - parent_points["registered"][source_local]
+        source_point_ids = np.asarray(accepted["source_point_id"], dtype=np.int64)
+        target_point_ids = np.asarray(accepted["target_point_id"], dtype=np.int64)
+        source_registered = np.asarray(accepted["source_registered"], dtype=float)
+        target_registered = np.asarray(accepted["target_registered"], dtype=float)
+        displacement = target_registered[plan.target_rows] - source_registered[plan.source_rows]
         source_summary = _transport_point_summary(
             plan,
-            point_ids=parent_points["point_id"][pair["source"].rows],
+            point_ids=source_point_ids,
             displacement=displacement,
             direction="source",
             np=np,
         )
         target_summary = _transport_point_summary(
             plan,
-            point_ids=child_points["point_id"][pair["target"].rows],
+            point_ids=target_point_ids,
             displacement=displacement,
             direction="target",
             np=np,
         )
         transport_count = int(plan.mass.shape[0])
-        source_summary_count = int(pair["source"].rows.size)
-        target_summary_count = int(pair["target"].rows.size)
+        source_summary_count = int(source_point_ids.size)
+        target_summary_count = int(target_point_ids.size)
         motion_links.append(
             (
                 motion_link_id,
@@ -1769,11 +2048,11 @@ def _tracking_motion_from_plans(
                 float(plan.edge_distance_max),
                 int(plan.solver_iterations),
                 int(bool(plan.solver_converged)),
-                0,
+                int(accepted.get("quality_flags", 0)),
             )
         )
-        transport_columns["source_point_id"].append(parent_points["point_id"][source_local].astype(np.int64))
-        transport_columns["target_point_id"].append(child_points["point_id"][target_local].astype(np.int64))
+        transport_columns["source_point_id"].append(source_point_ids[plan.source_rows].astype(np.int64))
+        transport_columns["target_point_id"].append(target_point_ids[plan.target_rows].astype(np.int64))
         transport_columns["mass"].append(np.asarray(plan.mass, dtype=np.float64))
         transport_columns["edge_cost"].append(np.asarray(plan.edge_cost, dtype=np.float32))
         transport_columns["registered_displacement_zyx"].append(np.asarray(displacement, dtype=np.float32))
