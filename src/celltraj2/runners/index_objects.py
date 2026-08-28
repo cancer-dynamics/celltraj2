@@ -5,7 +5,8 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from celltraj2.object_indexing import JsonlReporter, load_object_index_job, run_batch_object_indexing
+from celltraj2.object_indexing import load_object_index_job, run_batch_object_indexing
+from celltraj2.runners._common import run_reported
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -13,8 +14,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("job", type=Path, help="Path to a celltraj2 object-indexing job JSON file.")
     args = parser.parse_args(argv)
     job = load_object_index_job(args.job)
-    summary = run_batch_object_indexing(job, reporter=JsonlReporter())
-    return 1 if summary.failed else 0
+    return run_reported(lambda reporter: run_batch_object_indexing(job, reporter=reporter))
 
 
 if __name__ == "__main__":

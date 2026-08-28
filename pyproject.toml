@@ -22,6 +22,7 @@ celltraj2-track-centroids = "celltraj2.runners.track_centroids:main"
 celltraj2-build-boundaries = "celltraj2.runners.build_boundaries:main"
 celltraj2-track-objects = "celltraj2.runners.track_objects:main"
 celltraj2-track-surfaces = "celltraj2.runners.track_surfaces:main"
+celltraj2-apply-deferred-commit = "celltraj2.runners.apply_deferred_commit:main"
 
 [project.urls]
 Homepage = "https://github.com/cancer-dynamics/celltraj2"

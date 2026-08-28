@@ -9,6 +9,7 @@ from dataclasses import asdict, dataclass, field, is_dataclass
 from pathlib import Path
 from typing import Any
 
+from celltraj2.deferred_commit import PLAN_SCHEMA, defer_commit_plan
 from celltraj2.boundaries import (
     BoundaryGeometryResult,
     BoundaryLibraryResult,
@@ -20,9 +21,10 @@ from celltraj2.boundaries import (
     compute_boundary_geometry,
     compute_boundary_neighbors,
 )
-from celltraj2.h5_access import run_with_stale_retries, snapshot_revisions, validate_revisions
+from celltraj2.h5_access import H5AccessTimeout, run_with_stale_retries, snapshot_revisions, validate_revisions
 from celltraj2.object_indexing import JsonlReporter
 from celltraj2.paths import validate_name
+from celltraj2.reporting import JobCancelledError
 from celltraj2.schema import utc_now_iso
 from celltraj2.trajectory import Trajectory
 
@@ -275,6 +277,7 @@ class BatchBoundarySummary:
     completed: int = 0
     skipped: int = 0
     failed: int = 0
+    deferred: int = 0
     entities: int = 0
     points: int = 0
     geometry_sets: int = 0
@@ -486,6 +489,8 @@ def run_batch_boundaries(
                 reporter=emit,
                 context=common,
             )
+        except JobCancelledError:
+            raise
         except Exception as exc:
             summary.failed += 1
             emit({**common, "event": "file_failed", "error": repr(exc)})
@@ -678,89 +683,44 @@ def _run_boundary_file(
         point_count = int(view.point_count)
         boundary_digest = view.schema.get("boundary_digest")
 
+    commit_deferred = False
     if save_outputs:
-        with Trajectory(
-            h5_path,
-            mode="r+",
-            reporter=emit,
-            operation="boundary_commit",
-            job_id=batch_job.job_id,
-        ) as trajectory:
-            validate_revisions(trajectory.store, dependencies)
-            if library_result is not None:
-                trajectory.store.write_boundary_library(
-                    library_result.boundary_set,
-                    entities=library_result.entities,
-                    points=library_result.points,
-                    sources=library_result.sources,
-                    schema=library_result.schema,
-                    overwrite=overwrite_library,
+        run_record = {
+            "schema": "celltraj2.boundary_run.v1",
+            "job_id": batch_job.job_id,
+            "h5_path": str(h5_path),
+            "boundary_set": file_job.boundary_set,
+            "boundary_digest": boundary_digest,
+            "reused_library": reused,
+            "completed_at": utc_now_iso(),
+            "dependencies": dependencies,
+            "metadata": {**batch_job.metadata, **file_job.metadata},
+        }
+        commit_plan = _boundary_commit_plan(
+            batch_job, file_job, h5_path, dependencies=dependencies,
+            library_result=library_result, geometry_results=geometry_results,
+            neighbor_results=neighbor_results, run_record=run_record,
+            overwrite_library=overwrite_library,
+        )
+        try:
+            with Trajectory(
+                h5_path,
+                mode="r+",
+                reporter=emit,
+                operation="boundary_commit",
+                job_id=batch_job.job_id,
+            ) as trajectory:
+                validate_revisions(trajectory.store, dependencies)
+                _write_boundary_outputs(
+                    trajectory, batch_job, file_job, common=common,
+                    library_result=library_result, geometry_results=geometry_results,
+                    neighbor_results=neighbor_results, run_record=run_record,
+                    overwrite_library=overwrite_library, emit=emit,
                 )
-            for result, overwrite in geometry_results:
-                trajectory.store.write_boundary_geometry(
-                    result.boundary_set,
-                    result.geometry_set,
-                    values=result.values,
-                    topology_indptr=result.topology_indptr,
-                    topology_indices=result.topology_indices,
-                    schema=result.schema,
-                    overwrite=overwrite,
-                )
-            for result, overwrite in neighbor_results:
-                trajectory.store.write_boundary_neighbors(
-                    result.boundary_set,
-                    result.neighbor_set,
-                    indptr=result.indptr,
-                    indices=result.indices,
-                    distance=result.distance,
-                    displacement_zyx=result.displacement_zyx,
-                    schema=result.schema,
-                    overwrite=overwrite,
-                )
-            trajectory.store.write_json(
-                f"/runs/boundaries/{validate_name(batch_job.job_id, kind='boundary run')}/run.json",
-                {
-                    "schema": "celltraj2.boundary_run.v1",
-                    "job_id": batch_job.job_id,
-                    "h5_path": str(h5_path),
-                    "boundary_set": file_job.boundary_set,
-                    "boundary_digest": boundary_digest,
-                    "reused_library": reused,
-                    "completed_at": utc_now_iso(),
-                    "dependencies": dependencies,
-                    "metadata": {**batch_job.metadata, **file_job.metadata},
-                },
-                overwrite=True,
-            )
-            if not trajectory.store.has_boundary_set(file_job.boundary_set):
-                raise RuntimeError(
-                    f"Boundary commit completed without creating /boundaries/{file_job.boundary_set}"
-                )
-            committed_view = trajectory.boundary_library(file_job.boundary_set)
-            missing_geometry = sorted(
-                result.geometry_set
-                for result, _overwrite in geometry_results
-                if result.geometry_set not in committed_view.geometry_sets()
-            )
-            missing_neighbors = sorted(
-                result.neighbor_set
-                for result, _overwrite in neighbor_results
-                if result.neighbor_set not in committed_view.neighbor_sets()
-            )
-            if missing_geometry or missing_neighbors:
-                raise RuntimeError(
-                    "Boundary commit verification failed: "
-                    f"missing geometry={missing_geometry}, missing neighbors={missing_neighbors}"
-                )
-            emit(
-                {
-                    **common,
-                    "event": "boundary_commit_completed",
-                    "boundary_path": f"/boundaries/{file_job.boundary_set}",
-                    "geometry_sets_written": [result.geometry_set for result, _overwrite in geometry_results],
-                    "neighbor_sets_written": [result.neighbor_set for result, _overwrite in neighbor_results],
-                }
-            )
+        except H5AccessTimeout:
+            defer_commit_plan(commit_plan, reporter=emit, parent_job_id=batch_job.job_id)
+            commit_deferred = True
+            summary.deferred += 1
     summary.completed += 1
     summary.entities += entity_count
     summary.points += point_count
@@ -775,8 +735,157 @@ def _run_boundary_file(
             "point_count": point_count,
             "boundary_digest": boundary_digest,
             "reused_library": reused,
+            "saved": bool(save_outputs and not commit_deferred),
+            "deferred": commit_deferred,
         }
     )
+
+
+def _boundary_commit_plan(
+    batch_job: BoundaryBatchJob,
+    file_job: BoundaryFileJob,
+    h5_path: Path,
+    *,
+    dependencies: Mapping[str, int],
+    library_result: BoundaryLibraryResult | None,
+    geometry_results: list[tuple[BoundaryGeometryResult, bool]],
+    neighbor_results: list[tuple[BoundaryNeighborResult, bool]],
+    run_record: Mapping[str, Any],
+    overwrite_library: bool,
+) -> dict[str, Any]:
+    operations: list[dict[str, Any]] = []
+    requirements: list[dict[str, Any]] = []
+    if library_result is not None:
+        operations.append({
+            "op": "write_boundary_library",
+            "args": {
+                "boundary_set": library_result.boundary_set,
+                "entities": library_result.entities,
+                "points": library_result.points,
+                "sources": library_result.sources,
+                "schema": library_result.schema,
+                "overwrite": overwrite_library,
+            },
+        })
+        requirements.append({
+            "path": f"/boundaries/{library_result.boundary_set}",
+            "overwrite": overwrite_library,
+            "reason": "boundary library was written by another job",
+        })
+    for result, overwrite in geometry_results:
+        operations.append({
+            "op": "write_boundary_geometry",
+            "args": {
+                "boundary_set": result.boundary_set,
+                "geometry_set": result.geometry_set,
+                "values": result.values,
+                "topology_indptr": result.topology_indptr,
+                "topology_indices": result.topology_indices,
+                "schema": result.schema,
+                "overwrite": overwrite,
+            },
+        })
+        requirements.append({
+            "path": f"/boundaries/{result.boundary_set}/geometry/{result.geometry_set}",
+            "overwrite": overwrite,
+            "reason": "boundary geometry was written by another job",
+        })
+    for result, overwrite in neighbor_results:
+        operations.append({
+            "op": "write_boundary_neighbors",
+            "args": {
+                "boundary_set": result.boundary_set,
+                "neighbor_set": result.neighbor_set,
+                "indptr": result.indptr,
+                "indices": result.indices,
+                "distance": result.distance,
+                "displacement_zyx": result.displacement_zyx,
+                "schema": result.schema,
+                "overwrite": overwrite,
+            },
+        })
+        requirements.append({
+            "path": f"/boundaries/{result.boundary_set}/neighbors/{result.neighbor_set}",
+            "overwrite": overwrite,
+            "reason": "boundary neighbors were written by another job",
+        })
+    operations.append({
+        "op": "write_json",
+        "args": {
+            "path": f"/runs/boundaries/{validate_name(batch_job.job_id, kind='boundary run')}/run.json",
+            "data": dict(run_record),
+            "overwrite": True,
+        },
+    })
+    return {
+        "schema": PLAN_SCHEMA,
+        "job_id": batch_job.job_id,
+        "project_root": None if batch_job.project_root is None else str(batch_job.project_root),
+        "h5_path": str(h5_path),
+        "operation": "boundary_commit",
+        "dependencies": dict(dependencies),
+        "absent_unless_overwrite": requirements,
+        "operations": operations,
+    }
+
+
+def _write_boundary_outputs(
+    trajectory: Trajectory,
+    batch_job: BoundaryBatchJob,
+    file_job: BoundaryFileJob,
+    *,
+    common: Mapping[str, Any],
+    library_result: BoundaryLibraryResult | None,
+    geometry_results: list[tuple[BoundaryGeometryResult, bool]],
+    neighbor_results: list[tuple[BoundaryNeighborResult, bool]],
+    run_record: Mapping[str, Any],
+    overwrite_library: bool,
+    emit: Reporter,
+) -> None:
+    if library_result is not None:
+        trajectory.store.write_boundary_library(
+            library_result.boundary_set, entities=library_result.entities,
+            points=library_result.points, sources=library_result.sources,
+            schema=library_result.schema, overwrite=overwrite_library,
+        )
+    for result, overwrite in geometry_results:
+        trajectory.store.write_boundary_geometry(
+            result.boundary_set, result.geometry_set, values=result.values,
+            topology_indptr=result.topology_indptr, topology_indices=result.topology_indices,
+            schema=result.schema, overwrite=overwrite,
+        )
+    for result, overwrite in neighbor_results:
+        trajectory.store.write_boundary_neighbors(
+            result.boundary_set, result.neighbor_set, indptr=result.indptr,
+            indices=result.indices, distance=result.distance,
+            displacement_zyx=result.displacement_zyx, schema=result.schema, overwrite=overwrite,
+        )
+    trajectory.store.write_json(
+        f"/runs/boundaries/{validate_name(batch_job.job_id, kind='boundary run')}/run.json",
+        dict(run_record), overwrite=True,
+    )
+    if not trajectory.store.has_boundary_set(file_job.boundary_set):
+        raise RuntimeError(f"Boundary commit completed without creating /boundaries/{file_job.boundary_set}")
+    committed_view = trajectory.boundary_library(file_job.boundary_set)
+    missing_geometry = sorted(
+        result.geometry_set for result, _overwrite in geometry_results
+        if result.geometry_set not in committed_view.geometry_sets()
+    )
+    missing_neighbors = sorted(
+        result.neighbor_set for result, _overwrite in neighbor_results
+        if result.neighbor_set not in committed_view.neighbor_sets()
+    )
+    if missing_geometry or missing_neighbors:
+        raise RuntimeError(
+            "Boundary commit verification failed: "
+            f"missing geometry={missing_geometry}, missing neighbors={missing_neighbors}"
+        )
+    emit({
+        **dict(common), "event": "boundary_commit_completed",
+        "boundary_path": f"/boundaries/{file_job.boundary_set}",
+        "geometry_sets_written": [result.geometry_set for result, _overwrite in geometry_results],
+        "neighbor_sets_written": [result.neighbor_set for result, _overwrite in neighbor_results],
+    })
 
 
 def _boundary_dependency_paths(file_job: BoundaryFileJob) -> list[str]:

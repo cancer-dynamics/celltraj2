@@ -8,9 +8,12 @@ from dataclasses import asdict, dataclass, field, is_dataclass
 from pathlib import Path
 from typing import Any
 
+from celltraj2.deferred_commit import PLAN_SCHEMA, defer_commit_plan
+from celltraj2.h5_access import H5AccessTimeout, run_with_stale_retries, snapshot_revisions, validate_revisions
 from celltraj2.object_indexing import JsonlReporter
-from celltraj2.h5_access import run_with_stale_retries, snapshot_revisions, validate_revisions
+from celltraj2.paths import validate_name
 from celltraj2.registration import default_registration_run_id, register_global_translation
+from celltraj2.reporting import JobCancelledError
 from celltraj2.schema import utc_now_iso
 from celltraj2.trajectory import Trajectory
 
@@ -150,6 +153,7 @@ class BatchRegistrationSummary:
     completed: int = 0
     skipped: int = 0
     failed: int = 0
+    deferred: int = 0
     frames: int = 0
     estimated_frames: int = 0
 
@@ -203,6 +207,8 @@ def run_batch_registration(
                 reporter=emit,
                 context={"job_id": batch_job.job_id, "h5_path": str(h5_path)},
             )
+        except JobCancelledError:
+            raise
         except Exception as exc:
             summary.failed += 1
             emit({"event": "file_failed", "job_id": batch_job.job_id, "h5_path": str(h5_path), "error": repr(exc)})
@@ -279,58 +285,102 @@ def _run_file_job(
         )
     registration_path = None
     active = False
+    commit_deferred = False
     if save_outputs:
-        with Trajectory(
-            h5_path,
-            mode="r+",
-            reporter=emit,
-            operation="registration_commit",
-            job_id=batch_job.job_id,
-        ) as trajectory:
-            validate_revisions(trajectory.store, dependencies)
-            if trajectory.store.has_registration_set(file_job.registration_set) and not overwrite:
-                summary.skipped += 1
-                emit(
-                    {
-                        "event": "file_skipped",
-                        "job_id": batch_job.job_id,
-                        "h5_path": str(h5_path),
-                        "registration_set": file_job.registration_set,
-                        "reason": "registration set was written by another job",
-                    }
-                )
-                return
-            registration_path = trajectory.store.write_registration_set(result.registration, overwrite=overwrite)
-            if file_job.set_active:
-                trajectory.store.set_active_registration(
-                    result.registration.name,
-                    reason="registration_run",
-                    run_id=batch_job.job_id,
-                )
-                active = True
-            trajectory.store.write_registration_run(
-                batch_job.job_id,
-                {
-                    "schema": "celltraj2.registration_run.v1",
-                    "run_id": batch_job.job_id,
-                    "status": "completed",
-                    "completed_at": utc_now_iso(),
-                    "h5_path": str(h5_path),
-                    "object_set": file_job.object_set,
+        registration_path = f"/registrations/{result.registration.name}"
+        registration_payload = {
+            "name": result.registration.name,
+            "frames": result.registration.frames,
+            "transforms": result.registration.transforms,
+            "frame_status": result.registration.frame_status,
+            "pairwise_results": result.registration.pairwise_results,
+            "schema": result.registration.schema,
+            "canvas": result.registration.canvas,
+        }
+        run_record = {
+            "schema": "celltraj2.registration_run.v1",
+            "run_id": batch_job.job_id,
+            "status": "completed",
+            "completed_at": utc_now_iso(),
+            "h5_path": str(h5_path),
+            "object_set": file_job.object_set,
+            "registration_set": result.registration.name,
+            "registration_digest": result.registration.digest,
+            "registration_path": registration_path,
+            "set_active": bool(file_job.set_active),
+            "dependencies": dependencies,
+            "schema_record": result.registration.schema,
+            "metadata": {**batch_job.metadata, **file_job.metadata},
+        }
+        operations = [{
+            "op": "write_registration_set",
+            "result_key": "registration_path",
+            "args": {"registration": registration_payload, "overwrite": overwrite},
+        }]
+        if file_job.set_active:
+            operations.append({
+                "op": "set_active_registration",
+                "args": {
                     "registration_set": result.registration.name,
-                    "registration_digest": result.registration.digest,
-                    "registration_path": registration_path,
-                    "set_active": bool(file_job.set_active),
-                    "dependencies": dependencies,
-                    "schema_record": result.registration.schema,
-                    "metadata": {**batch_job.metadata, **file_job.metadata},
+                    "reason": "registration_run",
+                    "run_id": batch_job.job_id,
                 },
-                overwrite=True,
-            )
+            })
+        operations.append({
+            "op": "write_json",
+            "args": {
+                "path": f"/runs/registration/{validate_name(batch_job.job_id, kind='registration run')}/run.json",
+                "data": run_record,
+                "overwrite": True,
+            },
+        })
+        commit_plan = {
+            "schema": PLAN_SCHEMA,
+            "job_id": batch_job.job_id,
+            "project_root": None if batch_job.project_root is None else str(batch_job.project_root),
+            "h5_path": str(h5_path),
+            "operation": "registration_commit",
+            "dependencies": dependencies,
+            "absent_unless_overwrite": [{
+                "path": f"/registrations/{file_job.registration_set}",
+                "overwrite": overwrite,
+                "reason": "registration set was written by another job",
+            }],
+            "operations": operations,
+        }
+        try:
+            with Trajectory(
+                h5_path,
+                mode="r+",
+                reporter=emit,
+                operation="registration_commit",
+                job_id=batch_job.job_id,
+            ) as trajectory:
+                validate_revisions(trajectory.store, dependencies)
+                if trajectory.store.has_registration_set(file_job.registration_set) and not overwrite:
+                    summary.skipped += 1
+                    emit({
+                        "event": "file_skipped", "job_id": batch_job.job_id,
+                        "h5_path": str(h5_path), "registration_set": file_job.registration_set,
+                        "reason": "registration set was written by another job",
+                    })
+                    return
+                trajectory.store.write_registration_set(result.registration, overwrite=overwrite)
+                if file_job.set_active:
+                    trajectory.store.set_active_registration(
+                        result.registration.name, reason="registration_run", run_id=batch_job.job_id,
+                    )
+                    active = True
+                trajectory.store.write_registration_run(batch_job.job_id, run_record, overwrite=True)
+        except H5AccessTimeout:
+            defer_commit_plan(commit_plan, reporter=emit, parent_job_id=batch_job.job_id)
+            commit_deferred = True
+            summary.deferred += 1
     payload = {
         **result.to_dict(),
-        "saved": save_outputs,
-        "active": active,
+        "saved": bool(save_outputs and not commit_deferred),
+        "deferred": commit_deferred,
+        "active": bool(active and not commit_deferred),
         "registration_path": registration_path,
     }
     summary.completed += 1

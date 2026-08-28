@@ -8,14 +8,16 @@ from dataclasses import asdict, dataclass, field, is_dataclass, replace
 from pathlib import Path
 from typing import Any
 
+from celltraj2.deferred_commit import PLAN_SCHEMA, defer_commit_plan
 from celltraj2.model_input import (
     compose_model_input,
     model_input_summary,
     model_input_z_indices,
     normalized_frame_axes,
 )
-from celltraj2.h5_access import H5DependencyChangedError, snapshot_revisions, validate_revisions
-from celltraj2.reporting import JsonlReporter
+from celltraj2.h5_access import H5AccessTimeout, H5DependencyChangedError, snapshot_revisions, validate_revisions
+from celltraj2.paths import validate_name
+from celltraj2.reporting import JobCancelledError, JsonlReporter
 from celltraj2.schema import utc_now_iso
 from celltraj2.trajectory import Trajectory
 
@@ -250,6 +252,7 @@ class BatchSegmentationSummary:
     completed: int = 0
     skipped: int = 0
     failed: int = 0
+    deferred: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return _json_safe(self)
@@ -285,6 +288,8 @@ def run_batch_segmentation(
         emit({"event": "file_started", "job_id": batch_job.job_id, "h5_path": str(h5_path), "save_outputs": save_outputs})
         try:
             _run_file_job(batch_job, file_job, h5_path, segmenter, summary, emit)
+        except JobCancelledError:
+            raise
         except Exception as exc:
             summary.failed += 1
             emit({"event": "file_failed", "job_id": batch_job.job_id, "h5_path": str(h5_path), "error": repr(exc)})
@@ -335,22 +340,58 @@ def _run_file_job(
     completed_before = int(summary.completed)
     skipped_before = int(summary.skipped)
     failed_before = int(summary.failed)
+    defer_remaining_commits = False
     for frame in frames:
-        _run_frame(batch_job, file_job, h5_path, frame, segmenter, summary, emit)
+        defer_remaining_commits = _run_frame(
+            batch_job,
+            file_job,
+            h5_path,
+            frame,
+            segmenter,
+            summary,
+            emit,
+            force_deferred=defer_remaining_commits,
+        ) or defer_remaining_commits
     run_record["status"] = "completed_with_errors" if summary.failed > failed_before else "completed"
     run_record["completed_at"] = utc_now_iso()
     run_record["completed_frames"] = int(summary.completed - completed_before)
     run_record["skipped_frames"] = int(summary.skipped - skipped_before)
     run_record["failed_frames"] = int(summary.failed - failed_before)
     if save_outputs:
-        with Trajectory(
-            h5_path,
-            mode="r+",
-            reporter=emit,
-            operation="segmentation_provenance_commit",
-            job_id=batch_job.job_id,
-        ) as trajectory:
-            trajectory.write_segmentation_run(batch_job.job_id, run_record, overwrite=True)
+        provenance_plan = {
+            "schema": PLAN_SCHEMA,
+            "job_id": batch_job.job_id,
+            "project_root": None if batch_job.project_root is None else str(batch_job.project_root),
+            "h5_path": str(h5_path),
+            "operation": "segmentation_provenance_commit",
+            "dependencies": {},
+            "operations": [{
+                "op": "write_json",
+                "args": {
+                    "path": f"/runs/segmentation/{validate_name(batch_job.job_id, kind='segmentation run')}/run.json",
+                    "data": run_record,
+                    "overwrite": True,
+                },
+            }],
+        }
+        try:
+            if defer_remaining_commits:
+                raise H5AccessTimeout("A prior frame commit timed out; provenance is being staged without another wait")
+            with Trajectory(
+                h5_path,
+                mode="r+",
+                reporter=emit,
+                operation="segmentation_provenance_commit",
+                job_id=batch_job.job_id,
+            ) as trajectory:
+                trajectory.write_segmentation_run(batch_job.job_id, run_record, overwrite=True)
+        except H5AccessTimeout:
+            defer_commit_plan(
+                provenance_plan,
+                reporter=emit,
+                parent_job_id=batch_job.job_id,
+            )
+            summary.deferred += 1
 
 
 def _run_frame(
@@ -361,7 +402,10 @@ def _run_frame(
     segmenter: Segmenter,
     summary: BatchSegmentationSummary,
     emit: Reporter,
-) -> None:
+    *,
+    stale_attempt: int = 1,
+    force_deferred: bool = False,
+) -> bool:
     overwrite = bool(batch_job.overwrite or file_job.overwrite)
     save_outputs = bool(batch_job.save_outputs and file_job.save_outputs)
     try:
@@ -385,7 +429,7 @@ def _run_frame(
                     "saved": False,
                 }
                 emit({"event": "frame_skipped", "job_id": batch_job.job_id, "h5_path": str(h5_path), **record})
-                return
+                return force_deferred
             dependencies = ["/metadata/celltraj2.json", "/sources/image_source.json"]
             if str(getattr(trajectory.metadata.image_source, "source_type", "")) == "embedded_h5":
                 dependencies.append(trajectory.store.raw_frame_path(frame))
@@ -445,36 +489,73 @@ def _run_frame(
                 else None
             )
         output_path = None
+        commit_deferred = False
         if save_outputs:
-            with Trajectory(
-                h5_path,
-                mode="r+",
-                reporter=emit,
-                operation=f"segmentation_commit_frame_{int(frame)}",
-                job_id=batch_job.job_id,
-            ) as trajectory:
-                validate_revisions(trajectory.store, revisions)
-                if _has_output_frame(trajectory, file_job, frame) and not overwrite:
-                    summary.skipped += 1
-                    record = {
-                        "frame": int(frame),
-                        "status": "skipped",
-                        "reason": f"{file_job.output_group} frame was written by another job",
-                        "output_name": file_job.output_name,
-                        "output_kind": file_job.output_group,
-                        "output_h5_path": file_job.output_h5_path,
-                        "saved": False,
-                    }
-                    emit({"event": "frame_skipped", "job_id": batch_job.job_id, "h5_path": str(h5_path), **record})
-                    return
-                output_path = _write_output_frame(
-                    trajectory,
-                    file_job,
-                    frame,
-                    result.labels,
-                    overwrite=overwrite,
-                    batch_job=batch_job,
-                )
+            frame_metadata = {
+                "run_id": batch_job.job_id,
+                "backend": file_job.backend,
+                "output_kind": file_job.output_group,
+            }
+            output_path = file_job.output_h5_path + f"/frame_{int(frame)}"
+            operation = {
+                "op": "write_mask_frame" if file_job.output_group == "masks" else "write_label_frame",
+                "result_key": "output_path",
+                "args": {
+                    ("mask_set" if file_job.output_group == "masks" else "label_set"): file_job.output_name,
+                    "frame": int(frame),
+                    ("mask" if file_job.output_group == "masks" else "labels"): (
+                        (_require_numpy_array(result.labels) > 0)
+                        if file_job.output_group == "masks" else result.labels
+                    ),
+                    "overwrite": overwrite,
+                    "metadata": frame_metadata,
+                },
+            }
+            commit_plan = {
+                "schema": PLAN_SCHEMA,
+                "job_id": batch_job.job_id,
+                "project_root": None if batch_job.project_root is None else str(batch_job.project_root),
+                "h5_path": str(h5_path),
+                "operation": f"segmentation_commit_frame_{int(frame)}",
+                "dependencies": revisions,
+                "absent_unless_overwrite": [{
+                    "path": output_path, "overwrite": overwrite,
+                    "reason": f"{file_job.output_group} frame was written by another job",
+                }],
+                "operations": [operation],
+            }
+            try:
+                if force_deferred:
+                    raise H5AccessTimeout("A prior frame commit timed out; staging this frame without another wait")
+                with Trajectory(
+                    h5_path,
+                    mode="r+",
+                    reporter=emit,
+                    operation=f"segmentation_commit_frame_{int(frame)}",
+                    job_id=batch_job.job_id,
+                ) as trajectory:
+                    validate_revisions(trajectory.store, revisions)
+                    if _has_output_frame(trajectory, file_job, frame) and not overwrite:
+                        summary.skipped += 1
+                        record = {
+                            "frame": int(frame),
+                            "status": "skipped",
+                            "reason": f"{file_job.output_group} frame was written by another job",
+                            "output_name": file_job.output_name,
+                            "output_kind": file_job.output_group,
+                            "output_h5_path": file_job.output_h5_path,
+                            "saved": False,
+                        }
+                        emit({"event": "frame_skipped", "job_id": batch_job.job_id, "h5_path": str(h5_path), **record})
+                        return force_deferred
+                    output_path = _write_output_frame(
+                        trajectory, file_job, frame, result.labels,
+                        overwrite=overwrite, batch_job=batch_job,
+                    )
+            except H5AccessTimeout:
+                defer_commit_plan(commit_plan, reporter=emit, parent_job_id=batch_job.job_id)
+                commit_deferred = True
+                summary.deferred += 1
         preview_output_path = _frame_preview_output_path(batch_job, file_job, h5_path, frame)
         if preview_output_path is not None:
             _write_preview_npz(
@@ -500,7 +581,8 @@ def _run_frame(
             "output_kind": file_job.output_group,
             "output_h5_path": file_job.output_h5_path,
             "output_path": output_path,
-            "saved": save_outputs,
+            "saved": bool(save_outputs and not commit_deferred),
+            "deferred": commit_deferred,
             "preview_output_path": None if preview_output_path is None else str(preview_output_path),
             "input_summary": model_input_summary(model_input, channel_axis=channel_axis),
             "label_summary": _label_summary(result.labels),
@@ -512,6 +594,9 @@ def _run_frame(
             "z_count": len(model_inputs) if slice_wise_2d else None,
         }
         emit({"event": "frame_completed", "job_id": batch_job.job_id, "h5_path": str(h5_path), **record})
+        return commit_deferred or force_deferred
+    except JobCancelledError:
+        raise
     except H5DependencyChangedError as exc:
         emit(
             {
@@ -526,7 +611,7 @@ def _run_frame(
             }
         )
         if stale_attempt < 3:
-            _run_frame(
+            return _run_frame(
                 batch_job,
                 file_job,
                 h5_path,
@@ -535,8 +620,8 @@ def _run_frame(
                 summary,
                 emit,
                 stale_attempt=stale_attempt + 1,
+                force_deferred=force_deferred,
             )
-            return
         raise
     except Exception as exc:
         summary.failed += 1
@@ -552,6 +637,7 @@ def _run_frame(
         emit({"event": "frame_failed", "job_id": batch_job.job_id, "h5_path": str(h5_path), **record})
         if batch_job.fail_fast:
             raise
+        return force_deferred
 
 
 def _coerce_segmentation_result(value: Any) -> SegmentationResult:
@@ -720,6 +806,14 @@ def _write_output_frame(
         overwrite=overwrite,
         metadata=metadata,
     )
+
+
+def _require_numpy_array(value: Any) -> Any:
+    try:
+        import numpy as np
+    except ImportError as exc:
+        raise RuntimeError("Writing segmentation masks requires numpy") from exc
+    return np.asarray(value)
 
 
 def _write_preview_npz(

@@ -8,9 +8,11 @@ from dataclasses import asdict, dataclass, field, is_dataclass
 from pathlib import Path
 from typing import Any
 
+from celltraj2.deferred_commit import PLAN_SCHEMA, defer_commit_plan
 from celltraj2.features import FeatureSetSpec, default_feature_extraction_run_id, extract_feature_set
-from celltraj2.h5_access import run_with_stale_retries, snapshot_revisions, validate_revisions
-from celltraj2.reporting import JsonlReporter
+from celltraj2.h5_access import H5AccessTimeout, run_with_stale_retries, snapshot_revisions, validate_revisions
+from celltraj2.paths import validate_name
+from celltraj2.reporting import JobCancelledError, JsonlReporter
 from celltraj2.schema import utc_now_iso
 from celltraj2.trajectory import Trajectory
 
@@ -164,6 +166,7 @@ class BatchFeatureExtractionSummary:
     completed: int = 0
     skipped: int = 0
     failed: int = 0
+    deferred: int = 0
     features: int = 0
     observations: int = 0
 
@@ -212,6 +215,8 @@ def run_batch_feature_extraction(
                 reporter=emit,
                 context={"job_id": batch_job.job_id, "h5_path": str(h5_path)},
             )
+        except JobCancelledError:
+            raise
         except Exception as exc:
             summary.failed += 1
             emit({"event": "file_failed", "job_id": batch_job.job_id, "h5_path": str(h5_path), "error": repr(exc)})
@@ -298,58 +303,93 @@ def _run_file_job(
             )
         )
     values_path = None
+    commit_deferred = False
     if save_outputs:
-        with Trajectory(
-            h5_path,
-            mode="r+",
-            reporter=emit,
-            operation="feature_commit",
-            job_id=batch_job.job_id,
-        ) as trajectory:
-            validate_revisions(trajectory.store, dependencies)
-            if trajectory.store.has_feature_set(result.object_set, result.feature_set) and not overwrite:
-                summary.frames += len(result.frames)
-                summary.skipped += 1
-                emit(
-                    {
-                        "event": "file_skipped",
-                        "job_id": batch_job.job_id,
-                        "h5_path": str(h5_path),
+        values_path = f"/object_sets/{result.object_set}/features/{result.feature_set}/values"
+        run_record = {
+            "schema": "celltraj2.feature_extraction_run.v1",
+            "run_id": batch_job.job_id,
+            "status": "completed",
+            "completed_at": utc_now_iso(),
+            "h5_path": str(h5_path),
+            "object_set": result.object_set,
+            "source_label_set": result.source_label_set,
+            "feature_set": result.feature_set,
+            "frames": result.frames,
+            "feature_count": result.feature_count,
+            "observation_count": result.observation_count,
+            "values_path": values_path,
+            "dependencies": dependencies,
+            "feature_spec": file_job.feature_spec.to_dict(),
+            "metadata": {**batch_job.metadata, **file_job.metadata},
+        }
+        commit_plan = {
+            "schema": PLAN_SCHEMA,
+            "job_id": batch_job.job_id,
+            "project_root": None if batch_job.project_root is None else str(batch_job.project_root),
+            "h5_path": str(h5_path),
+            "operation": "feature_commit",
+            "dependencies": dependencies,
+            "absent_unless_overwrite": [{
+                "path": f"/object_sets/{result.object_set}/features/{result.feature_set}",
+                "overwrite": overwrite,
+                "reason": "feature set was written by another job",
+            }],
+            "operations": [
+                {
+                    "op": "write_feature_set",
+                    "result_key": "values_path",
+                    "args": {
                         "object_set": result.object_set,
                         "feature_set": result.feature_set,
-                        "reason": "feature set was written by another job",
-                    }
-                )
-                return
-            values_path = trajectory.store.write_feature_set(
-                result.object_set,
-                result.feature_set,
-                result.values,
-                result.schema,
-                overwrite=overwrite,
-                qc=result.qc,
-            )
-            trajectory.store.write_feature_extraction_run(
-                batch_job.job_id,
-                {
-                    "schema": "celltraj2.feature_extraction_run.v1",
-                    "run_id": batch_job.job_id,
-                    "status": "completed",
-                    "completed_at": utc_now_iso(),
-                    "h5_path": str(h5_path),
-                    "object_set": result.object_set,
-                    "source_label_set": result.source_label_set,
-                    "feature_set": result.feature_set,
-                    "frames": result.frames,
-                    "feature_count": result.feature_count,
-                    "observation_count": result.observation_count,
-                    "values_path": values_path,
-                    "dependencies": dependencies,
-                    "feature_spec": file_job.feature_spec.to_dict(),
-                    "metadata": {**batch_job.metadata, **file_job.metadata},
+                        "values": result.values,
+                        "schema": result.schema,
+                        "qc": result.qc,
+                        "overwrite": overwrite,
+                    },
                 },
-                overwrite=True,
-            )
+                {
+                    "op": "write_json",
+                    "args": {
+                        "path": f"/runs/feature_extraction/{validate_name(batch_job.job_id, kind='feature-extraction run')}/run.json",
+                        "data": run_record,
+                        "overwrite": True,
+                    },
+                },
+            ],
+        }
+        try:
+            with Trajectory(
+                h5_path,
+                mode="r+",
+                reporter=emit,
+                operation="feature_commit",
+                job_id=batch_job.job_id,
+            ) as trajectory:
+                validate_revisions(trajectory.store, dependencies)
+                if trajectory.store.has_feature_set(result.object_set, result.feature_set) and not overwrite:
+                    summary.frames += len(result.frames)
+                    summary.skipped += 1
+                    emit(
+                        {
+                            "event": "file_skipped",
+                            "job_id": batch_job.job_id,
+                            "h5_path": str(h5_path),
+                            "object_set": result.object_set,
+                            "feature_set": result.feature_set,
+                            "reason": "feature set was written by another job",
+                        }
+                    )
+                    return
+                trajectory.store.write_feature_set(
+                    result.object_set, result.feature_set, result.values, result.schema,
+                    overwrite=overwrite, qc=result.qc,
+                )
+                trajectory.store.write_feature_extraction_run(batch_job.job_id, run_record, overwrite=True)
+        except H5AccessTimeout:
+            defer_commit_plan(commit_plan, reporter=emit, parent_job_id=batch_job.job_id)
+            commit_deferred = True
+            summary.deferred += 1
     summary.frames += len(result.frames)
     summary.completed += len(result.frames)
     summary.features += result.feature_count
@@ -360,7 +400,8 @@ def _run_file_job(
             "job_id": batch_job.job_id,
             "h5_path": str(h5_path),
             **result.to_dict(),
-            "saved": save_outputs,
+            "saved": bool(save_outputs and not commit_deferred),
+            "deferred": commit_deferred,
             "values_path": values_path,
         }
     )

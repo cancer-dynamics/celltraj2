@@ -8,9 +8,11 @@ from dataclasses import asdict, dataclass, field, is_dataclass
 from pathlib import Path
 from typing import Any
 
+from celltraj2.deferred_commit import PLAN_SCHEMA, defer_commit_plan
+from celltraj2.h5_access import H5AccessTimeout, run_with_stale_retries, snapshot_revisions, validate_revisions
 from celltraj2.object_indexing import JsonlReporter
-from celltraj2.h5_access import run_with_stale_retries, snapshot_revisions, validate_revisions
 from celltraj2.paths import validate_name
+from celltraj2.reporting import JobCancelledError
 from celltraj2.schema import utc_now_iso
 from celltraj2.tracking import compute_boundary_motion, default_tracking_run_id
 from celltraj2.trajectory import Trajectory
@@ -170,6 +172,7 @@ class BatchSurfaceMotionSummary:
     completed: int = 0
     skipped: int = 0
     failed: int = 0
+    deferred: int = 0
     links: int = 0
     transport_edges: int = 0
 
@@ -228,11 +231,19 @@ def run_batch_surface_motion(
             if outcome is None:
                 summary.skipped += 1
                 continue
-            result, motion_path = outcome
+            result, motion_path, commit_deferred = outcome
+            if commit_deferred:
+                summary.deferred += 1
             summary.completed += 1
             summary.links += result.link_count
             summary.transport_edges += result.transport_edge_count
-            emit({**common, "event": "file_completed", **result.to_dict(), "saved": save_outputs, "motion_path": motion_path})
+            emit({
+                **common, "event": "file_completed", **result.to_dict(),
+                "saved": bool(save_outputs and not commit_deferred),
+                "deferred": commit_deferred, "motion_path": motion_path,
+            })
+        except JobCancelledError:
+            raise
         except Exception as exc:
             summary.failed += 1
             emit({**common, "event": "file_failed", "error": repr(exc)})
@@ -248,7 +259,7 @@ def _run_surface_motion_file(
     h5_path: Path,
     emit: Reporter,
     common: Mapping[str, Any],
-) -> tuple[Any, str | None] | None:
+) -> tuple[Any, str | None, bool] | None:
     """Calculate read-only, then hold the canonical H5 only for commit."""
 
     save_outputs = bool(batch_job.save_outputs and file_job.save_outputs)
@@ -312,45 +323,82 @@ def _run_surface_motion_file(
             emit({**common, "event": "surface_motion_frame_summary", "frame": int(frame), **counts})
 
     motion_path = None
+    commit_deferred = False
     if save_outputs:
-        with Trajectory(
-            h5_path,
-            mode="r+",
-            reporter=emit,
-            operation="surface_motion_commit",
-            job_id=batch_job.job_id,
-        ) as trajectory:
-            validate_revisions(trajectory.store, dependencies)
-            existing = file_job.motion_set in trajectory.boundary_library(file_job.boundary_set).motion_sets()
-            if existing and not overwrite:
-                emit({**common, "event": "file_skipped", "reason": "motion set was written by another job"})
-                return None
-            motion_path = trajectory.store.write_boundary_motion(
-                result.boundary_set,
-                result.motion_set,
-                links=result.links,
-                transport=result.transport,
-                point_summaries=result.point_summaries,
-                schema=result.schema,
-                overwrite=overwrite,
-            )
-            trajectory.store.write_json(
-                f"/runs/surface_motion/{validate_name(batch_job.job_id, kind='surface motion run')}/run.json",
+        motion_path = f"/boundaries/{result.boundary_set}/motion/{result.motion_set}"
+        run_record = {
+            "schema": "celltraj2.surface_motion_run.v1",
+            "job_id": batch_job.job_id,
+            "completed_at": utc_now_iso(),
+            **result.to_dict(),
+            "motion_path": motion_path,
+            "dependencies": dependencies,
+            "boundary_dependency": result.schema.get("boundary_dependency"),
+            "track_dependency": result.schema.get("track_dependency"),
+            "registration_dependency": result.schema.get("registration_dependency"),
+            "metadata": {**batch_job.metadata, **file_job.metadata},
+        }
+        commit_plan = {
+            "schema": PLAN_SCHEMA,
+            "job_id": batch_job.job_id,
+            "project_root": None if batch_job.project_root is None else str(batch_job.project_root),
+            "h5_path": str(h5_path),
+            "operation": "surface_motion_commit",
+            "dependencies": dependencies,
+            "absent_unless_overwrite": [{
+                "path": motion_path, "overwrite": overwrite,
+                "reason": "motion set was written by another job",
+            }],
+            "operations": [
                 {
-                    "schema": "celltraj2.surface_motion_run.v1",
-                    "job_id": batch_job.job_id,
-                    "completed_at": utc_now_iso(),
-                    **result.to_dict(),
-                    "motion_path": motion_path,
-                    "dependencies": dependencies,
-                    "boundary_dependency": result.schema.get("boundary_dependency"),
-                    "track_dependency": result.schema.get("track_dependency"),
-                    "registration_dependency": result.schema.get("registration_dependency"),
-                    "metadata": {**batch_job.metadata, **file_job.metadata},
+                    "op": "write_boundary_motion",
+                    "result_key": "motion_path",
+                    "args": {
+                        "boundary_set": result.boundary_set,
+                        "motion_set": result.motion_set,
+                        "links": result.links,
+                        "transport": result.transport,
+                        "point_summaries": result.point_summaries,
+                        "schema": result.schema,
+                        "overwrite": overwrite,
+                    },
                 },
-                overwrite=True,
-            )
-    return result, motion_path
+                {
+                    "op": "write_json",
+                    "args": {
+                        "path": f"/runs/surface_motion/{validate_name(batch_job.job_id, kind='surface motion run')}/run.json",
+                        "data": run_record,
+                        "overwrite": True,
+                    },
+                },
+            ],
+        }
+        try:
+            with Trajectory(
+                h5_path,
+                mode="r+",
+                reporter=emit,
+                operation="surface_motion_commit",
+                job_id=batch_job.job_id,
+            ) as trajectory:
+                validate_revisions(trajectory.store, dependencies)
+                existing = file_job.motion_set in trajectory.boundary_library(file_job.boundary_set).motion_sets()
+                if existing and not overwrite:
+                    emit({**common, "event": "file_skipped", "reason": "motion set was written by another job"})
+                    return None
+                trajectory.store.write_boundary_motion(
+                    result.boundary_set, result.motion_set, links=result.links,
+                    transport=result.transport, point_summaries=result.point_summaries,
+                    schema=result.schema, overwrite=overwrite,
+                )
+                trajectory.store.write_json(
+                    f"/runs/surface_motion/{validate_name(batch_job.job_id, kind='surface motion run')}/run.json",
+                    run_record, overwrite=True,
+                )
+        except H5AccessTimeout:
+            defer_commit_plan(commit_plan, reporter=emit, parent_job_id=batch_job.job_id)
+            commit_deferred = True
+    return result, motion_path, commit_deferred
 
 
 __all__ = [

@@ -7,7 +7,8 @@ import inspect
 from pathlib import Path
 from typing import Any
 
-from celltraj2.batch import JsonlReporter, SegmentationFileJob, SegmentationResult, load_batch_job, run_batch_segmentation
+from celltraj2.batch import SegmentationFileJob, SegmentationResult, load_batch_job, run_batch_segmentation
+from celltraj2.runners._common import run_reported
 
 
 def _optional_float(value: Any) -> float | None:
@@ -217,8 +218,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("job", type=Path, help="Path to a celltraj2 segmentation batch job JSON file.")
     args = parser.parse_args(argv)
     job = load_batch_job(args.job)
-    run_batch_segmentation(job, CellposeSegmenter(), reporter=JsonlReporter())
-    return 0
+    return run_reported(
+        lambda reporter: run_batch_segmentation(job, CellposeSegmenter(), reporter=reporter)
+    )
 
 
 if __name__ == "__main__":

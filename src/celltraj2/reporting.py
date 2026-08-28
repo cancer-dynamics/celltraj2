@@ -13,6 +13,32 @@ from typing import Any, TextIO
 from celltraj2.schema import utc_now_iso
 
 
+class JobCancelledError(RuntimeError):
+    """Raised cooperatively when SITE requests cancellation of a worker."""
+
+
+def cancel_request_path() -> Path | None:
+    """Return the configured cooperative cancellation request file."""
+
+    value = os.environ.get("CELLTRAJ2_CANCEL_PATH")
+    return None if value in (None, "") else Path(str(value))
+
+
+def cancel_requested() -> bool:
+    """Return whether the active SITE job has requested graceful cancellation."""
+
+    path = cancel_request_path()
+    return bool(path is not None and path.exists())
+
+
+def raise_if_cancelled() -> None:
+    """Stop at a worker-safe progress boundary when cancellation is requested."""
+
+    path = cancel_request_path()
+    if path is not None and path.exists():
+        raise JobCancelledError(f"Cancellation requested via {path}")
+
+
 def _json_safe(value: Any) -> Any:
     if isinstance(value, Path):
         return str(value)
@@ -37,6 +63,22 @@ class JsonlReporter:
 
     def __call__(self, event: Mapping[str, Any]) -> None:
         payload = {"timestamp": utc_now_iso(), **dict(event)}
+        self._write(payload)
+        if str(payload.get("event") or "") not in {
+            "job_cancel_requested",
+            "job_cancelled",
+            "job_completed",
+        } and cancel_requested():
+            self._write(
+                {
+                    "timestamp": utc_now_iso(),
+                    "event": "job_cancel_requested",
+                    "cancel_path": str(cancel_request_path()),
+                }
+            )
+            raise_if_cancelled()
+
+    def _write(self, payload: Mapping[str, Any]) -> None:
         line = json.dumps(_json_safe(payload), sort_keys=True) + "\n"
         self.stream.write(line)
         self.stream.flush()
@@ -45,5 +87,16 @@ class JsonlReporter:
                 handle.write(line)
                 handle.flush()
 
+    def terminal(self, event: Mapping[str, Any]) -> None:
+        """Write a terminal event without re-checking the cancellation flag."""
 
-__all__ = ["JsonlReporter"]
+        self._write({"timestamp": utc_now_iso(), **dict(event)})
+
+
+__all__ = [
+    "JobCancelledError",
+    "JsonlReporter",
+    "cancel_request_path",
+    "cancel_requested",
+    "raise_if_cancelled",
+]

@@ -1,13 +1,15 @@
 from multiprocessing import get_context
 from io import StringIO
 import json
+import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import time
 import unittest
+from unittest.mock import patch
 
 from celltraj2.h5_access import H5AccessTimeout, file_lease, lock_path
-from celltraj2.reporting import JsonlReporter
+from celltraj2.reporting import JobCancelledError, JsonlReporter
 
 
 def _hold_lease(path: str, exclusive: bool, ready, duration: float) -> None:
@@ -92,6 +94,19 @@ class H5AccessTests(unittest.TestCase):
             self.assertEqual(stdout_event["event"], "frame_completed")
             self.assertEqual(stored_event["frame"], 3)
             self.assertIn("timestamp", stored_event)
+
+    def test_jsonl_reporter_checks_graceful_cancel_after_progress_event(self):
+        with TemporaryDirectory() as tmp:
+            cancel_path = Path(tmp) / "cancel.request.json"
+            cancel_path.write_text("{}", encoding="utf-8")
+            stream = StringIO()
+            with patch.dict(os.environ, {"CELLTRAJ2_CANCEL_PATH": str(cancel_path)}, clear=False):
+                reporter = JsonlReporter(stream)
+                with self.assertRaises(JobCancelledError):
+                    reporter({"event": "frame_completed", "frame": 3})
+
+            events = [json.loads(line) for line in stream.getvalue().splitlines()]
+            self.assertEqual([event["event"] for event in events], ["frame_completed", "job_cancel_requested"])
 
 
 if __name__ == "__main__":

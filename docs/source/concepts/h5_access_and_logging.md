@@ -34,6 +34,29 @@ limits. Lock conflicts use jittered backoff and emit periodic wait events.
 Native HDF5 lock conflicts are retried as well, which covers non-SITE readers
 that do not use the cooperative sidecar.
 
+## Deferred Result Commits
+
+A write timeout no longer discards an expensive completed calculation. Batch
+segmentation, object indexing, feature extraction, registration, tracking,
+boundary construction, surface motion, and SITE pixel classification serialize
+the exact pending result into a compressed `.ct2commit.npz` bundle. The bundle
+contains JSON and NumPy arrays only, is read with `allow_pickle=false`, carries
+a SHA-256 digest, and records the H5 input revisions used by the calculation.
+
+When SITE launched the worker, `defer_commit_plan` also appends a
+`deferred_h5_commit` job to `analysis/workflow_jobs.jsonl`. Running that job
+opens the canonical H5 with `r+` only for the commit, revalidates dependencies,
+and executes only an allow-listed set of celltraj2 store operations. A second
+write timeout leaves the bundle intact and appends another retry job that
+references the same data. A successful or safely skipped commit removes the
+bundle. If scientific dependencies changed, the saved result is rejected as
+stale rather than being written against different inputs.
+
+Deferred artifacts live below
+`outputs/workflows/deferred_h5_commit/<commit_id>/` in SITE projects. Standalone
+workers without a SITE queue still save the bundle and job JSON beside the H5
+under `.deferred_h5_commits/`, but must launch that job manually.
+
 ## Concurrent Changes
 
 Stored resources have monotonic revision attributes. A worker snapshots the
@@ -68,3 +91,9 @@ Detailed frame starts, summaries, skip/failure state, lock waits, stale-commit
 retries, and backend output belong in the external job log and `events.jsonl`.
 This removes repeated progress-only mutations from the H5 and leaves the H5
 focused on canonical analysis results.
+
+Queued workers also check `CELLTRAJ2_CANCEL_PATH` after every structured
+progress event, including frame/slice summaries and periodic H5 wait events. A
+request raises a cooperative cancellation at that safe boundary and runners
+exit with code 130 after writing a final `job_cancelled` event. Cancellation is
+cooperative: it does not terminate a process in the middle of an H5 mutation.

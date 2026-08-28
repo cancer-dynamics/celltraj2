@@ -8,9 +8,11 @@ from dataclasses import asdict, dataclass, field, is_dataclass
 from pathlib import Path
 from typing import Any
 
+from celltraj2.deferred_commit import PLAN_SCHEMA, defer_commit_plan
 from celltraj2.objects import default_object_index_run_id, index_label_arrays, index_object_set
-from celltraj2.h5_access import run_with_stale_retries, snapshot_revisions, validate_revisions
-from celltraj2.reporting import JsonlReporter
+from celltraj2.h5_access import H5AccessTimeout, run_with_stale_retries, snapshot_revisions, validate_revisions
+from celltraj2.paths import validate_name
+from celltraj2.reporting import JobCancelledError, JsonlReporter
 from celltraj2.schema import utc_now_iso
 from celltraj2.trajectory import Trajectory
 
@@ -186,6 +188,7 @@ class BatchObjectIndexSummary:
     completed: int = 0
     skipped: int = 0
     failed: int = 0
+    deferred: int = 0
     observations: int = 0
 
     def to_dict(self) -> dict[str, Any]:
@@ -235,6 +238,8 @@ def run_batch_object_indexing(
                 reporter=emit,
                 context={"job_id": batch_job.job_id, "h5_path": str(h5_path)},
             )
+        except JobCancelledError:
+            raise
         except Exception as exc:
             summary.failed += 1
             emit({"event": "file_failed", "job_id": batch_job.job_id, "h5_path": str(h5_path), "error": repr(exc)})
@@ -358,79 +363,140 @@ def _run_file_job(
             )
     lookup_paths: dict[int, str] = {}
     observations_path = None
+    commit_deferred = False
     if save_outputs:
-        with Trajectory(
-            h5_path,
-            mode="r+",
-            reporter=emit,
-            operation="object_index_commit",
-            job_id=batch_job.job_id,
-        ) as trajectory:
-            validate_revisions(trajectory.store, dependencies)
-            if trajectory.store.has_observations(file_job.object_set) and not overwrite:
-                summary.frames += len(result.frames)
-                summary.skipped += 1
-                emit(
-                    {
-                        "event": "file_skipped",
-                        "job_id": batch_job.job_id,
-                        "h5_path": str(h5_path),
-                        "object_set": file_job.object_set,
-                        "reason": "observations were written by another job",
-                    }
-                )
-                return
-            if file_job.source_kind == "mask_set":
-                for frame in result.frames:
-                    trajectory.store.write_label_frame(
-                        result.source_label_set,
-                        frame,
-                        derived_label_frames[frame],
-                        overwrite=overwrite,
-                        metadata={
+        observations_path = f"/object_sets/{result.object_set}/observations"
+        lookup_paths = {
+            int(frame): f"/object_sets/{result.object_set}/lookup/frame_{int(frame)}"
+            for frame in result.frames
+        }
+        run_record = {
+            "schema": "celltraj2.object_indexing_run.v1",
+            "run_id": batch_job.job_id,
+            "status": "completed",
+            "completed_at": utc_now_iso(),
+            "h5_path": str(h5_path),
+            "object_set": result.object_set,
+            "source_label_set": result.source_label_set,
+            "source_kind": file_job.source_kind,
+            "source_name": file_job.source_name,
+            "frames": result.frames,
+            "observation_count": result.observation_count,
+            "frame_counts": result.frame_counts,
+            "observations_path": observations_path,
+            "dependencies": dependencies,
+            "metadata": provenance,
+        }
+        operations: list[dict[str, Any]] = []
+        if file_job.source_kind == "mask_set":
+            for frame in result.frames:
+                operations.append({
+                    "op": "write_label_frame",
+                    "args": {
+                        "label_set": result.source_label_set,
+                        "frame": int(frame),
+                        "labels": derived_label_frames[frame],
+                        "overwrite": overwrite,
+                        "metadata": {
                             "derived_from_kind": "mask_set",
                             "derived_from_name": file_job.source_name,
                             "mask_conversion": file_job.mask_conversion,
                         },
-                    )
-            observations_path = trajectory.store.write_observations(
-                result.object_set,
-                result.observations,
-                result.schema,
-                source_label_set=result.source_label_set,
-                overwrite=overwrite,
-                metadata=provenance,
-            )
-            if overwrite:
-                trajectory.store.clear_observation_lookup_frames(result.object_set)
-            for frame in result.frames:
-                lookup_paths[frame] = trajectory.store.write_observation_lookup_frame(
-                    result.object_set,
-                    frame,
-                    result.lookups[frame],
-                    overwrite=overwrite,
-                )
-            trajectory.store.write_object_indexing_run(
-                batch_job.job_id,
-                {
-                    "schema": "celltraj2.object_indexing_run.v1",
-                    "run_id": batch_job.job_id,
-                    "status": "completed",
-                    "completed_at": utc_now_iso(),
-                    "h5_path": str(h5_path),
+                    },
+                })
+        operations.append({
+            "op": "write_observations",
+            "result_key": "observations_path",
+            "args": {
+                "object_set": result.object_set,
+                "observations": result.observations,
+                "schema": result.schema,
+                "source_label_set": result.source_label_set,
+                "overwrite": overwrite,
+                "metadata": provenance,
+            },
+        })
+        if overwrite:
+            operations.append({
+                "op": "clear_observation_lookup_frames",
+                "args": {"object_set": result.object_set},
+            })
+        for frame in result.frames:
+            operations.append({
+                "op": "write_observation_lookup_frame",
+                "args": {
                     "object_set": result.object_set,
-                    "source_label_set": result.source_label_set,
-                    "source_kind": file_job.source_kind,
-                    "source_name": file_job.source_name,
-                    "frames": result.frames,
-                    "observation_count": result.observation_count,
-                    "frame_counts": result.frame_counts,
-                    "observations_path": observations_path,
-                    "dependencies": dependencies,
-                    "metadata": provenance,
+                    "frame": int(frame),
+                    "lookup": result.lookups[frame],
+                    "overwrite": overwrite,
                 },
-                overwrite=True,
-            )
+            })
+        operations.append({
+            "op": "write_json",
+            "args": {
+                "path": f"/runs/object_indexing/{validate_name(batch_job.job_id, kind='object-indexing run')}/run.json",
+                "data": run_record,
+                "overwrite": True,
+            },
+        })
+        commit_plan = {
+            "schema": PLAN_SCHEMA,
+            "job_id": batch_job.job_id,
+            "project_root": None if batch_job.project_root is None else str(batch_job.project_root),
+            "h5_path": str(h5_path),
+            "operation": "object_index_commit",
+            "dependencies": dependencies,
+            "absent_unless_overwrite": [{
+                "path": f"/object_sets/{result.object_set}/observations",
+                "overwrite": overwrite,
+                "reason": "observations were written by another job",
+            }],
+            "operations": operations,
+        }
+        try:
+            with Trajectory(
+                h5_path,
+                mode="r+",
+                reporter=emit,
+                operation="object_index_commit",
+                job_id=batch_job.job_id,
+            ) as trajectory:
+                validate_revisions(trajectory.store, dependencies)
+                if trajectory.store.has_observations(file_job.object_set) and not overwrite:
+                    summary.frames += len(result.frames)
+                    summary.skipped += 1
+                    emit({
+                        "event": "file_skipped", "job_id": batch_job.job_id,
+                        "h5_path": str(h5_path), "object_set": file_job.object_set,
+                        "reason": "observations were written by another job",
+                    })
+                    return
+                if file_job.source_kind == "mask_set":
+                    for frame in result.frames:
+                        trajectory.store.write_label_frame(
+                            result.source_label_set, frame, derived_label_frames[frame],
+                            overwrite=overwrite,
+                            metadata={
+                                "derived_from_kind": "mask_set",
+                                "derived_from_name": file_job.source_name,
+                                "mask_conversion": file_job.mask_conversion,
+                            },
+                        )
+                trajectory.store.write_observations(
+                    result.object_set, result.observations, result.schema,
+                    source_label_set=result.source_label_set, overwrite=overwrite, metadata=provenance,
+                )
+                if overwrite:
+                    trajectory.store.clear_observation_lookup_frames(result.object_set)
+                for frame in result.frames:
+                    trajectory.store.write_observation_lookup_frame(
+                        result.object_set, frame, result.lookups[frame], overwrite=overwrite,
+                    )
+                trajectory.store.write_object_indexing_run(batch_job.job_id, run_record, overwrite=True)
+        except H5AccessTimeout:
+            defer_commit_plan(commit_plan, reporter=emit, parent_job_id=batch_job.job_id)
+            commit_deferred = True
+            summary.deferred += 1
     summary.frames += len(result.frames)
     summary.completed += len(result.frames)
     summary.observations += result.observation_count
@@ -440,7 +506,8 @@ def _run_file_job(
             "job_id": batch_job.job_id,
             "h5_path": str(h5_path),
             **result.to_dict(),
-            "saved": save_outputs,
+            "saved": bool(save_outputs and not commit_deferred),
+            "deferred": commit_deferred,
             "observations_path": observations_path,
             "lookup_paths": {str(key): value for key, value in lookup_paths.items()},
         }
