@@ -34,8 +34,9 @@ Current core capabilities:
   point correspondences and registration-versioned displacement maps;
 - query parents, children, histories, descendants, lineages, and maximal
   root-to-leaf trajectories, including scipy sparse trajectory membership;
-- compute row-aligned single-object feature tables, including regionprops,
-  intensity, compartment ratios, channel correlations, and SITE signaling;
+- compute row-aligned single-object feature tables, including calibrated
+  regionprops, mask-within-object component summaries, intensity, compartment
+  ratios, channel correlations, and SITE signaling;
 - compose segmentation model input from stored channel specs;
 - run dry or saved batch segmentation through an injectable Python callable or
   the Cellpose worker command;

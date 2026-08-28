@@ -8,6 +8,7 @@ from celltraj2.feature_extraction import run_batch_feature_extraction
 from celltraj2.features import (
     INTENSITY_PERCENTILE_STATISTICS,
     expand_intensity_statistics,
+    mask_components_v1_spec,
     regionprops_v1_spec,
     site_signaling_v1_spec,
 )
@@ -138,6 +139,32 @@ class FeatureExtractionTests(unittest.TestCase):
                 ot_method="sinkhorn",
                 sinkhorn_regularization=0.05,
             )
+
+    def _create_calibrated_3d_feature_h5(self, path: Path) -> None:
+        metadata = TrajectoryMetadata(
+            roi_id="sample_XY001_ROI001",
+            dataset_id="sample",
+            frame_count=1,
+            image_source=ImageSourceSpec(
+                source_type="embedded_h5",
+                axes=("T", "Z", "Y", "X", "C"),
+                sizes={"T": 1, "Z": 2, "Y": 4, "X": 4, "C": 1},
+            ),
+            acquisition={
+                "micron_per_pixel": 0.5,
+                "voxel_size_um": {"Z": 2.0, "Y": 0.5, "X": 0.5},
+            },
+        )
+        labels = self.np.zeros((2, 4, 4), dtype=self.np.uint16)
+        labels[:, :2, :3] = 1
+        mask = self.np.zeros_like(labels, dtype=bool)
+        mask[0, 0, 0:2] = True
+        mask[1, 1, 2] = True
+        with TrajectoryStore.create(path, metadata=metadata) as store:
+            store.write_label_frame("cells", 1, labels)
+            store.write_mask_frame("mitochondria", 1, mask)
+        with Trajectory(path, mode="r+") as trajectory:
+            trajectory.index_observations("cells", run_id="index_cells")
 
     def test_centered_boundary_multipoles_are_translation_and_rotation_invariant(self):
         theta = self.np.linspace(0.0, 2.0 * self.np.pi, 32, endpoint=False)
@@ -307,6 +334,76 @@ class FeatureExtractionTests(unittest.TestCase):
                 self.assertEqual(schema["row_alignment"], "/object_sets/cyto/observations")
                 self.assertEqual(trajectory.object_set("cyto").feature_sets(), ["regionprops_v1"])
                 self.assertEqual(trajectory.feature_extraction_runs(), ["features_regionprops"])
+
+    def test_regionprops_uses_axially_corrected_physical_spacing(self):
+        try:
+            import skimage  # noqa: F401
+        except ImportError:
+            self.skipTest("scikit-image is not installed")
+
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "calibrated_3d.ct2.h5"
+            self._create_calibrated_3d_feature_h5(path)
+            with Trajectory(path, mode="r+") as trajectory:
+                spec = regionprops_v1_spec(
+                    "cells",
+                    properties=["area", "axis_major_length"],
+                    use_physical_spacing=True,
+                )
+                trajectory.extract_features(spec, run_id="features_regionprops_3d")
+                values = trajectory.object_set("cells").read_features("regionprops_v1")
+                schema = trajectory.object_set("cells").read_feature_schema("regionprops_v1")
+
+            self.np.testing.assert_allclose(values["regionprops_area"], [6.0])
+            area_schema = next(
+                column for column in schema["columns"] if column["name"] == "regionprops_area"
+            )
+            self.assertEqual(area_schema["calibration"]["spatial_axes"], ["Z", "Y", "X"])
+            self.assertEqual(area_schema["calibration"]["spacing"], [2.0, 0.5, 0.5])
+            self.assertEqual(area_schema["calibration"]["distance_unit"], "um")
+            self.assertTrue(area_schema["calibration"]["physical_spacing_enabled"])
+
+    def test_mask_components_are_measured_inside_each_object_in_physical_units(self):
+        try:
+            import skimage  # noqa: F401
+        except ImportError:
+            self.skipTest("scikit-image is not installed")
+
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "mask_components_3d.ct2.h5"
+            self._create_calibrated_3d_feature_h5(path)
+            with Trajectory(path, mode="r+") as trajectory:
+                spec = mask_components_v1_spec(
+                    "cells",
+                    mask_set="mitochondria",
+                    name="mito",
+                    metrics=[
+                        "mask_area",
+                        "mask_fraction",
+                        "component_count",
+                        "component_density",
+                        "component_area_mean",
+                        "component_area_std",
+                        "largest_component_fraction",
+                    ],
+                    use_physical_spacing=True,
+                )
+                trajectory.extract_features(spec, run_id="features_mask_components")
+                values = trajectory.object_set("cells").read_features("mask_components_v1")
+                schema = trajectory.object_set("cells").read_feature_schema("mask_components_v1")
+
+            self.np.testing.assert_allclose(values["mito_mask_area"], [1.5])
+            self.np.testing.assert_allclose(values["mito_mask_fraction"], [0.25])
+            self.np.testing.assert_allclose(values["mito_component_count"], [2.0])
+            self.np.testing.assert_allclose(values["mito_component_density"], [1.0 / 3.0])
+            self.np.testing.assert_allclose(values["mito_component_area_mean"], [0.75])
+            self.np.testing.assert_allclose(values["mito_component_area_std"], [0.25])
+            self.np.testing.assert_allclose(values["mito_largest_component_fraction"], [2.0 / 3.0])
+            area_schema = next(
+                column for column in schema["columns"] if column["name"] == "mito_mask_area"
+            )
+            self.assertEqual(area_schema["unit"], "um^3")
+            self.assertEqual(area_schema["calibration"]["spacing"], [2.0, 0.5, 0.5])
 
     def test_site_signaling_feature_set_defaults_to_cyto_over_nuc_ratio(self):
         with TemporaryDirectory() as tmp:

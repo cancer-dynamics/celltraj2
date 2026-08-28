@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import warnings as python_warnings
 from collections import OrderedDict
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, field, is_dataclass
@@ -10,6 +11,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from celltraj2.paths import validate_name
+from celltraj2.registration import registration_calibration
 from celltraj2.schema import utc_now_iso
 
 
@@ -41,6 +43,56 @@ INTENSITY_PERCENTILE_STATISTICS = tuple(
     f"percentile_{level}" for level in INTENSITY_PERCENTILE_LEVELS
 )
 INTENSITY_STATISTIC_OPTIONS = (*INTENSITY_SCALAR_STATISTICS, "percentiles")
+
+REGIONPROPS_SCALAR_PROPERTIES = (
+    "area",
+    "area_bbox",
+    "area_convex",
+    "area_filled",
+    "axis_major_length",
+    "axis_minor_length",
+    "equivalent_diameter_area",
+    "euler_number",
+    "extent",
+    "feret_diameter_max",
+    "solidity",
+    "eccentricity",
+    "orientation",
+    "perimeter",
+    "perimeter_crofton",
+)
+
+MASK_COMPONENT_METRICS = (
+    "mask_area",
+    "mask_fraction",
+    "component_count",
+    "component_density",
+    "component_area_mean",
+    "component_area_median",
+    "component_area_std",
+    "component_area_cv",
+    "component_area_min",
+    "component_area_max",
+    "largest_component_fraction",
+    "component_equivalent_diameter_mean",
+    "component_axis_major_length_mean",
+    "component_axis_minor_length_mean",
+    "component_elongation_mean",
+    "component_roundness_mean",
+    "component_extent_mean",
+    "component_solidity_mean",
+)
+
+DEFAULT_MASK_COMPONENT_METRICS = (
+    "mask_area",
+    "mask_fraction",
+    "component_count",
+    "component_area_mean",
+    "component_area_std",
+    "largest_component_fraction",
+    "component_elongation_mean",
+    "component_roundness_mean",
+)
 
 
 def expand_intensity_statistics(stats: Sequence[str] | str | None = None) -> list[str]:
@@ -95,6 +147,17 @@ def _require_regionprops_table() -> Any:
             "`python -m pip install -e .[analysis]`."
         ) from exc
     return regionprops_table
+
+
+def _require_skimage_measure() -> tuple[Any, Any]:
+    try:
+        from skimage.measure import label, regionprops  # type: ignore
+    except ImportError as exc:
+        raise RuntimeError(
+            "mask-component features require scikit-image. Install with "
+            "`python -m pip install -e .[analysis]`."
+        ) from exc
+    return label, regionprops
 
 
 def _json_safe(value: Any) -> Any:
@@ -219,6 +282,7 @@ def regionprops_v1_spec(
     source_label_set: str | None = None,
     feature_set: str = "regionprops_v1",
     properties: Sequence[str] | None = None,
+    use_physical_spacing: bool = False,
     frames: Mapping[str, Any] | None = None,
     metadata: Mapping[str, Any] | None = None,
 ) -> FeatureSetSpec:
@@ -234,6 +298,41 @@ def regionprops_v1_spec(
                 "kind": "regionprops",
                 "prefix": "regionprops",
                 "properties": list(properties or ("area", "equivalent_diameter_area", "extent", "solidity")),
+                "use_physical_spacing": bool(use_physical_spacing),
+            }
+        ],
+        metadata=dict(metadata or {}),
+    )
+
+
+def mask_components_v1_spec(
+    object_set: str,
+    *,
+    mask_set: str,
+    source_label_set: str | None = None,
+    feature_set: str = "mask_components_v1",
+    name: str | None = None,
+    metrics: Sequence[str] | None = None,
+    connectivity: int | str = 1,
+    use_physical_spacing: bool = False,
+    frames: Mapping[str, Any] | None = None,
+    metadata: Mapping[str, Any] | None = None,
+) -> FeatureSetSpec:
+    """Return a feature spec for a binary mask restricted to each labeled object."""
+
+    return FeatureSetSpec(
+        feature_set=feature_set,
+        object_set=object_set,
+        source_label_set=source_label_set,
+        frames=dict(frames or {"mode": "all"}),
+        features=[
+            {
+                "kind": "mask_components",
+                "name": _slug(name or mask_set, fallback="mask"),
+                "mask_set": str(mask_set),
+                "metrics": list(metrics or DEFAULT_MASK_COMPONENT_METRICS),
+                "connectivity": connectivity,
+                "use_physical_spacing": bool(use_physical_spacing),
             }
         ],
         metadata=dict(metadata or {}),
@@ -524,7 +623,15 @@ def _compute_feature_frame(
 ) -> dict[str, Any]:
     kind = str(feature.get("kind") or feature.get("type") or "").lower()
     if kind == "regionprops":
-        return _compute_regionprops(labels, feature=feature, np=np)
+        return _compute_regionprops(trajectory, labels, feature=feature, np=np)
+    if kind in {"mask_components", "mask_within_objects"}:
+        return _compute_mask_components(
+            trajectory,
+            labels,
+            frame=frame,
+            feature=feature,
+            np=np,
+        )
     if kind == "intensity":
         return _compute_intensity(trajectory, labels, frame=frame, source_label_set=source_label_set, feature=feature, np=np)
     if kind in {"compartment_ratio", "ratio"}:
@@ -569,7 +676,13 @@ def _compute_feature_frame(
     raise ValueError(f"Unsupported feature kind: {kind!r}")
 
 
-def _compute_regionprops(labels: Any, *, feature: Mapping[str, Any], np: Any) -> dict[str, Any]:
+def _compute_regionprops(
+    trajectory: Any,
+    labels: Any,
+    *,
+    feature: Mapping[str, Any],
+    np: Any,
+) -> dict[str, Any]:
     regionprops_table = _require_regionprops_table()
     properties = [str(item) for item in feature.get("properties", ["area"])]
     prefix = _slug(feature.get("prefix") or "regionprops")
@@ -577,9 +690,20 @@ def _compute_regionprops(labels: Any, *, feature: Mapping[str, Any], np: Any) ->
     columns: OrderedDict[str, dict[str, Any]] = OrderedDict()
     warnings: list[str] = []
     label_image = np.asarray(labels)
+    spacing, calibration_schema = _feature_spacing(
+        trajectory,
+        label_image,
+        enabled=_config_bool(feature.get("use_physical_spacing"), default=False),
+    )
+    spacing_kwargs = {} if spacing is None else {"spacing": spacing}
     for prop in properties:
         try:
-            table = regionprops_table(label_image, properties=("label", prop), separator="_")
+            table = regionprops_table(
+                label_image,
+                properties=("label", prop),
+                separator="_",
+                **spacing_kwargs,
+            )
         except Exception as exc:
             column = _slug(f"{prefix}_{prop}")
             columns[column] = {
@@ -589,6 +713,8 @@ def _compute_regionprops(labels: Any, *, feature: Mapping[str, Any], np: Any) ->
                 "property": prop,
                 "status": "unsupported",
                 "warning": repr(exc),
+                "unit": _regionprops_property_unit(prop, label_image.ndim, calibration_schema),
+                "calibration": calibration_schema,
             }
             warnings.append(f"regionprops property {prop!r} could not be computed: {exc!r}")
             continue
@@ -605,10 +731,267 @@ def _compute_regionprops(labels: Any, *, feature: Mapping[str, Any], np: Any) ->
                 "family": "regionprops",
                 "property": prop,
                 "regionprops_key": str(key),
+                "unit": _regionprops_property_unit(prop, label_image.ndim, calibration_schema),
+                "calibration": calibration_schema,
             }
             for index, label_id in enumerate(label_values):
                 values_by_label.setdefault(int(label_id), {})[column] = _float_or_nan(array[index], np=np)
     return {"values_by_label": values_by_label, "columns": columns, "warnings": warnings}
+
+
+def _compute_mask_components(
+    trajectory: Any,
+    labels: Any,
+    *,
+    frame: int,
+    feature: Mapping[str, Any],
+    np: Any,
+) -> dict[str, Any]:
+    label_components, regionprops = _require_skimage_measure()
+    mask_set = str(feature.get("mask_set") or "").strip()
+    if not mask_set:
+        raise ValueError("mask_components feature requires mask_set")
+    metrics = [str(item).strip().lower() for item in feature.get("metrics", DEFAULT_MASK_COMPONENT_METRICS)]
+    unsupported = [metric for metric in metrics if metric not in MASK_COMPONENT_METRICS]
+    if unsupported:
+        raise ValueError(f"Unsupported mask-component metrics: {', '.join(unsupported)}")
+    if not metrics:
+        raise ValueError("mask_components feature requires at least one metric")
+
+    label_image = np.asarray(labels)
+    mask = _read_compartment_source_mask(
+        trajectory,
+        "mask",
+        mask_set,
+        frame,
+        label_image,
+        np=np,
+    )
+    spacing, calibration_schema = _feature_spacing(
+        trajectory,
+        label_image,
+        enabled=_config_bool(feature.get("use_physical_spacing"), default=False),
+    )
+    spacing_kwargs = {} if spacing is None else {"spacing": spacing}
+    connectivity = _component_connectivity(feature.get("connectivity", 1), label_image.ndim)
+    prefix = _slug(feature.get("name") or mask_set, fallback="mask")
+    measure_unit = _measure_unit(label_image.ndim, calibration_schema)
+    length_unit = str(calibration_schema["distance_unit"])
+    voxel_measure = float(np.prod(spacing)) if spacing is not None else 1.0
+
+    columns: OrderedDict[str, dict[str, Any]] = OrderedDict()
+    for metric in metrics:
+        column = _slug(f"{prefix}_{metric}")
+        columns[column] = {
+            "name": column,
+            "dtype": "float64",
+            "family": "mask_components",
+            "metric": metric,
+            "mask_set": mask_set,
+            "connectivity": connectivity,
+            "unit": _mask_component_metric_unit(metric, measure_unit=measure_unit, length_unit=length_unit),
+            "calibration": calibration_schema,
+        }
+
+    values_by_label: dict[int, dict[str, float]] = {}
+    warnings: list[str] = []
+    for cell in regionprops(label_image):
+        label_id = int(cell.label)
+        cell_mask = np.asarray(cell.image, dtype=bool)
+        local_mask = np.logical_and(np.asarray(mask[cell.slice], dtype=bool), cell_mask)
+        component_labels = label_components(local_mask, connectivity=connectivity)
+        components = regionprops(component_labels, **spacing_kwargs)
+        values = _mask_component_values(
+            cell_mask,
+            local_mask,
+            components,
+            metrics=metrics,
+            voxel_measure=voxel_measure,
+            np=np,
+        )
+        values_by_label[label_id] = {
+            _slug(f"{prefix}_{metric}"): values[metric]
+            for metric in metrics
+        }
+    return {"values_by_label": values_by_label, "columns": columns, "warnings": warnings}
+
+
+def _feature_spacing(
+    trajectory: Any,
+    labels: Any,
+    *,
+    enabled: bool,
+) -> tuple[tuple[float, ...] | None, dict[str, Any]]:
+    ndim = int(getattr(labels, "ndim", 0))
+    if ndim not in {2, 3}:
+        raise ValueError(f"Feature extraction expects 2D or 3D labels, received {ndim}D")
+    spatial_axes = ("Z", "Y", "X") if ndim == 3 else ("Y", "X")
+    if not enabled:
+        return None, {
+            "physical_spacing_enabled": False,
+            "spatial_axes": list(spatial_axes),
+            "spacing": [1.0] * ndim,
+            "distance_unit": "pixel" if ndim == 2 else "voxel",
+            "source": "index_space",
+        }
+    calibration = registration_calibration(trajectory.metadata)
+    if str(calibration.get("distance_unit")) != "um":
+        raise ValueError(
+            "Physical spacing was requested, but micron calibration is missing from H5 acquisition metadata."
+        )
+    scale_zyx = tuple(float(value) for value in calibration["coordinate_scale"])
+    spacing = scale_zyx if ndim == 3 else scale_zyx[-2:]
+    return spacing, {
+        "physical_spacing_enabled": True,
+        "spatial_axes": list(spatial_axes),
+        "spacing": list(spacing),
+        "distance_unit": "um",
+        "source": str(calibration.get("source") or "h5_acquisition_metadata"),
+    }
+
+
+def _component_connectivity(value: Any, ndim: int) -> int:
+    if str(value).strip().lower() in {"full", "max", "all"}:
+        return int(ndim)
+    try:
+        connectivity = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid component connectivity: {value!r}") from exc
+    if not 1 <= connectivity <= ndim:
+        raise ValueError(f"Component connectivity must be between 1 and {ndim}, received {connectivity}")
+    return connectivity
+
+
+def _mask_component_values(
+    cell_mask: Any,
+    local_mask: Any,
+    components: Sequence[Any],
+    *,
+    metrics: Sequence[str],
+    voxel_measure: float,
+    np: Any,
+) -> dict[str, float]:
+    cell_area = float(np.count_nonzero(cell_mask)) * voxel_measure
+    mask_area = float(np.count_nonzero(local_mask)) * voxel_measure
+    count = len(components)
+    areas = np.asarray([float(component.area) for component in components], dtype=float)
+    area_mean = _nan_stat(areas, "mean", np=np)
+    values = {
+        "mask_area": mask_area,
+        "mask_fraction": mask_area / cell_area if cell_area > 0 else float(np.nan),
+        "component_count": float(count),
+        "component_density": float(count) / cell_area if cell_area > 0 else float(np.nan),
+        "component_area_mean": area_mean,
+        "component_area_median": _nan_stat(areas, "median", np=np),
+        "component_area_std": _nan_stat(areas, "std", np=np),
+        "component_area_cv": _nan_stat(areas, "std", np=np) / area_mean if area_mean > 0 else float(np.nan),
+        "component_area_min": _nan_stat(areas, "min", np=np),
+        "component_area_max": _nan_stat(areas, "max", np=np),
+        "largest_component_fraction": float(np.nanmax(areas) / np.nansum(areas)) if areas.size and np.nansum(areas) > 0 else float(np.nan),
+    }
+    if "component_equivalent_diameter_mean" in metrics:
+        equivalent_diameters = _component_property_values(
+            components, "equivalent_diameter_area", np=np
+        )
+        values["component_equivalent_diameter_mean"] = _nan_stat(
+            equivalent_diameters, "mean", np=np
+        )
+    axis_metrics = {
+        "component_axis_major_length_mean",
+        "component_axis_minor_length_mean",
+        "component_elongation_mean",
+        "component_roundness_mean",
+    }
+    if axis_metrics.intersection(metrics):
+        major_lengths = _component_property_values(components, "axis_major_length", np=np)
+        minor_lengths = _component_property_values(components, "axis_minor_length", np=np)
+        values["component_axis_major_length_mean"] = _nan_stat(major_lengths, "mean", np=np)
+        values["component_axis_minor_length_mean"] = _nan_stat(minor_lengths, "mean", np=np)
+        elongation = np.divide(
+            major_lengths,
+            minor_lengths,
+            out=np.full(major_lengths.shape, np.nan, dtype=float),
+            where=minor_lengths > 0,
+        )
+        roundness = np.divide(
+            minor_lengths,
+            major_lengths,
+            out=np.full(minor_lengths.shape, np.nan, dtype=float),
+            where=major_lengths > 0,
+        )
+        values["component_elongation_mean"] = _nan_stat(elongation, "mean", np=np)
+        values["component_roundness_mean"] = _nan_stat(roundness, "mean", np=np)
+    if "component_extent_mean" in metrics:
+        extents = _component_property_values(components, "extent", np=np)
+        values["component_extent_mean"] = _nan_stat(extents, "mean", np=np)
+    if "component_solidity_mean" in metrics:
+        solidities = _component_property_values(components, "solidity", np=np)
+        values["component_solidity_mean"] = _nan_stat(solidities, "mean", np=np)
+    return values
+
+
+def _component_property_values(components: Sequence[Any], name: str, *, np: Any) -> Any:
+    values: list[float] = []
+    for component in components:
+        try:
+            with python_warnings.catch_warnings():
+                python_warnings.simplefilter("ignore")
+                values.append(float(getattr(component, name)))
+        except Exception:
+            values.append(float(np.nan))
+    return np.asarray(values, dtype=float)
+
+
+def _nan_stat(values: Any, statistic: str, *, np: Any) -> float:
+    array = np.asarray(values, dtype=float)
+    array = array[np.isfinite(array)]
+    if not array.size:
+        return float(np.nan)
+    return float(getattr(np, f"nan{statistic}")(array))
+
+
+def _measure_unit(ndim: int, calibration: Mapping[str, Any]) -> str:
+    if calibration["distance_unit"] == "um":
+        return f"um^{ndim}"
+    return "pixel" if ndim == 2 else "voxel"
+
+
+def _regionprops_property_unit(prop: str, ndim: int, calibration: Mapping[str, Any]) -> str:
+    if prop in {"area", "area_bbox", "area_convex", "area_filled"}:
+        return _measure_unit(ndim, calibration)
+    if prop in {
+        "axis_major_length",
+        "axis_minor_length",
+        "equivalent_diameter_area",
+        "feret_diameter_max",
+        "perimeter",
+        "perimeter_crofton",
+    }:
+        return str(calibration["distance_unit"])
+    if prop == "orientation":
+        return "radian"
+    return "dimensionless"
+
+
+def _mask_component_metric_unit(metric: str, *, measure_unit: str, length_unit: str) -> str:
+    if metric in {
+        "mask_area",
+        "component_area_mean",
+        "component_area_median",
+        "component_area_std",
+        "component_area_min",
+        "component_area_max",
+    }:
+        return measure_unit
+    if metric == "component_density":
+        return f"1/{measure_unit}"
+    if metric in {
+        "component_equivalent_diameter_mean",
+        "component_axis_major_length_mean",
+        "component_axis_minor_length_mean",
+    }:
+        return length_unit
+    return "dimensionless"
 
 
 def _compute_intensity(

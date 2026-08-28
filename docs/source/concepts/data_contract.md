@@ -509,6 +509,9 @@ Feature set names group related quantities. Current defaults are:
   `site_nuc`, and `site_ratio`.
 - `regionprops_v1`: scikit-image `regionprops_table`-style object morphology
   columns, currently using a `regionprops_<property>` naming pattern.
+- `mask_components_v1`: measurements of a stored binary mask restricted to
+  each labeled object, including mask occupancy and connected-component size
+  and shape summaries.
 
 Additional feature blocks can write intensity, compartment ratio, channel
 correlation, or regionprops-style columns into the same feature set. Output
@@ -530,6 +533,38 @@ An explicitly named single-statistic block keeps its feature name; a block that
 returns multiple statistics appends each statistic, for example
 `signal_mean` and `signal_percentile_50`. Each expanded percentile is recorded
 separately in the compound dataset and column schema.
+
+Regionprops blocks accept `use_physical_spacing`. When enabled, celltraj2
+passes the H5 acquisition calibration to `skimage.measure.regionprops_table`
+through its `spacing=` argument. Three-dimensional labels receive spacing in
+stored Z/Y/X order; two-dimensional labels receive Y/X. Z uses
+`voxel_size_um.Z`, or the existing `micron_per_pixel * zscale` fallback, so
+area, volume, axis length, and equivalent-diameter results are axially
+corrected. Every output-column schema records whether physical spacing was
+enabled, the exact axes and spacing sent, calibration source, and output unit.
+Requesting physical spacing without micron calibration is an explicit error;
+it never silently produces values labeled as microns.
+
+A `mask_components` block references `/masks/<mask_set>/frame_<n>` by semantic
+name. The mask is intersected with each positive source-label region before
+connected components are assigned, so foreground crossing a cell boundary is
+split and cannot merge organelles from adjacent cells. Connectivity is
+explicit: `1` is face connectivity and `"full"` includes corners. Available
+outputs include:
+
+- total mask area/volume, mask fraction, component count, and component
+  density per cell area/volume;
+- component area/volume mean, median, standard deviation, coefficient of
+  variation, minimum, maximum, and largest-component fraction;
+- mean equivalent diameter, major/minor axis length, elongation
+  (major/minor), roundness (minor/major), extent, and solidity.
+
+With physical spacing enabled, areas/volumes and lengths use microns to the
+appropriate power. Otherwise they use pixel/voxel index units. A cell with no
+mask foreground has zero mask occupancy and component count; component size
+and shape summaries are `NaN`. Shape statistics are calculated only when
+requested. Roundness is an axis-ratio measure that works in both 2D and 3D;
+surface-derived sphericity remains the responsibility of boundary features.
 
 Compartments are described with stored label or mask sources rather than raw H5
 paths. A compartment can start from the object set's source labels and then

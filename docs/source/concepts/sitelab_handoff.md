@@ -267,8 +267,9 @@ feature table under:
 /runs/feature_extraction/<run_id>/
 ```
 
-Supported feature block kinds are `regionprops`, `intensity`,
-`compartment_ratio`, and `channel_correlation`. The SITE launcher also exposes a
+Supported feature block kinds include `regionprops`, `mask_components`,
+`intensity`, `compartment_ratio`, `channel_correlation`, and the
+boundary-derived feature families. The SITE launcher also exposes a
 `SITE Signaling` block that expands to compact `site_cyto`, `site_nuc`, and
 `site_ratio` columns inside the default `site_v1` feature set.
 
@@ -278,6 +279,23 @@ Intensity `stats` may contain `mean`, `sum`, `median`, `min`, `max`, `std`,
 and 100, with one `percentile_<level>` feature column and schema entry per
 level. The SITE Featurize dialog presents these as checkboxes and stores the
 bundle token in its workflow JSON.
+
+Regionprops properties and Surface Geometry, Surface Interaction, and Surface
+Motion fields/metrics are selected from fixed checkbox catalogs rather than
+free-form CSV text. Legacy saved lists are mapped back onto those catalogs.
+For a 3D active object set, SITE enables `use_physical_spacing` by default and
+shows the per-H5 Z/Y/X voxel spacing that will be sent to scikit-image. Users
+can disable physical spacing explicitly. A missing micron calibration is shown
+in the setup and causes a clear worker error if physical mode remains enabled.
+
+The `Mask Components` block detects named `/masks/` datasets in the active H5
+files. It stores `mask_set`, connectivity, selected metrics, physical-spacing
+choice, and compact feature prefix in the normal Featurize UI snapshot, so
+Save Settings and Load from Run restore the block exactly. The worker
+intersects and relabels the mask separately inside each cell, then returns mask
+occupancy, puncta/organelle counts, component size distributions, and simple
+axis-ratio/extent/solidity shape summaries as ordinary row-aligned object
+feature columns.
 
 Mask and label inputs are referenced by source name and kind, not by H5 path.
 The worker resolves those names to `/masks/<name>/frame_<n>` or
