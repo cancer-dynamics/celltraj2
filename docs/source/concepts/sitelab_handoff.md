@@ -1,5 +1,16 @@
 # SITE Handoff
 
+## 2026-08-28 interpretation contract
+
+`celltraj2` now provides the first versioned cell Type/State interpretation
+contract used by `sitelab`: stable project observation keys, hierarchical
+taxonomies/state spaces, dense-posterior classification values, hard tracked
+type constancy with non-biological review flags, immutable releases, optional
+H5 classification groups, boundary projections, and H5-side materialization
+receipts under `/runs/interpretation`. See the SITE
+[implementation handoff](../../../../../docs/SITE_cell_type_first_vertical_slice_implementation_handoff.md)
+for the cross-repository workflow and verified boundaries.
+
 SITE prepares ROI definitions and image caches. `celltraj2` creates and owns
 the per-ROI analysis H5.
 

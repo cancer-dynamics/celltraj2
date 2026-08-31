@@ -58,6 +58,23 @@ from celltraj2.features import (
     site_signaling_v1_spec,
 )
 from celltraj2.h5_access import H5AccessTimeout, H5DependencyChangedError, open_h5
+from celltraj2.interpretation import (
+    BiologyRelease,
+    ClassificationManifest,
+    ClassificationResult,
+    MaterializationReceipt,
+    ProjectObservationKey,
+    StateNode,
+    StateSpace,
+    TypeNode,
+    TypeTaxonomy,
+    classification_content_digest,
+    classification_values_dtype,
+    compile_gate_memberships,
+    enforce_track_type_constancy,
+    observation_spine_digest,
+    track_type_review_records,
+)
 from celltraj2.object_indexing import (
     BatchObjectIndexSummary,
     ObjectIndexBatchJob,
@@ -144,6 +161,15 @@ __all__ = [
     "ImageSourceSpec",
     "H5AccessTimeout",
     "H5DependencyChangedError",
+    "BiologyRelease",
+    "ClassificationManifest",
+    "ClassificationResult",
+    "MaterializationReceipt",
+    "ProjectObservationKey",
+    "StateNode",
+    "StateSpace",
+    "TypeNode",
+    "TypeTaxonomy",
     "JsonlReporter",
     "ObjectIndexBatchJob",
     "ObjectIndexFileJob",
@@ -175,6 +201,10 @@ __all__ = [
     "compute_boundary_neighbors",
     "common_density_point_samples",
     "compute_boundary_motion",
+    "classification_content_digest",
+    "classification_values_dtype",
+    "compile_gate_memberships",
+    "enforce_track_type_constancy",
     "expand_intensity_statistics",
     "extract_feature_set",
     "estimate_pair_translation",
@@ -182,6 +212,7 @@ __all__ = [
     "mask_components_v1_spec",
     "optimal_transport_plan",
     "open_h5",
+    "observation_spine_digest",
     "resolve_boundary_source_ids",
     "regionprops_v1_spec",
     "register_global_translation",
@@ -195,6 +226,7 @@ __all__ = [
     "site_signaling_v1_spec",
     "track_minimum_boundary_ot_cost",
     "track_minimum_centroid_distance",
+    "track_type_review_records",
 ]
 
 __version__ = "0.1.0"

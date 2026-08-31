@@ -258,6 +258,32 @@ def _execute_operation(trajectory: Trajectory, operation: Mapping[str, Any]) -> 
             data["object_set"], data["feature_set"], data["values"], data["schema"],
             overwrite=bool(data.get("overwrite", False)), qc=data.get("qc"),
         )
+    if name == "write_classification_set":
+        return store.write_classification_set(
+            data["object_set"], data["classification_set"],
+            values=data["values"], probabilities=data["probabilities"],
+            schema=data["schema"], source_manifest=data["source_manifest"],
+            expected_observation_spine_digest=data.get("expected_observation_spine_digest"),
+        )
+    if name == "write_interpretation_release":
+        return store.write_interpretation_release(
+            data["object_set"], data["release_id"], data["manifest"],
+        )
+    if name == "write_interpretation_materialization_receipt":
+        return store.write_interpretation_materialization_receipt(
+            data["object_set"], data["artifact_id"], data["receipt"],
+        )
+    if name == "set_active_interpretation":
+        return store.set_active_interpretation(
+            data["object_set"], active_release_ids=list(data["active_release_ids"]),
+            selected_release_id=data.get("selected_release_id"),
+        )
+    if name == "project_classification_to_boundary":
+        return store.project_classification_to_boundary(
+            data["boundary_set"], data["attribute_set"],
+            object_set=data["object_set"], classification_set=data["classification_set"],
+            schema=data["schema"],
+        )
     if name == "write_registration_set":
         registration = SimpleNamespace(**dict(data["registration"]))
         return store.write_registration_set(registration, overwrite=bool(data.get("overwrite", False)))

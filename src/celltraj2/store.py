@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import uuid
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Callable, Mapping as TypingMapping
@@ -175,6 +176,7 @@ class TrajectoryStore:
             "runs/feature_extraction",
             "runs/registration",
             "runs/tracking",
+            "runs/interpretation",
         ):
             self._h5.require_group(name)
         self.write_json("/images/raw/metadata.json", {"storage": "frame_based", "frame_index_base": 1}, overwrite=True)
@@ -321,6 +323,10 @@ class TrajectoryStore:
         group.require_group("lookup")
         group.require_group("features")
         group.require_group("tracks")
+        group.require_group("classifications")
+        group.require_group("representations")
+        group.require_group("biological_events")
+        group.require_group("interpretation_releases")
         json_path = f"{group_path}/object_set.json"
         if overwrite_metadata or json_path.strip("/") not in self._h5:
             payload = {
@@ -435,6 +441,313 @@ class TrajectoryStore:
         if "object_sets" not in self._h5:
             return []
         return sorted(str(key) for key in self._h5["object_sets"].keys())
+
+    def write_classification_set(
+        self,
+        object_set: str,
+        classification_set: str,
+        *,
+        values: Any,
+        probabilities: Any,
+        schema: Mapping[str, Any],
+        source_manifest: Mapping[str, Any],
+        expected_observation_spine_digest: str | None = None,
+    ) -> str:
+        """Stage and immutably materialize one row-aligned classification.
+
+        Long-running computation and project queries must happen before this
+        method is called.  The enclosing ``TrajectoryStore`` owns the exclusive
+        H5 lease for this short validation/write/flush window.
+        """
+
+        from celltraj2.interpretation import validate_classification_arrays
+
+        np = __import__("numpy")
+        object_name = validate_name(object_set, kind="object set")
+        try:
+            artifact_id = str(uuid.UUID(str(classification_set)))
+        except (ValueError, AttributeError, TypeError) as exc:
+            raise ValueError("classification_set must be a UUID") from exc
+        self.require_object_set(object_name)
+        observations = self.read_observations(object_name)
+        if "observation_id" not in (observations.dtype.names or ()):
+            raise ValueError("Target observations do not contain observation_id")
+        if expected_observation_spine_digest not in (None, ""):
+            from celltraj2.interpretation import observation_spine_digest
+
+            observation_schema = (
+                self.read_observations_schema(object_name)
+                if f"object_sets/{object_name}/observations_schema.json" in self._h5
+                else {"schema": "celltraj2.observations.v1"}
+            )
+            actual_spine_digest = observation_spine_digest(
+                observations,
+                object_set=object_name,
+                observation_schema=observation_schema,
+            )
+            if actual_spine_digest != str(expected_observation_spine_digest):
+                raise ValueError(
+                    "Target observation-spine digest does not match the project classification fragment"
+                )
+        class_ids = list(schema.get("class_ids") or source_manifest.get("class_ids") or [])
+        if not class_ids:
+            raise ValueError("Classification schema must contain an ordered class_ids registry")
+        normalized, matrix = validate_classification_arrays(
+            values,
+            probabilities,
+            class_count=len(class_ids),
+            expected_observation_ids=observations["observation_id"],
+        )
+        digest = str(
+            source_manifest.get("content_digest")
+            or schema.get("content_digest")
+            or ""
+        )
+        if not digest or len(digest) != 64:
+            raise ValueError("Classification source manifest must contain a SHA-256 content_digest")
+        target_path = f"object_sets/{object_name}/classifications/{artifact_id}"
+        if target_path in self._h5:
+            existing = self._h5[target_path]
+            existing_digest = str(existing.attrs.get("content_digest", ""))
+            if existing_digest == digest:
+                return f"/{target_path}"
+            raise ValueError(
+                f"Classification UUID {artifact_id} already exists with another content digest"
+            )
+        staging_root = self._h5.require_group(f"object_sets/{object_name}/classifications/__staging__")
+        staging_name = f"write-{uuid.uuid4().hex}"
+        staging_path = f"object_sets/{object_name}/classifications/__staging__/{staging_name}"
+        group = staging_root.create_group(staging_name)
+        try:
+            dataset = group.create_dataset(
+                "values",
+                data=normalized,
+                compression="gzip",
+                shuffle=True,
+            )
+            dataset.attrs["row_alignment"] = f"/object_sets/{object_name}/observations"
+            dataset.attrs["observation_id_join"] = "observation_id"
+            posterior = group.create_dataset(
+                "probabilities",
+                data=np.ascontiguousarray(matrix, dtype=np.float32),
+                compression="gzip",
+                shuffle=True,
+            )
+            posterior.attrs["dtype_contract"] = "float32_dense"
+            posterior.attrs["class_order"] = json.dumps(class_ids)
+            h5py = _require_h5py()
+            string_dtype = h5py.string_dtype(encoding="utf-8")
+            group.create_dataset(
+                "schema.json",
+                data=_json_text(dict(schema)),
+                dtype=string_dtype,
+            )
+            group.create_dataset(
+                "source_manifest.json",
+                data=_json_text(dict(source_manifest)),
+                dtype=string_dtype,
+            )
+            group.attrs["schema"] = "celltraj2.classification_materialization.v1"
+            group.attrs["classification_uuid"] = artifact_id
+            group.attrs["classification_kind"] = str(schema.get("classification_kind") or "")
+            group.attrs["content_digest"] = digest
+            if expected_observation_spine_digest not in (None, ""):
+                group.attrs["observation_spine_digest"] = str(expected_observation_spine_digest)
+            group.attrs["complete"] = True
+            if int(group["values"].shape[0]) != int(observations.shape[0]):
+                raise ValueError("Staged classification row count changed during write")
+            if tuple(group["probabilities"].shape) != tuple(matrix.shape):
+                raise ValueError("Staged posterior shape changed during write")
+            self._h5.move(staging_path, target_path)
+        except Exception:
+            if staging_path in self._h5:
+                del self._h5[staging_path]
+            raise
+        self._mark_mutation(target_path)
+        return f"/{target_path}"
+
+    def read_classification_set(self, object_set: str, classification_set: str) -> dict[str, Any]:
+        """Read one materialized classification and its manifests."""
+
+        object_name = validate_name(object_set, kind="object set")
+        artifact_id = str(uuid.UUID(str(classification_set)))
+        path = f"object_sets/{object_name}/classifications/{artifact_id}"
+        group = self._h5[path]
+        return {
+            "values": group["values"][()],
+            "probabilities": group["probabilities"][()],
+            "schema": self.read_json(f"/{path}/schema.json"),
+            "source_manifest": self.read_json(f"/{path}/source_manifest.json"),
+        }
+
+    def list_classification_sets(self, object_set: str) -> list[str]:
+        """List complete immutable classification UUIDs for an object set."""
+
+        object_name = validate_name(object_set, kind="object set")
+        path = f"object_sets/{object_name}/classifications"
+        if path not in self._h5:
+            return []
+        return sorted(
+            str(key)
+            for key in self._h5[path].keys()
+            if str(key) != "__staging__" and bool(self._h5[path][key].attrs.get("complete", False))
+        )
+
+    def write_interpretation_release(
+        self,
+        object_set: str,
+        release_id: str,
+        manifest: Mapping[str, Any],
+    ) -> str:
+        """Write one immutable BiologyRelease manifest into an object set."""
+
+        object_name = validate_name(object_set, kind="object set")
+        release_uuid = str(uuid.UUID(str(release_id)))
+        self.require_object_set(object_name)
+        path = f"/object_sets/{object_name}/interpretation_releases/{release_uuid}/manifest.json"
+        if path.strip("/") in self._h5:
+            if self.read_json(path) == dict(manifest):
+                return path
+            raise ValueError(f"BiologyRelease {release_uuid} already exists with different content")
+        self.write_json(path, dict(manifest), overwrite=False)
+        return path
+
+    def set_active_interpretation(
+        self,
+        object_set: str,
+        *,
+        active_release_ids: list[str],
+        selected_release_id: str | None,
+    ) -> str:
+        """Update the small mutable active-release selector for one object set."""
+
+        object_name = validate_name(object_set, kind="object set")
+        release_ids = [str(uuid.UUID(str(value))) for value in active_release_ids]
+        selected = None if selected_release_id in (None, "") else str(uuid.UUID(str(selected_release_id)))
+        if selected is not None and selected not in release_ids:
+            raise ValueError("selected_release_id must be present in active_release_ids")
+        payload = {
+            "schema": "celltraj2.interpretation_active.v1",
+            "active_release_ids": release_ids,
+            "selected_release_id": selected,
+        }
+        path = f"/object_sets/{object_name}/interpretation_active.json"
+        if path.strip("/") in self._h5 and self.read_json(path) == payload:
+            return path
+        self.write_json(path, payload, overwrite=True)
+        return path
+
+    def write_interpretation_materialization_receipt(
+        self,
+        object_set: str,
+        artifact_id: str,
+        receipt: Mapping[str, Any],
+    ) -> str:
+        """Record an immutable H5-side receipt for one materialization.
+
+        The receipt lives under ``/runs`` so a self-contained H5 records which
+        project artifact was applied even when it is later copied away from the
+        project catalog. Replaying an identical receipt is a no-op.
+        """
+
+        object_name = validate_name(object_set, kind="object set")
+        artifact_uuid = str(uuid.UUID(str(artifact_id)))
+        payload = dict(receipt)
+        if str(payload.get("artifact_id") or "") != artifact_uuid:
+            raise ValueError("Materialization receipt artifact_id does not match")
+        if str(payload.get("object_set") or "") != object_name:
+            raise ValueError("Materialization receipt object_set does not match")
+        path = (
+            f"/runs/interpretation/{artifact_uuid}/materializations/"
+            f"{object_name}/receipt.json"
+        )
+        if path.strip("/") in self._h5:
+            if self.read_json(path) == payload:
+                return path
+            raise ValueError(
+                f"Materialization receipt for {artifact_uuid}/{object_name} already differs"
+            )
+        self.write_json(path, payload, overwrite=False)
+        return path
+
+    def project_classification_to_boundary(
+        self,
+        boundary_set: str,
+        attribute_set: str,
+        *,
+        object_set: str,
+        classification_set: str,
+        schema: Mapping[str, Any],
+    ) -> str:
+        """Project a cell classification onto boundary entities by observation ID."""
+
+        np = __import__("numpy")
+        boundary_name = validate_name(boundary_set, kind="boundary set")
+        classification = self.read_classification_set(object_set, classification_set)
+        entities = self._h5[f"boundaries/{boundary_name}/entities"][()]
+        if "observation_id" not in (entities.dtype.names or ()):
+            raise ValueError("Boundary entities do not contain observation_id")
+        values = classification["values"]
+        by_observation = {int(row["observation_id"]): row for row in values}
+        dtype = np.dtype(
+            [
+                ("observation_id", "<u8"),
+                ("class_index", "<u4"),
+                ("assignment_status", "u1"),
+                ("confidence", "<f4"),
+                ("qc_flags", "<u4"),
+            ]
+        )
+        projected = np.zeros(int(entities.shape[0]), dtype=dtype)
+        projected["confidence"] = np.nan
+        missing = 0
+        for index, entity in enumerate(entities):
+            observation_id = int(entity["observation_id"])
+            projected["observation_id"][index] = max(0, observation_id)
+            source = by_observation.get(observation_id)
+            if source is None:
+                missing += 1
+                continue
+            for field in ("class_index", "assignment_status", "confidence", "qc_flags"):
+                projected[field][index] = source[field]
+        projection_schema = dict(schema)
+        projection_schema.update(
+            {
+                "schema": "celltraj2.boundary_classification_projection.v1",
+                "source_object_set": str(object_set),
+                "source_classification_uuid": str(uuid.UUID(str(classification_set))),
+                "source_classification_digest": classification["source_manifest"].get("content_digest"),
+                "boundary_set": boundary_name,
+                "entity_count": int(entities.shape[0]),
+                "missing_observation_count": int(missing),
+            }
+        )
+        attribute_name = validate_name(attribute_set, kind="boundary entity attribute set")
+        existing_schema_path = (
+            f"/boundaries/{boundary_name}/entity_attributes/{attribute_name}/schema.json"
+        )
+        if existing_schema_path.strip("/") in self._h5:
+            existing_schema = self.read_json(existing_schema_path)
+            if (
+                str(existing_schema.get("source_classification_uuid") or "")
+                == str(projection_schema["source_classification_uuid"])
+                and str(existing_schema.get("source_classification_digest") or "")
+                == str(projection_schema.get("source_classification_digest") or "")
+            ):
+                return (
+                    f"/boundaries/{boundary_name}/entity_attributes/"
+                    f"{attribute_name}/values"
+                )
+            raise ValueError(
+                f"Boundary attribute set {attribute_name!r} already projects another classification"
+            )
+        return self.write_boundary_entity_attributes(
+            boundary_name,
+            attribute_name,
+            projected,
+            projection_schema,
+            overwrite=False,
+        )
 
     def write_boundary_library(
         self,
