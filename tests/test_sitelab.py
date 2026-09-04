@@ -4,6 +4,7 @@ from tempfile import TemporaryDirectory
 import unittest
 
 from celltraj2.sitelab import (
+    create_analysis_h5_from_site_roi,
     create_metadata_from_site_roi,
     dataset_id_from_roi_json,
     default_cell_file_path,
@@ -12,6 +13,7 @@ from celltraj2.sitelab import (
     roi_cache_axes_from_source,
     stored_site_path,
 )
+from celltraj2.store import TrajectoryStore
 
 
 class SitelabHandoffTests(unittest.TestCase):
@@ -152,21 +154,27 @@ class SitelabHandoffTests(unittest.TestCase):
     def test_create_metadata_from_site_roi_reads_version_02_sharded_roi_record(self):
         roi_id = "sample_XY001_ROI001_a1b2c3d4"
         roi_uuid = "a1b2c3d4-1111-2222-3333-444455556666"
+        dataset_uuid = "bbb2c3d4-1111-2222-3333-444455556666"
+        project_uuid = "ccc2c3d4-1111-2222-3333-444455556666"
         with TemporaryDirectory() as tmp:
             project_root = Path(tmp)
+            (project_root / "sitelab.project.json").write_text(
+                json.dumps({"project_uuid": project_uuid}),
+                encoding="utf-8",
+            )
             roi_json_path = project_root / "rois" / "sample.rois.json"
-            record_dir = project_root / "rois" / "dataset-uuid"
+            record_dir = project_root / "rois" / dataset_uuid
             record_dir.mkdir(parents=True)
             roi_json_path.write_text(
                 json.dumps(
                     {
                         "roi_set_version": "0.2",
                         "dataset_id": "sample",
-                        "dataset_uuid": "dataset-uuid",
+                        "dataset_uuid": dataset_uuid,
                         "source_path": "sample.nd2",
                         "source_axes": ["T", "P", "C", "Y", "X"],
                         "source_sizes": {"T": 3, "P": 1, "C": 1, "Y": 4, "X": 5},
-                        "roi_record_dir": "rois/dataset-uuid",
+                        "roi_record_dir": f"rois/{dataset_uuid}",
                     }
                 ),
                 encoding="utf-8",
@@ -193,9 +201,77 @@ class SitelabHandoffTests(unittest.TestCase):
 
         self.assertEqual(root, project_root)
         self.assertEqual(dataset_id, "sample")
+        self.assertEqual(metadata.project_uuid, project_uuid)
+        self.assertEqual(metadata.dataset_uuid, dataset_uuid)
+        self.assertEqual(metadata.roi_uuid, roi_uuid)
+        self.assertEqual(roi_record["project_uuid"], project_uuid)
+        self.assertEqual(roi_record["dataset_uuid"], dataset_uuid)
         self.assertEqual(roi_record["roi_uuid"], roi_uuid)
         self.assertEqual(metadata.roi_id, roi_id)
         self.assertEqual(metadata.frame_count, 2)
+
+    def test_create_analysis_h5_embeds_complete_site_identity(self):
+        project_uuid = "11111111-1111-4111-8111-111111111111"
+        dataset_uuid = "22222222-2222-4222-8222-222222222222"
+        roi_uuid = "33333333-3333-4333-8333-333333333333"
+        roi_id = "MixedCase_XY001_ROI001_33333333"
+        with TemporaryDirectory() as tmp:
+            project_root = Path(tmp)
+            (project_root / "sitelab.project.json").write_text(
+                json.dumps({"project_uuid": project_uuid}),
+                encoding="utf-8",
+            )
+            roi_json_path = project_root / "rois" / "MixedCase.rois.json"
+            record_dir = project_root / "rois" / dataset_uuid
+            record_dir.mkdir(parents=True)
+            roi_json_path.write_text(
+                json.dumps(
+                    {
+                        "roi_set_version": "0.2",
+                        "dataset_id": "MixedCase",
+                        "dataset_uuid": dataset_uuid,
+                        "source_path": "MixedCase.nd2",
+                        "source_axes": ["T", "P", "C", "Y", "X"],
+                        "source_sizes": {"T": 1, "P": 1, "C": 1, "Y": 4, "X": 5},
+                        "roi_record_dir": f"rois/{dataset_uuid}",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (record_dir / f"{roi_uuid}.roi.site.json").write_text(
+                json.dumps(
+                    {
+                        "roi_id": roi_id,
+                        "roi_uuid": roi_uuid,
+                        "position_index": 0,
+                        "bounds": {
+                            "z_start": 0,
+                            "z_stop": 1,
+                            "y_start": 0,
+                            "y_stop": 4,
+                            "x_start": 0,
+                            "x_stop": 5,
+                        },
+                        "storage_mode": "linked_nd2",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            h5_path = create_analysis_h5_from_site_roi(
+                roi_json_path=roi_json_path,
+                roi_id=roi_id,
+                project_root=project_root,
+            )
+
+            with TrajectoryStore.open(h5_path) as store:
+                metadata = store.read_json("/metadata/celltraj2.json")
+                roi = store.read_json("/metadata/roi.json")
+                links = store.read_json("/metadata/source_links.json")
+
+        for payload in (metadata, roi, links):
+            self.assertEqual(payload["project_uuid"], project_uuid)
+            self.assertEqual(payload["dataset_uuid"], dataset_uuid)
+            self.assertEqual(payload["roi_uuid"], roi_uuid)
 
 
 if __name__ == "__main__":

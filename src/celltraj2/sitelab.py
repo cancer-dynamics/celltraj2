@@ -29,6 +29,24 @@ def load_json(path: str | Path) -> dict[str, Any]:
     return json.loads(Path(path).read_text(encoding="utf-8"))
 
 
+def _consistent_identity_value(field_name: str, *values: Any) -> str | None:
+    resolved = {str(value) for value in values if value not in (None, "")}
+    if len(resolved) > 1:
+        raise ValueError(f"Conflicting {field_name} values in SITE handoff metadata: {sorted(resolved)}")
+    return next(iter(resolved), None)
+
+
+def _project_uuid_from_root(project_root: Path) -> str | None:
+    project_path = project_root / "sitelab.project.json"
+    if not project_path.is_file():
+        return None
+    try:
+        project = load_json(project_path)
+    except (OSError, json.JSONDecodeError):
+        return None
+    return str(project.get("project_uuid") or "") or None
+
+
 def infer_project_root_from_roi_json(roi_json_path: str | Path) -> Path:
     """Return the SITE project root for a ROI JSON path when possible."""
 
@@ -228,6 +246,28 @@ def create_metadata_from_site_roi(
     roi_records = load_roi_records(roi_json_path, roi_set_data, project_root=root)
     roi_record = find_roi_record({"rois": roi_records}, roi_id)
     dataset_id = dataset_id_from_roi_json(roi_json_path, roi_set_data)
+    project_uuid = _consistent_identity_value(
+        "project_uuid",
+        _project_uuid_from_root(root),
+        roi_set_data.get("project_uuid"),
+        roi_record.get("project_uuid"),
+        (manifest or {}).get("project_uuid"),
+    )
+    dataset_uuid = _consistent_identity_value(
+        "dataset_uuid",
+        roi_set_data.get("dataset_uuid"),
+        roi_record.get("dataset_uuid"),
+        (manifest or {}).get("dataset_uuid"),
+    )
+    roi_uuid = _consistent_identity_value("roi_uuid", roi_record.get("roi_uuid"))
+    roi_record.update(
+        {
+            "project_uuid": project_uuid,
+            "dataset_id": dataset_id,
+            "dataset_uuid": dataset_uuid,
+            "roi_uuid": roi_uuid,
+        }
+    )
     image_source = image_source_from_site_roi(roi_set=roi_set_data, roi_record=roi_record, project_root=root)
 
     image = {}
@@ -248,6 +288,9 @@ def create_metadata_from_site_roi(
     metadata = TrajectoryMetadata(
         roi_id=roi_id,
         dataset_id=dataset_id,
+        project_uuid=project_uuid,
+        dataset_uuid=dataset_uuid,
+        roi_uuid=roi_uuid,
         frame_count=frame_count_from_roi(roi_record, roi_set_data),
         channels=channels,
         roi=roi_spec,
@@ -281,6 +324,9 @@ def create_analysis_h5_from_site_roi(
     out = Path(output_path) if output_path is not None else default_cell_file_path(root, dataset_id, roi_id)
     linked_nd2_path = resolve_site_path(roi_set.get("source_path"), project_root=root)
     source_links = {
+        "project_uuid": metadata.project_uuid,
+        "dataset_uuid": metadata.dataset_uuid,
+        "roi_uuid": metadata.roi_uuid,
         "roi_json_path": str(Path(roi_json_path)),
         "manifest_path": str(Path(manifest_path)) if manifest_path is not None else None,
         "project_root": str(root),

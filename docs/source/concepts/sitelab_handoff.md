@@ -1,5 +1,38 @@
 # SITE Handoff
 
+## 2026-09-03 propagated posterior invariant
+
+SITE gate classification can propagate hard type constancy across accepted
+lineage links. When that propagation assigns or ambiguates a row with no direct
+posterior support, `enforce_track_type_constancy` now supplies a normalized
+derived posterior: one-hot for a single lineage candidate and lineage consensus
+for multiple candidates. This preserves the canonical invariant that every
+assigned or ambiguous row sums to one while retaining incomplete-support QC and
+review semantics. SITE separately records gate-overlap conflicts and their kNN
+resolution provenance in the project classification artifact.
+
+## 2026-09-02 portable classification display metadata
+
+New SITE materializations add the classification role plus class UUID-to-name
+and UUID-to-color maps to `schema.json`. These fields do not alter the dense
+posterior or row-alignment contract; they let a standalone `.ct2.h5` retain
+the categorical Type/State palette used by ROI object and surface rendering.
+Boundary projection remains available for downstream denormalization but is
+not required for SITE visualization.
+
+## 2026-09-02 active hierarchy and scoped gate revision
+
+SITE now retains immutable taxonomy/release alternatives while exposing exactly
+one active TypeTaxonomy and at most one active BiologyRelease. Manual ROI
+evidence may target any hierarchy node. Project classifications may combine
+gate evidence from several PopulationSnapshots: applicable gates on each node
+and evidence-bearing ancestors use logical AND, absence from a snapshot is not
+negative evidence, and the deepest uniquely valid node is assigned. The H5
+contract remains a dense `float32` posterior in the classification manifest's
+stable all-node UUID order. See the updated SITE
+[implementation handoff](../../../../../docs/SITE_cell_type_first_vertical_slice_implementation_handoff.md)
+and [cell typing tutorial](../../../../../docs/SITE_cell_typing_tutorial.md).
+
 ## 2026-08-28 interpretation contract
 
 `celltraj2` now provides the first versioned cell Type/State interpretation

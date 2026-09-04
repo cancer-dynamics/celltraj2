@@ -172,6 +172,26 @@ class InterpretationSchemaTests(unittest.TestCase):
         branch = [item for item in result.review_records if item["kind"] == "suspicious_branch"]
         self.assertEqual(branch[0]["biological_event_created"], False)
 
+    def test_track_constancy_propagates_normalized_posteriors_to_unsupported_rows(self):
+        initial = compile_gate_memberships(
+            self.np.arange(1, 4),
+            self.np.asarray([[1, 0], [0, 0], [0, 0]], dtype=self.np.float32),
+        )
+        assignments = self.np.asarray(
+            [(1, 7, 0), (2, 7, 0), (3, 7, 0)],
+            dtype=[("observation_id", "<i8"), ("lineage_id", "<i8"), ("n_children", "<i4")],
+        )
+        result = enforce_track_type_constancy(
+            initial.values,
+            initial.probabilities,
+            assignments,
+        )
+        self.assertEqual(
+            result.values["assignment_status"].tolist(),
+            [CLASSIFICATION_STATUS_CODES["assigned"]] * 3,
+        )
+        self.np.testing.assert_allclose(result.probabilities, [[1, 0], [1, 0], [1, 0]])
+
 
 class InterpretationStoreTests(unittest.TestCase):
     def setUp(self):

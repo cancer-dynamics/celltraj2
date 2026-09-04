@@ -791,6 +791,12 @@ def enforce_track_type_constancy(
         if len(candidate_classes) == 1:
             class_index = next(iter(candidate_classes))
             derived = result["class_index"][active_rows] != class_index
+            unsupported = active_rows[
+                ~np.isclose(np.nansum(matrix[active_rows], axis=1), 1.0, atol=1e-5)
+            ]
+            if unsupported.size:
+                matrix[unsupported] = 0.0
+                matrix[unsupported, class_index - 1] = 1.0
             result["assignment_status"][active_rows] = status_assigned
             result["class_index"][active_rows] = class_index
             class_support = matrix[active_rows, class_index - 1]
@@ -802,6 +808,23 @@ def enforce_track_type_constancy(
             if had_unknown:
                 result["qc_flags"][active_rows] |= QC_TRACK_INCOMPLETE_SUPPORT
         elif len(candidate_classes) > 1:
+            unsupported = active_rows[
+                ~np.isclose(np.nansum(matrix[active_rows], axis=1), 1.0, atol=1e-5)
+            ]
+            if unsupported.size:
+                supported_rows = active_rows[
+                    np.isclose(np.nansum(matrix[active_rows], axis=1), 1.0, atol=1e-5)
+                ]
+                if supported_rows.size:
+                    consensus = np.nansum(matrix[supported_rows], axis=0)
+                    consensus_sum = float(np.nansum(consensus))
+                else:
+                    consensus = np.zeros(matrix.shape[1], dtype=np.float32)
+                    consensus_sum = 0.0
+                if consensus_sum <= 0.0:
+                    consensus[list(index - 1 for index in candidate_classes)] = 1.0
+                    consensus_sum = float(len(candidate_classes))
+                matrix[unsupported] = consensus / consensus_sum
             result["assignment_status"][active_rows] = status_ambiguous
             result["class_index"][active_rows] = 0
             for row in active_rows.tolist():

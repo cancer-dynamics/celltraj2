@@ -109,6 +109,9 @@ class RoiSpec:
     artifact_path: Path | None = None
     source_path: Path | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    project_uuid: str | None = None
+    dataset_uuid: str | None = None
+    roi_uuid: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return _json_safe(self)
@@ -186,6 +189,9 @@ class TrajectoryMetadata:
     acquisition: dict[str, Any] = field(default_factory=dict)
     treatments: list[dict[str, Any]] = field(default_factory=list)
     notes: str | None = None
+    project_uuid: str | None = None
+    dataset_uuid: str | None = None
+    roi_uuid: str | None = None
 
     def frame_map(self) -> list[dict[str, int]]:
         """Return local one-based frame to parent zero-based T mapping."""
