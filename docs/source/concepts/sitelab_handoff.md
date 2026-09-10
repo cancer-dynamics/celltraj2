@@ -1,5 +1,21 @@
 # SITE Handoff
 
+## 2026-09-09 hierarchy reconciliation and interpretation source checks
+
+`enforce_track_type_constancy` accepts a TypeTaxonomy and explicit ordered class
+UUIDs. Compatible support resolves to the deepest supported type; incompatible
+branches remain ambiguous. Raw inputs are not mutated, review uses original
+evidence, and derived fills do not inflate the support summary.
+
+`celltraj2.source_dependencies` captures/checks selected scientific H5 inputs
+independently of the observation spine. Tables, schemas and declared
+registrations use content hashes; large raw/label/mask data use cooperative
+resource revisions. `write_classification_set(expected_source_dependencies=...)`
+checks target inputs before writing, including the deferred-commit path.
+Legacy inputs remain unverified. Full backend discovery passed 129 tests.
+
+See the [cross-repository contract, limitations, and verification](../../../../../docs/SITE_interpretation_foundations_2026-09-09.md).
+
 ## 2026-09-03 propagated posterior invariant
 
 SITE gate classification can propagate hard type constancy across accepted

@@ -452,6 +452,7 @@ class TrajectoryStore:
         schema: Mapping[str, Any],
         source_manifest: Mapping[str, Any],
         expected_observation_spine_digest: str | None = None,
+        expected_source_dependencies: Mapping[str, Any] | None = None,
     ) -> str:
         """Stage and immutably materialize one row-aligned classification.
 
@@ -461,6 +462,10 @@ class TrajectoryStore:
         """
 
         from celltraj2.interpretation import validate_classification_arrays
+        from celltraj2.source_dependencies import require_current_sources
+
+        source_validation = {"scope": "target_h5_captured_inputs", **require_current_sources(self._h5, expected_source_dependencies)}
+        source_manifest = {**source_manifest, "materialization_source_validation": source_validation}
 
         np = __import__("numpy")
         object_name = validate_name(object_set, kind="object set")

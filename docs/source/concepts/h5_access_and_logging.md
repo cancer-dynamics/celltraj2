@@ -44,13 +44,15 @@ contains JSON and NumPy arrays only, is read with `allow_pickle=false`, carries
 a SHA-256 digest, and records the H5 input revisions used by the calculation.
 
 When SITE launched the worker, `defer_commit_plan` also appends a
-`deferred_h5_commit` job to `analysis/workflow_jobs.jsonl`. Running that job
-opens the canonical H5 with `r+` only for the commit, revalidates dependencies,
-and executes only an allow-listed set of celltraj2 store operations. A second
-write timeout leaves the bundle intact and appends another retry job that
-references the same data. A successful or safely skipped commit removes the
-bundle. If scientific dependencies changed, the saved result is rejected as
-stale rather than being written against different inputs.
+`deferred_h5_commit` job to the workstation queue named by
+`CELLTRAJ2_WORKFLOW_QUEUE_PATH`. It copies the SITE instance/workspace
+provenance supplied in the worker environment. Running that job opens the
+canonical H5 with `r+` only for the commit, revalidates dependencies, and
+executes only an allow-listed set of celltraj2 store operations. A second write
+timeout leaves the bundle intact and appends another retry job that references
+the same data. A successful or safely skipped commit removes the bundle. If
+scientific dependencies changed, the saved result is rejected as stale rather
+than being written against different inputs.
 
 Deferred artifacts live below
 `outputs/workflows/deferred_h5_commit/<commit_id>/` in SITE projects. Standalone

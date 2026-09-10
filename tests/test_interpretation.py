@@ -9,6 +9,9 @@ from celltraj2.interpretation import (
     CLASSIFICATION_STATUS_CODES,
     QC_POSTERIOR_SWITCH,
     QC_SUSPICIOUS_BRANCH,
+    QC_TRACK_TYPE_CONFLICT,
+    QC_TRACK_CONSTRAINT_DERIVED,
+    QC_TRACK_INCOMPLETE_SUPPORT,
     BiologyRelease,
     ProjectObservationKey,
     StateNode,
@@ -191,6 +194,53 @@ class InterpretationSchemaTests(unittest.TestCase):
             [CLASSIFICATION_STATUS_CODES["assigned"]] * 3,
         )
         self.np.testing.assert_allclose(result.probabilities, [[1, 0], [1, 0], [1, 0]])
+
+        conflicting = compile_gate_memberships(
+            self.np.arange(1, 4), self.np.asarray([[1, 0], [0, 1], [0, 0]])
+        )
+        result = enforce_track_type_constancy(conflicting.values, conflicting.probabilities, assignments)
+        self.np.testing.assert_allclose(result.probabilities[2], [.5, .5])
+        self.assertTrue(result.values["qc_flags"][2] & QC_TRACK_CONSTRAINT_DERIVED)
+        self.assertTrue(self.np.all(result.values["qc_flags"] & QC_TRACK_INCOMPLETE_SUPPORT))
+        self.np.testing.assert_array_equal(conflicting.probabilities[2], [0, 0])
+
+
+    def test_hierarchy_reconciles_specificity_but_not_siblings(self):
+        np = self.np
+        parent, child, sibling = [str(uuid4()) for _ in range(3)]
+        taxonomy = TypeTaxonomy(str(uuid4()), "Types", (
+            TypeNode(parent, "Parent", "parent", "#000000"),
+            TypeNode(child, "Child", "child", "#111111", parent_type_id=parent),
+            TypeNode(sibling, "Sibling", "sibling", "#222222", parent_type_id=parent),
+        ))
+        # Posterior order intentionally differs from taxonomy order; IDs are sparse.
+        ids = np.asarray([11, 22, 33, 44])
+        assignments = np.asarray([(i, 7, 0) for i in ids], dtype=[
+            ("observation_id", "<i8"), ("lineage_id", "<i8"), ("n_children", "<i4")])
+        links = np.asarray([(11, 22), (22, 33)], dtype=[
+            ("parent_observation_id", "<i8"), ("child_observation_id", "<i8")])
+        for memberships, expected in (
+            ([[0, 1, 0], [1, 0, 0], [0, 0, 0], [0, 0, 1]], [1, 1, 1, 0]),
+            ([[0, 1, 0], [0, 1, 0], [0, 0, 0], [0, 0, 1]], [2, 2, 2, 0]),
+            ([[0, 1, 0], [1, 0, 0], [0, 0, 1], [0, 0, 0]], [0, 0, 0, 0]),
+        ):
+            with self.subTest(expected=expected):
+                raw = compile_gate_memberships(ids, np.asarray(memberships), excluded=[False, False, False, True])
+                before_values, before_probs = raw.values.copy(), raw.probabilities.copy()
+                result = enforce_track_type_constancy(raw.values, raw.probabilities, assignments,
+                    links=links, taxonomy=taxonomy, class_ids=[child, parent, sibling])
+                self.assertEqual(result.values["class_index"].tolist(), expected)
+                self.assertEqual(raw.values.tobytes(), before_values.tobytes())
+                np.testing.assert_array_equal(raw.probabilities, before_probs)
+                np.testing.assert_array_equal(result.probabilities[:2], before_probs[:2])
+                if expected[0] == 1:
+                    self.assertEqual([r["kind"] for r in result.review_records], ["hierarchy_refinement"])
+                    self.assertFalse(np.any(result.values["qc_flags"] & QC_POSTERIOR_SWITCH))
+                    self.assertTrue(result.values["qc_flags"][0] & QC_TRACK_CONSTRAINT_DERIVED)
+                    self.assertAlmostEqual(float(result.values["confidence"][0]), 0.5)
+                if expected[0] == 0:
+                    self.assertTrue(np.all(result.values["qc_flags"][:3] & QC_TRACK_TYPE_CONFLICT))
+                    self.assertIn("posterior_switch", [r["kind"] for r in result.review_records])
 
 
 class InterpretationStoreTests(unittest.TestCase):

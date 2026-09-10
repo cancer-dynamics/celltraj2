@@ -264,6 +264,7 @@ def _execute_operation(trajectory: Trajectory, operation: Mapping[str, Any]) -> 
             values=data["values"], probabilities=data["probabilities"],
             schema=data["schema"], source_manifest=data["source_manifest"],
             expected_observation_spine_digest=data.get("expected_observation_spine_digest"),
+            expected_source_dependencies=data.get("expected_source_dependencies"),
         )
     if name == "write_interpretation_release":
         return store.write_interpretation_release(
@@ -383,6 +384,14 @@ def defer_commit_plan(
             str(sys.executable), "-m", "celltraj2.runners.apply_deferred_commit", str(job_path),
         ],
     }
+    submitted_by = {
+        "instance_id": str(os.environ.get("SITELAB_INSTANCE_ID") or ""),
+        "workspace_id": str(os.environ.get("SITELAB_WORKSPACE_ID") or ""),
+        "instance_label": str(os.environ.get("SITELAB_INSTANCE_LABEL") or ""),
+    }
+    if submitted_by["instance_id"] or submitted_by["workspace_id"]:
+        queue_record["submitted_by"] = submitted_by
+    queue_record["revision"] = 0
     queue_path_value = os.environ.get("CELLTRAJ2_WORKFLOW_QUEUE_PATH")
     queued = False
     if queue_path_value not in (None, ""):

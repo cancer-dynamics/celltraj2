@@ -102,6 +102,9 @@ class DeferredCommitTests(unittest.TestCase):
             environment = {
                 "CELLTRAJ2_DEFERRED_ROOT": str(root / "deferred"),
                 "CELLTRAJ2_WORKFLOW_QUEUE_PATH": str(queue),
+                "SITELAB_INSTANCE_ID": "instance-a",
+                "SITELAB_WORKSPACE_ID": "workspace-a",
+                "SITELAB_INSTANCE_LABEL": "test:1:a",
             }
             with patch.dict(os.environ, environment, clear=False):
                 deferred = defer_commit_plan(self._plan(root / "target.h5"))
@@ -115,6 +118,14 @@ class DeferredCommitTests(unittest.TestCase):
 
             self.assertEqual(outcome.status, "committed")
             self.assertFalse(Path(str(deferred.bundle_path)).exists())
+            self.assertEqual(
+                record["submitted_by"],
+                {
+                    "instance_id": "instance-a",
+                    "workspace_id": "workspace-a",
+                    "instance_label": "test:1:a",
+                },
+            )
 
     def test_timeout_requeues_same_durable_bundle(self):
         with TemporaryDirectory() as tmp:

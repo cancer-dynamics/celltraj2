@@ -731,19 +731,55 @@ def compile_gate_memberships(
     return ClassificationResult(values=normalized, probabilities=probabilities)
 
 
+def type_class_ancestors(
+    taxonomy: TypeTaxonomy, class_ids: Sequence[str]
+) -> dict[int, frozenset[int]]:
+    """Map one-based posterior columns to their registered strict ancestors."""
+
+    registry = list(class_ids)
+    parents = {node.type_id: node.parent_type_id for node in taxonomy.nodes}
+    if len(set(registry)) != len(registry) or set(registry).difference(parents):
+        raise ValueError("Class IDs must be unique members of the type taxonomy")
+    indices = {class_id: index + 1 for index, class_id in enumerate(registry)}
+    ancestors: dict[int, frozenset[int]] = {}
+    for class_id, index in indices.items():
+        found: set[int] = set()
+        parent = parents[class_id]
+        while parent is not None:
+            if parent in indices:
+                found.add(indices[parent])
+            parent = parents[parent]
+        ancestors[index] = frozenset(found)
+    return ancestors
+
+
+def reconcile_type_candidates(
+    candidates: Sequence[int] | set[int], ancestors: Mapping[int, frozenset[int]]
+) -> set[int]:
+    """Keep deepest supported candidates; incompatible branches remain separate."""
+
+    supported = set(candidates)
+    superseded = {ancestor for index in supported for ancestor in ancestors.get(index, ())}
+    return supported.difference(superseded)
+
+
 def enforce_track_type_constancy(
     values: Any,
     probabilities: Any,
     assignments: Any,
     *,
     links: Any | None = None,
+    taxonomy: TypeTaxonomy | None = None,
+    class_ids: Sequence[str] | None = None,
 ) -> ClassificationResult:
     """Compile one hard type per accepted rooted lineage while retaining posteriors.
 
     The input probabilities remain observation-level evidence.  The returned
     hard calls are constant over every connected accepted lineage.  Conflicting
     support produces an ambiguous lineage and review records instead of a type
-    transition.
+    transition. With a taxonomy, compatible ancestor/descendant support resolves
+    to the deepest supported type. Omitting the taxonomy preserves flat behavior.
+    Supported posterior rows are unchanged; filled rows are constraint-derived.
     """
 
     np = _require_numpy()
@@ -761,6 +797,16 @@ def enforce_track_type_constancy(
         expected_observation_ids=track_rows["observation_id"],
     )
     result = normalized.copy()
+    raw_matrix = matrix.copy()
+    matrix = matrix.copy()
+    registry = list(class_ids) if class_ids is not None else (
+        [node.type_id for node in taxonomy.nodes] if taxonomy is not None else []
+    )
+    if taxonomy is not None and len(registry) != matrix.shape[1]:
+        raise ValueError("Class IDs must match posterior columns")
+    if taxonomy is None and class_ids is not None:
+        raise ValueError("Class IDs require a type taxonomy")
+    ancestors = type_class_ancestors(taxonomy, registry) if taxonomy is not None else {}
     status_assigned = CLASSIFICATION_STATUS_CODES["assigned"]
     status_not_evaluated = CLASSIFICATION_STATUS_CODES["not_evaluated"]
     status_unknown = CLASSIFICATION_STATUS_CODES["unknown"]
@@ -779,6 +825,7 @@ def enforce_track_type_constancy(
         ambiguous_rows = active_rows[result["assignment_status"][active_rows] == status_ambiguous]
         for row in ambiguous_rows.tolist():
             candidate_classes.update(int(item) + 1 for item in np.flatnonzero(matrix[row] > 0.0))
+        candidate_classes = reconcile_type_candidates(candidate_classes, ancestors)
         had_unknown = bool(
             np.any(
                 np.isin(
@@ -799,7 +846,9 @@ def enforce_track_type_constancy(
                 matrix[unsupported, class_index - 1] = 1.0
             result["assignment_status"][active_rows] = status_assigned
             result["class_index"][active_rows] = class_index
-            class_support = matrix[active_rows, class_index - 1]
+            # Derived fills must not inflate the evidence-based support summary.
+            supported = active_rows[np.isclose(np.nansum(raw_matrix[active_rows], axis=1), 1.0)]
+            class_support = raw_matrix[supported, class_index - 1]
             finite_support = class_support[np.isfinite(class_support)]
             result["confidence"][active_rows] = (
                 np.float32(np.mean(finite_support)) if finite_support.size else np.nan
@@ -825,6 +874,7 @@ def enforce_track_type_constancy(
                     consensus[list(index - 1 for index in candidate_classes)] = 1.0
                     consensus_sum = float(len(candidate_classes))
                 matrix[unsupported] = consensus / consensus_sum
+                result["qc_flags"][unsupported] |= QC_TRACK_CONSTRAINT_DERIVED
             result["assignment_status"][active_rows] = status_ambiguous
             result["class_index"][active_rows] = 0
             for row in active_rows.tolist():
@@ -833,13 +883,17 @@ def enforce_track_type_constancy(
                     np.float32(np.max(finite_row)) if finite_row.size else np.nan
                 )
             result["qc_flags"][active_rows] |= QC_TRACK_TYPE_CONFLICT
+            if had_unknown:
+                result["qc_flags"][active_rows] |= QC_TRACK_INCOMPLETE_SUPPORT
         else:
             result["assignment_status"][active_rows] = status_unknown
             result["class_index"][active_rows] = 0
             result["confidence"][active_rows] = np.nan
         if suspicious_branch:
             result["qc_flags"][rows] |= QC_SUSPICIOUS_BRANCH
-    review_records = tuple(track_type_review_records(matrix, track_rows, links=links))
+    review_records = tuple(track_type_review_records(
+        raw_matrix, track_rows, links=links, class_ancestors=ancestors
+    ))
     switch_ids: set[int] = set()
     for record in review_records:
         if record.get("kind") == "posterior_switch":
@@ -866,6 +920,7 @@ def track_type_review_records(
     assignments: Any,
     *,
     links: Any | None = None,
+    class_ancestors: Mapping[int, frozenset[int]] | None = None,
 ) -> list[dict[str, Any]]:
     """Return posterior-discordance and suspicious-branch review records."""
 
@@ -873,6 +928,8 @@ def track_type_review_records(
     matrix = np.asarray(probabilities, dtype=np.float32)
     track_rows = np.asarray(assignments)
     records: list[dict[str, Any]] = []
+    row_by_id = {int(row["observation_id"]): index for index, row in enumerate(track_rows)}
+    ancestors = class_ancestors or {}
     if links is not None:
         link_rows = np.asarray(links)
         required = {"parent_observation_id", "child_observation_id"}
@@ -882,8 +939,12 @@ def track_type_review_records(
         for link in link_rows:
             parent_id = int(link["parent_observation_id"])
             child_id = int(link["child_observation_id"])
-            parent = matrix[parent_id - 1]
-            child = matrix[child_id - 1]
+            if parent_id not in row_by_id or child_id not in row_by_id:
+                raise ValueError("Track link references an observation outside the assignments")
+            parent = matrix[row_by_id[parent_id]]
+            child = matrix[row_by_id[child_id]]
+            if not np.all(np.isfinite(parent)) or not np.all(np.isfinite(child)):
+                continue
             parent_sum = float(np.sum(parent))
             child_sum = float(np.sum(child))
             if parent_sum <= 0.0 or child_sum <= 0.0:
@@ -897,7 +958,12 @@ def track_type_review_records(
                 records.append(
                     {
                         "schema": "celltraj2.type_track_review.v1",
-                        "kind": "posterior_switch",
+                        "kind": (
+                            "hierarchy_refinement"
+                            if parent_argmax in ancestors.get(child_argmax, ())
+                            or child_argmax in ancestors.get(parent_argmax, ())
+                            else "posterior_switch"
+                        ),
                         "parent_observation_id": parent_id,
                         "child_observation_id": child_id,
                         "parent_class_index": parent_argmax,
