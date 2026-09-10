@@ -23,8 +23,12 @@ def _remove_readonly(function, path: str, _exc: BaseException) -> None:
 
 
 def _rmtree(path: Path) -> None:
-    shutil.rmtree(path, onexc=_remove_readonly)
-
+    #shutil.rmtree(path, onexc=_remove_readonly)
+    # Try Python 3.12+ syntax first, fall back to older versions
+    try:
+        shutil.rmtree(path, onexc=_remove_readonly)
+    except TypeError:
+        shutil.rmtree(path, onerror=_remove_readonly)
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
