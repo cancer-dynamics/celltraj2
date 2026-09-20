@@ -99,6 +99,97 @@ class SourceDependencyTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "digest"):
             check_source_dependencies(self.store.h5, damaged)
 
+    def test_stale_diagnostic_names_file_and_distinguishes_historical_versions(self):
+        from celltraj2.source_dependencies import require_current_sources
+        before = self.capture()
+        # QC alone changes a whole feature-group fingerprint; values remain intact.
+        self.store.write_json("/object_sets/cells/features/markers/qc.json", {"review": "updated"})
+        after = self.capture()
+        for dependencies, mixed in ((before, False), (merge_source_dependencies(before, after), True)):
+            with self.subTest(mixed=mixed):
+                with self.assertRaises(ValueError) as caught:
+                    require_current_sources(self.store.h5, dependencies)
+                message = str(caught.exception)
+                self.assertIn(str(self.path), message)
+                self.assertIn("/object_sets/cells/features/markers", message)
+                self.assertIn("content fingerprint differs: expected", message)
+                self.assertIn("not evidence of H5 corruption", message)
+                self.assertEqual("2 historical versions" in message, mixed)
+
+    def test_feature_drift_policy_preserves_history_and_blocks_other_changes(self):
+        from celltraj2.source_dependencies import require_current_sources
+        before = self.capture()
+        self.store.write_json("/object_sets/cells/features/markers/qc.json", {"updated": True})
+        mixed = merge_source_dependencies(before, self.capture())
+        for dependencies in (before, mixed):
+            report = require_current_sources(self.store.h5, dependencies, object_set="cells", policy="allow_feature_drift")
+            self.assertEqual(report["status"], "stale")
+            self.assertEqual(report["feature_drift_paths"], ["/object_sets/cells/features/markers"])
+            self.assertTrue(report["changes"])
+        del self.store.h5["object_sets/cells/features/markers"]
+        self.assertEqual(require_current_sources(self.store.h5, mixed, object_set="cells", policy="allow_feature_drift")["status"], "stale")
+        for path in ("/object_sets/cells/observations", "/object_sets/cells/tracks/accepted/assignments", "/registrations/motion/transforms"):
+            with self.subTest(path=path):
+                dependencies = self.capture()
+                values = self.store.h5[path][()]
+                if values.dtype.names:
+                    values["centroid_x"] += 1
+                else:
+                    values[...] += 1
+                self.store.h5[path][...] = values
+                with self.assertRaisesRegex(ValueError, "Stale interpretation source") as caught:
+                    require_current_sources(self.store.h5, dependencies, object_set="cells", policy="allow_feature_drift")
+                self.assertIn(str(self.path), str(caught.exception))
+        dependencies = self.capture()
+        self.store.write_label_frame("cells", 1, self.np.asarray([[2, 1]]), overwrite=True)
+        with self.assertRaisesRegex(ValueError, "/labels/cells"):
+            require_current_sources(self.store.h5, dependencies, object_set="cells", policy="allow_feature_drift")
+        damaged = deepcopy(before)
+        damaged["resources"] = []
+        with self.assertRaisesRegex(ValueError, "metadata digest"):
+            require_current_sources(self.store.h5, damaged, object_set="cells", policy="allow_feature_drift")
+
+    def test_deferred_historical_write_records_feature_drift_and_requires_spine(self):
+        from celltraj2.deferred_commit import PLAN_SCHEMA, execute_commit_plan, read_bundle, write_bundle
+        dependencies = self.capture()
+        raw = compile_gate_memberships(self.np.asarray([1, 2]), self.np.ones((2, 1)))
+        artifact_id = str(uuid4())
+        args = {"object_set": "cells", "classification_set": artifact_id,
+            "values": raw.values, "probabilities": raw.probabilities,
+            "schema": {"class_ids": [str(uuid4())]},
+            "source_manifest": {"artifact_id": artifact_id, "content_digest": "a" * 64},
+            "expected_source_dependencies": dependencies,
+            "source_dependency_policy": "allow_feature_drift", "return_source_validation": True}
+        with self.assertRaisesRegex(ValueError, "requires an observation-spine digest"):
+            self.store.write_classification_set(**args)
+        args["expected_observation_spine_digest"] = observation_spine_digest(
+            self.observations, object_set="cells", observation_schema=self.store.read_observations_schema("cells"))
+        plan = {"schema": PLAN_SCHEMA, "h5_path": str(self.path), "job_id": "historical-write",
+            "operation": "materialize_interpretation", "dependencies": {},
+            "operations": [{"op": "write_classification_set", "result_key": "classification", "args": args}]}
+        bundle, digest = write_bundle(Path(self.tmp.name) / "historical.npz", plan)
+        self.store.write_json("/object_sets/cells/features/markers/schema.json", {"units": "changed"}, overwrite=True)
+        self.store.close()
+        outcome = execute_commit_plan(read_bundle(bundle, expected_sha256=digest))
+        validation = outcome.operation_results["classification"]["source_validation"]
+        self.assertEqual(validation["status"], "stale")
+        self.assertEqual(validation["policy"], "allow_feature_drift")
+        with TrajectoryStore.open(self.path, "r") as store:
+            saved = store.read_classification_set("cells", artifact_id)
+            self.assertEqual(saved["source_manifest"]["materialization_source_validation"], validation)
+            self.np.testing.assert_array_equal(saved["values"], raw.values)
+            self.np.testing.assert_allclose(saved["probabilities"], raw.probabilities)
+        repeated = execute_commit_plan(read_bundle(bundle, expected_sha256=digest))
+        self.assertEqual(repeated.operation_results["classification"], outcome.operation_results["classification"])
+        # Even without a dependency manifest, identity/spine validation is mandatory.
+        with TrajectoryStore.open(self.path, "r+") as store:
+            values = store.read_observations("cells")
+            values["label_id"][0] = 99
+            store.h5["object_sets/cells/observations"][...] = values
+        args["expected_source_dependencies"] = None
+        with self.assertRaisesRegex(ValueError, "observation-spine.*H5"):
+            execute_commit_plan(plan)
+
     def test_commit_plan_revalidates_sources_before_writing(self):
         from celltraj2.deferred_commit import PLAN_SCHEMA, execute_commit_plan, read_bundle, write_bundle
         dependencies = self.capture()

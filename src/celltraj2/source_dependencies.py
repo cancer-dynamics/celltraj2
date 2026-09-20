@@ -186,10 +186,42 @@ def check_source_dependencies(h5: Any, manifest: Mapping[str, Any] | None) -> di
     return {"status": status, "changes": changes}
 
 
-def require_current_sources(h5: Any, manifest: Mapping[str, Any] | None) -> dict[str, Any]:
-    """Reject changed captured inputs; legacy artifacts remain explicitly unverified."""
+def require_current_sources(h5: Any, manifest: Mapping[str, Any] | None, *,
+                            object_set: str | None = None, policy: str = "require_current") -> dict[str, Any]:
+    """Validate captured inputs, optionally retaining historical feature results.
+
+    Feature drift never changes the saved fingerprint or its stale status.
+    Non-feature changes remain blocking; legacy gaps remain unverified.
+    The caller must separately validate the observation spine before writing.
+    """
+    if policy not in {"require_current", "allow_feature_drift"}:
+        raise ValueError(f"Unknown source dependency policy: {policy}")
+    if policy == "allow_feature_drift" and not object_set:
+        raise ValueError("Feature drift policy requires an object set")
     report = check_source_dependencies(h5, manifest)
-    if report["status"] == "stale":
-        paths = ", ".join(sorted({change["path"] for change in report["changes"]}))
-        raise ValueError(f"Stale interpretation source dependencies: {paths}")
+    prefix = f"/object_sets/{validate_name(object_set, kind='object set')}/features/" if object_set else ""
+    feature_changes = [c for c in report["changes"] if prefix and str(c["path"]).startswith(prefix)]
+    blocking = [c for c in report["changes"] if policy == "require_current" or c not in feature_changes]
+    report.update(policy=policy, h5_path=str(getattr(h5, "filename", None) or "<unknown H5>"),
+                  feature_drift_paths=sorted({c["path"] for c in feature_changes}))
+    if blocking:
+        details = []
+        for change in blocking:
+            expected, actual = change["expected"], change["actual"]
+            if expected["exists"] != actual["exists"]:
+                reason = "resource missing" if not actual["exists"] else "resource now exists"
+            elif expected.get("mode") == "revision":
+                reason = f"revision changed: expected {expected.get('revision')}, actual {actual.get('revision')}"
+            else:
+                reason = f"content fingerprint differs: expected {expected.get('content_digest')}, actual {actual.get('content_digest')}"
+            versions = {canonical_json_digest(r) for r in (manifest or {}).get("resources", []) if r["path"] == change["path"]}
+            if len(versions) > 1:
+                reason += f"; artifact retains {len(versions)} historical versions of this resource"
+            details.append(f"{change['path']} -- {reason}")
+        filename = str(getattr(h5, "filename", None) or "<unknown H5>")
+        raise ValueError(
+            f"Stale interpretation source dependencies in H5 {filename}:\n"
+            + "\n".join(details)
+            + "\nA freshness mismatch is not evidence of H5 corruption. Group fingerprints include tables, schemas, QC metadata, and attributes."
+        )
     return report

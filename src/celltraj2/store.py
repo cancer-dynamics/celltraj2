@@ -453,7 +453,9 @@ class TrajectoryStore:
         source_manifest: Mapping[str, Any],
         expected_observation_spine_digest: str | None = None,
         expected_source_dependencies: Mapping[str, Any] | None = None,
-    ) -> str:
+        source_dependency_policy: str = "require_current",
+        return_source_validation: bool = False,
+    ) -> str | dict[str, Any]:
         """Stage and immutably materialize one row-aligned classification.
 
         Long-running computation and project queries must happen before this
@@ -464,7 +466,10 @@ class TrajectoryStore:
         from celltraj2.interpretation import validate_classification_arrays
         from celltraj2.source_dependencies import require_current_sources
 
-        source_validation = {"scope": "target_h5_captured_inputs", **require_current_sources(self._h5, expected_source_dependencies)}
+        if source_dependency_policy == "allow_feature_drift" and not expected_observation_spine_digest:
+            raise ValueError(f"Historical-feature materialization requires an observation-spine digest: {self._h5.filename}")
+        source_validation = {"scope": "target_h5_captured_inputs", **require_current_sources(
+            self._h5, expected_source_dependencies, object_set=object_set, policy=source_dependency_policy)}
         source_manifest = {**source_manifest, "materialization_source_validation": source_validation}
 
         np = __import__("numpy")
@@ -492,7 +497,7 @@ class TrajectoryStore:
             )
             if actual_spine_digest != str(expected_observation_spine_digest):
                 raise ValueError(
-                    "Target observation-spine digest does not match the project classification fragment"
+                    f"Target observation-spine digest does not match the project classification fragment in H5 {self._h5.filename}"
                 )
         class_ids = list(schema.get("class_ids") or source_manifest.get("class_ids") or [])
         if not class_ids:
@@ -515,7 +520,7 @@ class TrajectoryStore:
             existing = self._h5[target_path]
             existing_digest = str(existing.attrs.get("content_digest", ""))
             if existing_digest == digest:
-                return f"/{target_path}"
+                return {"path": f"/{target_path}", "source_validation": source_validation} if return_source_validation else f"/{target_path}"
             raise ValueError(
                 f"Classification UUID {artifact_id} already exists with another content digest"
             )
@@ -569,7 +574,7 @@ class TrajectoryStore:
                 del self._h5[staging_path]
             raise
         self._mark_mutation(target_path)
-        return f"/{target_path}"
+        return {"path": f"/{target_path}", "source_validation": source_validation} if return_source_validation else f"/{target_path}"
 
     def read_classification_set(self, object_set: str, classification_set: str) -> dict[str, Any]:
         """Read one materialized classification and its manifests."""

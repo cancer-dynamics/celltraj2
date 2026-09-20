@@ -265,6 +265,8 @@ def _execute_operation(trajectory: Trajectory, operation: Mapping[str, Any]) -> 
             schema=data["schema"], source_manifest=data["source_manifest"],
             expected_observation_spine_digest=data.get("expected_observation_spine_digest"),
             expected_source_dependencies=data.get("expected_source_dependencies"),
+            source_dependency_policy=str(data.get("source_dependency_policy", "require_current")),
+            return_source_validation=bool(data.get("return_source_validation", False)),
         )
     if name == "write_interpretation_release":
         return store.write_interpretation_release(

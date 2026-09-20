@@ -435,7 +435,7 @@ def extract_feature_set(
     frame_counts: dict[int, int] = {}
     frame_warnings: dict[int, list[str]] = {}
     frame_feature_summaries: dict[int, list[dict[str, Any]]] = {}
-    boundary_feature_cache: dict[str, Any] = {}
+    boundary_feature_cache: dict[str, Any] = {"progress": progress}
     run_name = validate_name(run_id or default_feature_extraction_run_id(), kind="feature-extraction run")
 
     if save_outputs:
@@ -633,7 +633,13 @@ def _compute_feature_frame(
             np=np,
         )
     if kind == "intensity":
-        return _compute_intensity(trajectory, labels, frame=frame, source_label_set=source_label_set, feature=feature, np=np)
+        return _compute_intensity(trajectory, labels, frame=frame, source_label_set=source_label_set, feature=feature, np=np, cache=boundary_cache)
+    if kind == "texture":
+        from celltraj2.image_features import compute_texture_frame
+        return compute_texture_frame(trajectory, labels, frame=frame, source_label_set=source_label_set, feature=feature)
+    if kind == "centroid_motility":
+        from celltraj2.centroid_features import compute_centroid_frame
+        return compute_centroid_frame(trajectory, labels, frame=frame, object_set=object_set, feature=feature, cache=boundary_cache)
     if kind in {"compartment_ratio", "ratio"}:
         return _compute_compartment_ratio(
             trajectory,
@@ -751,12 +757,8 @@ def _compute_mask_components(
     mask_set = str(feature.get("mask_set") or "").strip()
     if not mask_set:
         raise ValueError("mask_components feature requires mask_set")
-    metrics = [str(item).strip().lower() for item in feature.get("metrics", DEFAULT_MASK_COMPONENT_METRICS)]
-    unsupported = [metric for metric in metrics if metric not in MASK_COMPONENT_METRICS]
-    if unsupported:
-        raise ValueError(f"Unsupported mask-component metrics: {', '.join(unsupported)}")
-    if not metrics:
-        raise ValueError("mask_components feature requires at least one metric")
+    from celltraj2.feature_catalog import component_metrics
+    metrics = component_metrics(feature, DEFAULT_MASK_COMPONENT_METRICS)
 
     label_image = np.asarray(labels)
     mask = _read_compartment_source_mask(
@@ -787,6 +789,8 @@ def _compute_mask_components(
             "dtype": "float64",
             "family": "mask_components",
             "metric": metric,
+            "component_statistic": metric.rsplit("_", 1)[-1] if metric.startswith("component_") and metric not in {"component_count", "component_density"} else None,
+            "largest_definition": "component with greatest physical area/volume; lowest component label breaks ties",
             "mask_set": mask_set,
             "connectivity": connectivity,
             "unit": _mask_component_metric_unit(metric, measure_unit=measure_unit, length_unit=length_unit),
@@ -927,6 +931,30 @@ def _mask_component_values(
     if "component_solidity_mean" in metrics:
         solidities = _component_property_values(components, "solidity", np=np)
         values["component_solidity_mean"] = _nan_stat(solidities, "mean", np=np)
+    from celltraj2.feature_catalog import COMPONENT_FIELDS
+    for quantity in COMPONENT_FIELDS:
+        requested = [metric for metric in metrics if metric.startswith(f"component_{quantity}_")]
+        if not requested:
+            continue
+        if quantity == "area":
+            data = areas
+        elif quantity in {"roundness", "elongation"}:
+            major = _component_property_values(components, "axis_major_length", np=np)
+            minor = _component_property_values(components, "axis_minor_length", np=np)
+            numerator, denominator = (minor, major) if quantity == "roundness" else (major, minor)
+            data = np.divide(numerator, denominator, out=np.full(major.shape, np.nan), where=denominator > 0)
+        else:
+            prop = "equivalent_diameter_area" if quantity == "equivalent_diameter" else quantity
+            data = _component_property_values(components, prop, np=np)
+        for metric in requested:
+            statistic = metric[len(f"component_{quantity}_"):]
+            if statistic == "largest":
+                values[metric] = float(data[int(np.argmax(areas))]) if count else float(np.nan)
+            elif statistic == "cv":
+                mean = _nan_stat(data, "mean", np=np)
+                values[metric] = _nan_stat(data, "std", np=np) / mean if mean > 0 else float(np.nan)
+            else:
+                values[metric] = _nan_stat(data, statistic, np=np)
     return values
 
 
@@ -974,6 +1002,12 @@ def _regionprops_property_unit(prop: str, ndim: int, calibration: Mapping[str, A
 
 
 def _mask_component_metric_unit(metric: str, *, measure_unit: str, length_unit: str) -> str:
+    if metric.endswith("_cv"):
+        return "dimensionless"
+    if metric.startswith("component_area_"):
+        return measure_unit
+    if metric.startswith(("component_equivalent_diameter_", "component_axis_major_length_", "component_axis_minor_length_")):
+        return length_unit
     if metric in {
         "mask_area",
         "component_area_mean",
@@ -1002,6 +1036,7 @@ def _compute_intensity(
     source_label_set: str,
     feature: Mapping[str, Any],
     np: Any,
+    cache: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     selector = feature.get("channel", feature.get("channel_selector", feature.get("signal_channel", 0)))
     channel = _resolve_channel(trajectory, selector)
@@ -1021,6 +1056,10 @@ def _compute_intensity(
         frame=frame,
         background=feature.get("background"),
         np=np,
+    )
+    from celltraj2.image_features import normalize_intensity
+    image, normalization_schema, normalization_warnings = normalize_intensity(
+        trajectory, image, frame=frame, channel=channel, feature=feature, cache={} if cache is None else cache,
     )
     stats = expand_intensity_statistics(feature.get("stats", ["mean"]))
     per_label = _per_label_stats(compartment["labels"], image, stats, np=np)
@@ -1045,9 +1084,11 @@ def _compute_intensity(
         }
         if background_schema is not None:
             columns[column]["background"] = background_schema
+        if normalization_schema is not None:
+            columns[column]["normalization"] = normalization_schema
         for label_id, values in per_label.items():
             values_by_label.setdefault(label_id, {})[column] = values.get(stat, np.nan)
-    return {"values_by_label": values_by_label, "columns": columns, "warnings": [*compartment["warnings"], *background_warnings]}
+    return {"values_by_label": values_by_label, "columns": columns, "warnings": [*compartment["warnings"], *background_warnings, *normalization_warnings]}
 
 
 def _compute_compartment_ratio(

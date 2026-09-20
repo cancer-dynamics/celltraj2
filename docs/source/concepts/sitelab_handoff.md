@@ -1,5 +1,20 @@
 # SITE Handoff
 
+## 2026-09-15 Classical features and summary controls
+
+See [Classical Single-Object Features](classical_features.md) for formulas,
+defaults, units, limitations, and executable specifications. New feature kinds
+are `centroid_motility` (stored tracks, ROI-clipped weighted Voronoi neighbors)
+and `texture` (masked GLCM on the largest-compartment XY slice). Intensity has
+optional post-background per-frame/pooled normalization with saved transforms.
+Mask components and surface motion accept independent `fields` and `statistics`
+alongside backward-compatible `metrics`. Surface motion adds local differential
+flow invariants; 2D radial shape multipoles now use uniform-angle sampling about
+the object centroid. No tracking or boundary-library products are modified.
+The observation/table contract is unchanged. New modules are `feature_catalog`,
+`centroid_features`, `image_features`, and `surface_flow_features`; tests are in
+`test_classical_features.py`.
+
 ## 2026-09-09 hierarchy reconciliation and interpretation source checks
 
 `enforce_track_type_constancy` accepts a TypeTaxonomy and explicit ordered class

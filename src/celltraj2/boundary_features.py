@@ -368,10 +368,8 @@ def _motion_summary(context: Mapping[str, Any], *, feature: Mapping[str, Any], n
     direction = str(feature.get("direction") or "incoming").lower()
     if direction not in {"incoming", "outgoing", "both"}:
         raise ValueError("Boundary motion direction must be incoming, outgoing, or both")
-    metrics = _string_list(
-        feature.get(
-            "metrics",
-            (
+    from celltraj2.feature_catalog import MOTION_FIELDS, SUMMARY_STATISTICS, motion_metrics
+    metrics = motion_metrics(feature, (
                 "displacement_z_mean",
                 "displacement_y_mean",
                 "displacement_x_mean",
@@ -379,22 +377,11 @@ def _motion_summary(context: Mapping[str, Any], *, feature: Mapping[str, Any], n
                 "normal_mean",
                 "mapped_fraction",
                 "ot_cost_mean",
-            ),
-        )
-    )
-    allowed = {
-        "displacement_z_mean", "displacement_y_mean", "displacement_x_mean",
-        "displacement_z_std", "displacement_y_std", "displacement_x_std",
-        "magnitude_mean", "magnitude_std", "magnitude_min", "magnitude_max",
-        "normal_mean", "normal_std", "normal_min", "normal_max",
-        "tangential_magnitude_mean", "mapped_fraction", "ot_cost_mean",
-        "transported_mass_sum", "motion_link_count",
-    }
-    unsupported = sorted(set(metrics) - allowed)
-    if unsupported:
-        raise ValueError(f"Unsupported boundary motion metric(s): {unsupported}")
+    ))
     geometry_set = feature.get("geometry_set")
-    if any(metric.startswith("normal_") or metric.startswith("tangential_") for metric in metrics):
+    derivative_prefixes = ("normal_gradient_squared_", "surface_divergence_", "tangential_vorticity_", "tangential_strain_rate_")
+    need_derivatives = any(metric.startswith(derivative_prefixes) or metric == "derivative_valid_fraction" for metric in metrics)
+    if need_derivatives or any(metric.startswith("normal_") or metric.startswith("tangential_") for metric in metrics):
         geometry_set = validate_name(str(geometry_set or ""), kind="boundary geometry set")
     geometry_schema = None
     if geometry_set not in (None, ""):
@@ -410,6 +397,18 @@ def _motion_summary(context: Mapping[str, Any], *, feature: Mapping[str, Any], n
     if not math.isfinite(mapped_mass_threshold) or mapped_mass_threshold < 0 or mapped_mass_threshold > 1:
         raise ValueError("mapped_mass_threshold must be in [0, 1]")
     motion = _motion_product(context, motion_set=motion_set)
+    from celltraj2.centroid_features import time_calibration
+    interval, time_unit = time_calibration(context["trajectory"].metadata)
+    length_unit = str(context["view"].schema.get("distance_unit", "physical_length"))
+    velocity_enabled = bool(feature.get("as_velocity", False))
+    def motion_unit(metric: str) -> str:
+        if metric.startswith("normal_gradient_squared_"):
+            return f"1/{time_unit}^2" if velocity_enabled else "dimensionless"
+        if metric.startswith(("surface_divergence_", "tangential_vorticity_", "tangential_strain_rate_")):
+            return f"1/{time_unit}" if velocity_enabled else "dimensionless"
+        if metric.startswith(("displacement_", "magnitude_", "normal_", "tangential_magnitude_")):
+            return f"{length_unit}/{time_unit}" if velocity_enabled else length_unit
+        return "stored_transport_unit" if metric.startswith(("ot_cost_", "transported_mass_")) else "dimensionless"
     columns: OrderedDict[str, dict[str, Any]] = OrderedDict()
     for metric in metrics:
         column = _slug(f"{prefix}_{metric}")
@@ -418,6 +417,11 @@ def _motion_summary(context: Mapping[str, Any], *, feature: Mapping[str, Any], n
             "direction": direction,
             "mapped_mass_threshold": mapped_mass_threshold,
             "schema": motion["schema"],
+            "as_velocity": bool(feature.get("as_velocity", False)),
+            "derivative_method": "weighted_local_tangent_linear_fit",
+            "derivative_neighbors": int(feature.get("derivative_neighbors", 16)),
+            "derivative_radius": feature.get("derivative_radius"),
+            "mean_motion_subtracted": False,
         }
         if geometry_set:
             product_dependency["geometry_set"] = str(geometry_set)
@@ -426,6 +430,9 @@ def _motion_summary(context: Mapping[str, Any], *, feature: Mapping[str, Any], n
             "name": column,
             "dtype": "float64",
             "family": "boundary_motion",
+            "unit": motion_unit(metric),
+            "time_interval": interval,
+            "time_unit": time_unit,
             "statistic": metric,
             "boundary_dependency": dict(context["dependency"]),
             "motion_dependency": product_dependency,
@@ -439,12 +446,18 @@ def _motion_summary(context: Mapping[str, Any], *, feature: Mapping[str, Any], n
             entity=entity,
             direction=direction,
             geometry_set=None if geometry_set in (None, "") else str(geometry_set),
+            as_velocity=bool(feature.get("as_velocity", False)),
             np=np,
         )
         vectors = data["vectors"]
+        if feature.get("fields"):
+            vectors[data["point_coverage"] < mapped_mass_threshold] = np.nan
         magnitude = np.linalg.norm(vectors, axis=1)
         normal = data.get("normal_displacement")
         tangential = data.get("tangential_magnitude")
+        if feature.get("fields"):
+            normal = np.where(np.all(np.isfinite(vectors), axis=1), normal, np.nan)
+            tangential = np.where(np.all(np.isfinite(vectors), axis=1), tangential, np.nan)
         metric_values = {
             "displacement_z_mean": _statistic(vectors[:, 0], "mean", np=np),
             "displacement_y_mean": _statistic(vectors[:, 1], "mean", np=np),
@@ -475,6 +488,19 @@ def _motion_summary(context: Mapping[str, Any], *, feature: Mapping[str, Any], n
             "transported_mass_sum": float(np.nansum(data["transported_mass"])),
             "motion_link_count": float(data["link_count"]),
         }
+        fields = {f"displacement_{axis}": vectors[:, j] for j, axis in enumerate("zyx")}
+        fields.update(magnitude=magnitude, normal=normal, tangential_magnitude=tangential)
+        if need_derivatives:
+            from celltraj2.surface_flow_features import surface_flow_fields
+            fields.update(surface_flow_fields(data["positions"], vectors, data["normals"],
+                          spatial_ndim=int(context["view"].schema.get("spatial_ndim", 3)),
+                          neighbors=int(feature.get("derivative_neighbors", 16)), radius=feature.get("derivative_radius")))
+            metric_values["derivative_valid_fraction"] = float(np.mean(np.isfinite(fields["surface_divergence"]))) if len(vectors) else np.nan
+        for field in MOTION_FIELDS:
+            for statistic in SUMMARY_STATISTICS:
+                metric = f"{field}_{statistic}"
+                if metric in metrics:
+                    metric_values[metric] = _statistic(fields.get(field), statistic, np=np)
         label_id = int(entity["source_label_id"])
         values_by_label[label_id] = {
             _slug(f"{prefix}_{metric}"): metric_values[metric] for metric in metrics
@@ -632,12 +658,20 @@ def _multipole_summary(context: Mapping[str, Any], *, feature: Mapping[str, Any]
         else:
             radius = np.linalg.norm(points - np.mean(points, axis=0, keepdims=True), axis=1)
             charge = radius - np.nanmean(radius) if signal == "shape_radial_deviation" else radius
-        moments = boundary_multipole_magnitudes(
-            points,
-            charge,
-            order=order,
-            spatial_ndim=spatial_ndim,
-        )
+        if spatial_ndim == 2 and signal in {"shape_radius", "shape_radial_deviation"}:
+            from celltraj2.registration import registration_calibration
+            from celltraj2.surface_flow_features import radial_shape_magnitudes_2d
+            key = ("shape_observations", context["object_set"])
+            if key not in context["cache"]:
+                context["cache"][key] = context["trajectory"].store.read_observations(context["object_set"])
+            observations = context["cache"][key]
+            selected = observations[(observations["frame"] == context["frame"]) & (observations["label_id"] == int(entity["source_label_id"]))]
+            scale = np.asarray(context["view"].schema.get("coordinate_scale_zyx", registration_calibration(context["trajectory"].metadata)["coordinate_scale"]))
+            center = np.array([selected[0][f"centroid_{axis}"] for axis in "zyx"]) * scale if len(selected) else None
+            moments = radial_shape_magnitudes_2d(points, center_zyx=center, order=order, deviation=signal == "shape_radial_deviation")
+            signal_dependency.update(angular_sampling="uniform_512", center="object_area_centroid", radial_policy="outermost_on_duplicate_ray")
+        else:
+            moments = boundary_multipole_magnitudes(points, charge, order=order, spatial_ndim=spatial_ndim)
         label_id = int(entity["source_label_id"])
         values_by_label[label_id] = {
             _slug(f"{prefix}_l{ell}"): float(moments[ell]) for ell in range(order + 1)
@@ -711,6 +745,7 @@ def _motion_point_data(
     direction: str,
     geometry_set: str | None,
     np: Any,
+    as_velocity: bool = False,
 ) -> dict[str, Any]:
     product = _motion_product(context, motion_set=motion_set)
     direction_value = str(direction).lower()
@@ -738,6 +773,13 @@ def _motion_point_data(
     ot_cost: list[float] = []
     transported_mass: list[float] = []
     for link, selected_direction in selected:
+        duration = 1.0
+        if as_velocity:
+            from celltraj2.centroid_features import time_calibration
+            interval, _ = time_calibration(context["trajectory"].metadata)
+            duration = (int(link["target_frame"]) - int(link["source_frame"])) * interval
+            if duration <= 0:
+                raise ValueError("Surface motion links must advance in time.")
         summary_name = "target_summary" if selected_direction == "incoming" else "source_summary"
         summary_start_name = "target_summary_start" if selected_direction == "incoming" else "source_summary_start"
         summary_count_name = "target_summary_count" if selected_direction == "incoming" else "source_summary_count"
@@ -754,7 +796,7 @@ def _motion_point_data(
             mass = np.asarray(summary_group["matched_mass"][start:stop], dtype=float)
             displacement = np.asarray(
                 summary_group["barycentric_displacement_zyx"][start:stop], dtype=float
-            )
+            ) / duration
             coverage = np.asarray(summary_group["matched_fraction"][start:stop], dtype=float)
             local = np.searchsorted(point_ids, edge_ids)
             id_valid = (local >= 0) & (local < point_ids.size)
@@ -774,7 +816,7 @@ def _motion_point_data(
         id_column = "target_point_id" if selected_direction == "incoming" else "source_point_id"
         edge_ids = np.asarray(group[id_column][start:stop], dtype=np.int64)
         mass = np.asarray(group["mass"][start:stop], dtype=float)
-        displacement = np.asarray(group["registered_displacement_zyx"][start:stop], dtype=float)
+        displacement = np.asarray(group["registered_displacement_zyx"][start:stop], dtype=float) / duration
         local = np.searchsorted(point_ids, edge_ids)
         valid = (local >= 0) & (local < point_ids.size)
         valid &= point_ids[np.clip(local, 0, max(0, point_ids.size - 1))] == edge_ids if point_ids.size else False
@@ -805,6 +847,9 @@ def _motion_point_data(
         if normals is None:
             raise KeyError(f"Geometry set {geometry_set!r} does not contain normals_zyx")
         normals = np.asarray(normals, dtype=float)
+        lengths = np.linalg.norm(normals, axis=1)
+        normals = np.divide(normals, lengths[:, None], out=np.full_like(normals, np.nan), where=lengths[:, None] > 0)
+        result["normals"] = normals
         normal = np.sum(vectors * normals, axis=1)
         tangential_vector = vectors - normal[:, None] * normals
         result["normal_displacement"] = normal

@@ -423,7 +423,7 @@ def _feature_dependency_paths(spec: FeatureSetSpec, frames: list[int]) -> list[s
         if isinstance(value, Mapping):
             kind = str(value.get("source_kind") or source_kind or "")
             for key, item in value.items():
-                if key in {"label_set", "exclude_label_set"} and item not in (None, ""):
+                if key in {"label_set", "include_label_set", "exclude_label_set"} and item not in (None, ""):
                     paths.add(f"/labels/{item}")
                 elif key in {"mask_set", "include_mask_set", "exclude_mask_set"} and item not in (None, ""):
                     paths.add(f"/masks/{item}")
@@ -431,12 +431,20 @@ def _feature_dependency_paths(spec: FeatureSetSpec, frames: list[int]) -> list[s
                     paths.add(f"/{'labels' if kind == 'label' else 'masks'}/{item}")
                 elif key == "boundary_set" and item not in (None, ""):
                     paths.add(f"/boundaries/{item}")
+                elif key == "track_set" and item not in (None, ""):
+                    paths.add(f"/object_sets/{spec.object_set}/tracks/{item}")
+                elif key == "registration_set" and item not in (None, ""):
+                    paths.add("/registrations" if item == "auto" else f"/registrations/{item}")
                 visit(item, source_kind=kind)
         elif isinstance(value, (list, tuple)):
             for item in value:
                 visit(item, source_kind=source_kind)
 
     visit(spec.features)
+    if any(feature.get("kind") == "centroid_motility" for feature in spec.features):
+        paths.add("/registrations")
+    if any(feature.get("kind") in {"intensity", "texture"} for feature in spec.features):
+        paths.add("/images")
     return sorted(paths)
 
 
