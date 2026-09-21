@@ -658,6 +658,12 @@ def _compute_feature_frame(
             feature=feature,
             np=np,
         )
+    if kind == "channel_comparison":
+        from celltraj2.channel_comparison import compute_channel_comparison_frame
+        return compute_channel_comparison_frame(
+            trajectory, labels, frame=frame, source_label_set=source_label_set,
+            feature=feature, cache=boundary_cache,
+        )
     if kind in {
         "boundary_geometry",
         "surface_geometry",

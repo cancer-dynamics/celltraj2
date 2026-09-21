@@ -168,8 +168,113 @@ Pooled mean/variance are exact streaming merges weighted by finite pixel count,
 without retaining the movie in memory. `schema.json` records reference
 counts/mean/std and every output frame's scale/offset. Empty references or zero
 denominators give NaN intensities plus warnings. Negative corrected values are
-not clipped. This option currently belongs to Intensity blocks, not ratio blocks
-or the SITE Signaling bundle.
+not clipped. These options are available for Intensity and independently for each
+channel in Channel Comparison, not for compartment-ratio blocks or SITE Signaling.
+
+## Channel Comparison
+
+`channel_comparison` extends the former correlation-only family. The compartment
+is still one object label intersected with any include masks/labels and minus any
+exclude masks/labels. Calculations work on all pixels/voxels of this compartment,
+in both 2D and 3D; there is no representative-slice reduction for this family.
+
+```python
+feature = {
+    "kind": "channel_comparison", "name": "fret",
+    "channel_a": {"raw_index": 0}, "channel_b": {"raw_index": 1},
+    "compartment": {"include_mask_set": "nuclear"},
+    "metrics": ["pearson_correlation", "ratio_of_means", "valid_ratio_fraction"],
+    "fields": ["ratio", "difference"],
+    "statistics": ["mean", "median", "percentiles", "area"],
+    "denominator_policy": "positive", "denominator_floor": 0.0,
+    "background_a": {"source_kind": "label", "source_name": "cells", "region": "inverse"},
+    "background_b": {"source_kind": "label", "source_name": "cells", "region": "inverse"},
+}
+```
+
+### Object-level scalars
+
+- `pearson_correlation`: zero-lag Pearson correlation, the comparison used by the
+  old Channel Correlation block. It does not search for image/channel shifts.
+- `spearman_correlation`: [SciPy Spearman rank correlation](https://docs.scipy.org/doc/scipy/reference/generated/scipy.stats.spearmanr.html).
+- `cosine_similarity`: uncentered normalized dot product of the two pixel vectors.
+- `ratio_of_means`: mean(A) / mean(B) over the same finite paired pixels.
+- `valid_pair_count`: number of compartment pixels finite in both processed channels.
+- `valid_pair_fraction`: that count divided by the total compartment pixel count.
+- `valid_ratio_fraction`: fraction of finite pairs yielding finite, accepted A/B.
+
+Pearson/Spearman require at least two pairs and nonconstant channels. Cosine
+similarity is undefined for a zero vector. All these coefficients return NaN when
+undefined. Missing values are removed as pairs in the new family, so both channels
+always use the same population. Empty compartments have zero valid-pair count and
+NaN fractions/coefficients. New scalar columns use `<name>_<metric>`.
+
+### Pixel quantities and summaries
+
+| Field | Per-pixel expression |
+| --- | --- |
+| `ratio` | A / B |
+| `inverse_ratio` | B / A |
+| `difference` | A - B |
+| `absolute_difference` | abs(A - B) |
+| `sum` | A + B |
+| `product` | A * B |
+| `normalized_difference` | (A - B) / (A + B) |
+| `log2_ratio` | log2(A) - log2(B), requiring positive A and B |
+
+Select mean, median, population std, sum, min, max, `area` (valid pixel count),
+and/or the intensity `percentiles` bundle (0, 1, 10, 20, ..., 90, 99, 100).
+Columns are `<name>_<field>_<statistic>`, such as `fret_ratio_mean` and
+`fret_ratio_percentile_99`. Counts are per quantity: a finite pair can be valid
+for difference but invalid for ratio. Empty valid populations give NaN summaries,
+including sum, except `area=0`. Inf/overflow results are excluded like NaNs.
+
+**Mean of pixelwise ratios is not ratio of compartment means.** For A=[2,9] and
+B=[1,3], `ratio_mean=2.5`, while `ratio_of_means=2.75`. Ratio-of-means uses all
+finite pairs and applies the denominator threshold to mean(B); it does not first
+remove individual B pixels below the ratio threshold.
+
+Default denominator policy is `positive`: denominator > floor. `absolute` allows
+signed denominators whose absolute value exceeds the floor. The floor defaults
+to zero and must be finite/nonnegative; it is expressed in processed-channel
+units. It applies to B for A/B, A for B/A, and A+B for normalized difference.
+Log2 ratio always requires A > 0 and B > floor. Invalid divisions become
+NaN and are excluded from summaries, never replaced with zero or an epsilon.
+Negative numerators are allowed for ordinary ratios. Normalized difference is
+not clipped and need not lie in [-1,1] when corrected channels contain negatives.
+
+### Independent preprocessing
+
+`background_a` / `background_b` use the existing background-source options.
+`normalization_a` / `normalization_b` use the Intensity normalization schema:
+
+```python
+feature["normalization_a"] = {
+    "method": "match_mean", "scope": "per_frame", "reference_frame": 1,
+    "source_kind": "label", "source_name": "cells", "region": "region",
+}
+```
+
+Processing order is channel-specific background subtraction, channel-specific
+normalization, two-channel comparison, then compartment summary. Reference
+regions may differ between channels and from the measurement compartment.
+`all_frames` pools all movie frames within each H5/ROI, not across files or
+treatment groups; `per_frame` estimates each frame separately. Normalization is
+disabled by default, because independent scaling/centering changes A/B and may
+erase true FRET changes. These are channel ratios, not automatically bleed-through
+corrected FRET efficiencies. No donor/acceptor identity is inferred from channel order.
+
+Each column records both channel selectors, compartment, validity policy, and
+preprocessing schemas, including actual per-frame normalization transforms.
+Source-revision checks include raw images and both channels' mask/label references.
+The implementation is in `celltraj2.channel_comparison`; regression tests are in
+`tests/test_channel_comparison.py`.
+
+Legacy `channel_correlation` jobs still execute the original code and naming,
+including propagation of nonfinite pixels into the correlation result. SITE loads
+them into the comparison controls. Leaving them correlation-only without added
+preprocessing preserves the old specification and single column. Adding quantities,
+metrics, or preprocessing upgrades to the new family and explicit suffixed names.
 
 ## Mask-Component Summaries
 

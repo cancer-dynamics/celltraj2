@@ -443,7 +443,7 @@ def _feature_dependency_paths(spec: FeatureSetSpec, frames: list[int]) -> list[s
     visit(spec.features)
     if any(feature.get("kind") == "centroid_motility" for feature in spec.features):
         paths.add("/registrations")
-    if any(feature.get("kind") in {"intensity", "texture"} for feature in spec.features):
+    if any(feature.get("kind") in {"intensity", "texture", "channel_comparison"} for feature in spec.features):
         paths.add("/images")
     return sorted(paths)
 

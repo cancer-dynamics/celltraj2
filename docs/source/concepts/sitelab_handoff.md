@@ -1,5 +1,17 @@
 # SITE Handoff
 
+## 2026-09-21 Channel comparison
+
+`channel_comparison` adds compartment-local object scalars (Pearson, Spearman,
+cosine, ratio-of-means, validity counts/fractions), pixel quantities (A/B, B/A,
+difference/absolute difference, sum, product, normalized difference, log2 ratio),
+and separate intensity-style statistics including percentiles. Independent
+`background_a/b` and `normalization_a/b` reuse existing preprocessing. Denominator
+policy/floor are explicit; invalid pixels are omitted, with counts available.
+Mean-of-ratios and ratio-of-means are intentionally separate. Legacy
+`channel_correlation` dispatch is unchanged. See [the feature guide](classical_features.md#channel-comparison)
+and `tests/test_channel_comparison.py` (2D/3D, normalization, validity, persistence).
+
 ## 2026-09-15 Classical features and summary controls
 
 See [Classical Single-Object Features](classical_features.md) for formulas,

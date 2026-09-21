@@ -24,6 +24,14 @@ CENTROID_METRICS = (
     "polarization",
 )
 TEXTURE_METRICS = ("contrast", "dissimilarity", "homogeneity", "asm", "energy", "correlation", "entropy")
+CHANNEL_COMPARISON_METRICS = (
+    "pearson_correlation", "spearman_correlation", "cosine_similarity", "ratio_of_means",
+    "valid_pair_count", "valid_pair_fraction", "valid_ratio_fraction",
+)
+CHANNEL_COMPARISON_FIELDS = (
+    "ratio", "inverse_ratio", "difference", "absolute_difference", "sum", "product",
+    "normalized_difference", "log2_ratio",
+)
 
 
 def summary_metrics(feature, *, fields, scalars, statistics=SUMMARY_STATISTICS, prefix="", defaults=()):
