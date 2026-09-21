@@ -1,0 +1,22 @@
+# Run from the celltraj2 repository root.
+name: celltraj2
+channels:
+  - conda-forge
+  - nodefaults
+dependencies:
+  - python=3.12
+  - pip
+  - numpy>=1.24,<3
+  - scipy>=1.10
+  - scikit-image>=0.22
+  - scikit-learn>=1.3
+  - h5py>=3.10
+  - zarr>=2.18
+  - dask>=2024
+  - xarray>=2024
+  - tifffile>=2024
+  - matplotlib>=3.8
+  - pandas
+  - umap-learn>=0.5.6
+  - pip:
+      - -e .[analysis,nd2]

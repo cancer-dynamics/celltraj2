@@ -54,31 +54,51 @@ git clone https://github.com/cancer-dynamics/celltraj2.git
 cd celltraj2
 ```
 
-## Install
+## Create the conda environments
 
-Install with the analysis and ND2 extras in the environment that will run
-H5/Zarr/ND2 workflows:
+Install [conda](https://docs.conda.io/projects/conda/en/stable/user-guide/install/index.html)
+and Git first. From the `celltraj2` repository root:
 
 ```bash
-python -m pip install -e ".[analysis,nd2,dev]"
+conda env create -f environment.yml
+conda activate celltraj2
 ```
 
-Cellpose batch workers can install only the I/O pieces they need, for example:
+[environment.yml](environment.yml) selects Python 3.12 and installs the analysis
+stack plus local `celltraj2[analysis,nd2]` through pip in editable mode (`-e`).
+
+For Cellpose segmentation, create either or both separate worker environments:
+
+```bash
+conda env create -f environment-cellpose3.yml
+conda env create -f environment-cellpose4.yml
+```
+
+- [environment-cellpose3.yml](environment-cellpose3.yml): Python 3.11,
+  Cellpose 3.1.1, and NumPy 2.0.2.
+- [environment-cellpose4.yml](environment-cellpose4.yml): Python 3.12 and
+  Cellpose 4.2.1.1.
+
+Both workers include PyTorch and editable `celltraj2[analysis,nd2]`. Activate
+`cellpose3` or `cellpose4` to use that version. Conda and pip resolve
+platform-specific dependencies; the YAMLs contain no CUDA build pins or
+workstation paths.
+
+## Existing environments and local installs
+
+From the repository root in the environment you want to update:
 
 ```bash
 python -m pip install -e ".[analysis,nd2]"
-python -m celltraj2.runners.cellpose_segment segmentation_job.json
-python -m celltraj2.runners.extract_features feature_extraction_job.json
-python -m celltraj2.runners.register_global registration_job.json
-python -m celltraj2.runners.track_centroids tracking_job.json
+python -m pip check
 ```
 
-Lean environments can still import the package and use the typed metadata
-contracts:
+Add `,dev` to the extras for tests. Lean metadata-only environments can use
+`python -m pip install -e .`. If a YAML changes, use
+`conda env update -f <environment-file.yml>` from this repo root.
 
-```bash
-python -m pip install -e .
-```
+For verification, GPU/model setup, and SITE integration, see the
+[installation guide](https://cancerdynamics.org/docs/celltraj2/getting_started/installation.html).
 
 ## Documentation Development
 

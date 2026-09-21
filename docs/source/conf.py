@@ -40,7 +40,8 @@ exclude_patterns = ["_build", "Thumbs.db", ".DS_Store"]
 html_theme = "sphinx_rtd_theme"
 html_title = "celltraj2 documentation"
 html_baseurl = "https://cancerdynamics.org/docs/celltraj2/"
-html_extra_path = ["_extra"]
+# Publish the canonical repository recipes as downloadable files.
+html_extra_path = ["_extra", "../../environment.yml", "../../environment-cellpose3.yml", "../../environment-cellpose4.yml"]
 html_copy_source = False
 
 autosummary_generate = True

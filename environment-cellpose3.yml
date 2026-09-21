@@ -1,0 +1,13 @@
+# Run from the celltraj2 repository root. Cellpose supplies PyTorch via pip.
+name: cellpose3
+channels:
+  - conda-forge
+  - nodefaults
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+      - numpy==2.0.2
+      - cellpose==3.1.1
+      - torch>=2.5
+      - -e .[analysis,nd2]
