@@ -1,5 +1,23 @@
 # SITE Handoff
 
+## 2026-09-23 State checkpoint A contracts
+
+`celltraj2.state_contracts` now validates frozen Boolean Type membership over
+stable UUIDs and portable file/observation identities, shared State component
+bindings, separately scoped exact-leaf kinetic bindings, and typed dependency
+closure. `BiologyRelease` reads/writes v2 while preserving v1 serialized payloads
+and digests. State definitions and shared predictions have no singular owner
+leaf. Kinetic validation checks the entire admitted segment, physical time,
+split/component membership and accepted edges; it does not estimate dynamics.
+
+The identity-only singleton Type/State baseline uses existing row-aligned H5
+classification writes, verified with temporary fixtures. The companion
+[SITE checkpoint A report](../../../../sitelab/docs/cell_state_checkpoint_a.md)
+records composition/compatibility, coverage/readiness limits and tests.
+Fate/event workflows, kinetic estimators/flux, and full State model/event
+persistence remain proposed later checkpoints. No real project data or user
+releases were materialized by this implementation work.
+
 ## 2026-09-21 Channel comparison
 
 `channel_comparison` adds compartment-local object scalars (Pearson, Spearman,

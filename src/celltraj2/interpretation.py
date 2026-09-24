@@ -26,6 +26,7 @@ TYPE_TAXONOMY_SCHEMA = "site.type_taxonomy.v1"
 STATE_SPACE_SCHEMA = "site.state_space.v1"
 CLASSIFICATION_MANIFEST_SCHEMA = "site.classification_manifest.v1"
 BIOLOGY_RELEASE_SCHEMA = "site.biology_release.v1"
+BIOLOGY_RELEASE_V2_SCHEMA = "site.biology_release.v2"
 MATERIALIZATION_RECEIPT_SCHEMA = "site.interpretation_materialization_receipt.v1"
 CLASSIFICATION_VALUES_SCHEMA = "celltraj2.classification_values.v1"
 
@@ -64,6 +65,8 @@ def _require_numpy() -> Any:
 def _json_safe(value: Any) -> Any:
     if isinstance(value, Path):
         return str(value)
+    if isinstance(value, BiologyRelease):
+        return value.to_dict()
     if is_dataclass(value):
         return {str(key): _json_safe(item) for key, item in asdict(value).items()}
     if isinstance(value, Mapping):
@@ -475,6 +478,12 @@ class BiologyRelease:
     created_by: str = ""
     created_at: str = field(default_factory=utc_now_iso)
     schema: str = BIOLOGY_RELEASE_SCHEMA
+    state_memberships: tuple[Any, ...] = ()
+    state_bindings: tuple[Any, ...] = ()
+    kinetic_bindings: tuple[Any, ...] = ()
+    dependency_closure: tuple[Any, ...] = ()
+    completeness_scope: dict[str, Any] = field(default_factory=dict)
+    compatibility_report: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         for name in ("release_id", "project_uuid", "type_taxonomy_id"):
@@ -507,11 +516,42 @@ class BiologyRelease:
             "representations",
             tuple(_uuid_text(item, field_name="representation") for item in self.representations),
         )
-        if self.schema != BIOLOGY_RELEASE_SCHEMA:
+        if self.schema not in {BIOLOGY_RELEASE_SCHEMA, BIOLOGY_RELEASE_V2_SCHEMA}:
             raise ValueError(f"Unsupported biology-release schema {self.schema!r}")
+        if self.schema == BIOLOGY_RELEASE_SCHEMA:
+            if any((self.state_memberships, self.state_bindings, self.kinetic_bindings,
+                    self.dependency_closure, self.completeness_scope, self.compatibility_report)):
+                raise ValueError("Typed State bindings require BiologyRelease v2")
+        else:
+            from celltraj2.state_contracts import (
+                KineticModelBinding, StateComponentBinding, StateDependency,
+                StateMembershipSpec, validate_release_v2_structure,
+            )
+            for name, cls in (
+                ("state_memberships", StateMembershipSpec),
+                ("state_bindings", StateComponentBinding),
+                ("kinetic_bindings", KineticModelBinding),
+                ("dependency_closure", StateDependency),
+            ):
+                object.__setattr__(self, name, tuple(
+                    item if isinstance(item, cls) else cls.from_dict(item)
+                    for item in getattr(self, name)))
+            if any(not role.strip() for role in self.type_classifications):
+                raise ValueError("Type role names must not be empty")
+            validate_release_v2_structure(self)
 
     def to_dict(self) -> dict[str, Any]:
-        return _json_safe(self)
+        result = _json_safe(asdict(self))
+        extension_fields = ("state_memberships", "state_bindings", "kinetic_bindings",
+                            "dependency_closure", "completeness_scope", "compatibility_report")
+        if self.schema == BIOLOGY_RELEASE_SCHEMA:
+            # Preserve historical serialized v1 bytes and digests.
+            for name in extension_fields:
+                result.pop(name)
+        else:
+            for name in extension_fields[:4]:
+                result[name] = [item.to_dict() for item in getattr(self, name)]
+        return result
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "BiologyRelease":
