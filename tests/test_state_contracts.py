@@ -135,6 +135,20 @@ class StateContractTests(unittest.TestCase):
                           "split_ids": ("train",) * 3, "graph_components": ("track_1",) * 3,
                           "accepted_edges": tuple(zip(self.keys[:2], self.keys[1:3]))}}
         kinetic.validate_context(self.taxonomy, self.membership, assignments, windows=windows, pairs=pairs)
+        narrow = self.kinetic(observations=self.keys[:2], window_ids=(window_id,))
+        with self.assertRaisesRegex(ValueError, "Entire kinetic window segment"):
+            narrow.validate_context(self.taxonomy, self.membership, assignments,
+                windows={window_id: {**windows[window_id], "segment": self.keys[:3]}})
+        other_file = replace(self.keys[2], roi_uuid=uid())
+        shared_cohort = (*self.keys, other_file)
+        shared_membership = replace(self.membership, resolved_observations=shared_cohort,
+            resolved_partitions=(self.keys[0].partition, other_file.partition), conditioning_digest=None)
+        shared_kinetic = self.kinetic(observations=shared_cohort, window_ids=(window_id,))
+        with self.assertRaisesRegex(ValueError, "Kinetic window crosses files"):
+            shared_kinetic.validate_context(self.taxonomy, shared_membership,
+                {**assignments, other_file: self.tumor},
+                windows={window_id: {**windows[window_id],
+                    "segment": (self.keys[0], other_file, self.keys[1])}})
         assignments[self.keys[1]] = self.cd3
         with self.assertRaisesRegex(ValueError, "mixed Type leaves"):
             kinetic.validate_context(self.taxonomy, self.membership, assignments, windows=windows, pairs=pairs)

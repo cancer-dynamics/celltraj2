@@ -104,7 +104,8 @@ def _fingerprint(h5: Any, path: str, mode: str) -> dict[str, Any]:
 
 
 def capture_source_dependencies(
-    h5: Any, *, object_set: str, feature_sets: Sequence[str] = (), track_set: str | None = None
+    h5: Any, *, object_set: str, feature_sets: Sequence[str] = (), track_set: str | None = None,
+    include_acquisition: bool = False,
 ) -> dict[str, Any]:
     """Capture the selected tables, schemas, geometry, and declared source versions."""
     base = f"/object_sets/{validate_name(object_set, kind='object set')}"
@@ -112,6 +113,8 @@ def capture_source_dependencies(
         "observations", "observations_schema.json", "object_set.json",
     )}
     paths["/metadata/celltraj2.json"] = "scientific_metadata"
+    if include_acquisition:
+        paths["/metadata/acquisition.json"] = "content"
     # Embedded raw pixels and segmentation are large; writers maintain revisions.
     paths["/images/raw"] = "revision"
     schema_paths = [f"{base}/observations_schema.json", f"{base}/object_set.json"]

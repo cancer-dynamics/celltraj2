@@ -399,9 +399,12 @@ class KineticModelBinding:
                 raise ValueError(f"Missing kinetic window reference {window_id}")
             window = windows[window_id]
             members = _keys(window["members"], "window members")
+            segment = _keys(window.get("segment", window["members"]), "window segment")
             if not members or key(window["anchor"]) not in members or not set(members).issubset(cohort):
                 raise ValueError("Kinetic window members/anchor must belong to its exact leaf cohort")
-            if len({member.partition for member in members}) != 1:
+            if not set(members).issubset(segment) or not set(segment).issubset(cohort):
+                raise ValueError("Entire kinetic window segment must belong to its exact leaf cohort")
+            if len({member.partition for member in segment}) != 1:
                 raise ValueError("Kinetic window crosses files")
         for pair_id in self.pair_ids:
             if pairs is None or pair_id not in pairs:

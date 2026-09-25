@@ -1,5 +1,25 @@
 # SITE Handoff
 
+## 2026-09-24 State checkpoint B trajectory representations
+
+`celltraj2.trajectory_representations` adds validated versioned physical timebase,
+trajectory window and result contracts. The pure kernel retains all observations
+and anchors with exclusion reasons; creates deterministic past-only windows,
+safe segments and exact-leaf lag pairs; and rejects bridges across files,
+branches/gaps, Type conflicts, groups/splits, censoring or invalid features.
+Physical timestamps or an explicit interval are required for temporal estimates;
+static singleton exploration remains available without timing. Windows preserve
+all intervening observations and accepted-edge dependencies, including when
+delay samples are farther apart than consecutive frames.
+
+The companion sitelab B workflow freezes graph/time/source context, saves shared
+direct/delay/PCA affine transforms and keyed coordinates, and provides linked
+selection and a dedicated State workspace. See the
+[checkpoint B guide](../../../../sitelab/docs/cell_state_checkpoint_b.md).
+Tests use temporary fixtures. C fate/events, D kinetic estimators/flux/MMIST and
+full State model/event H5 materialization remain proposed; this kernel does not
+fit a kinetic model or infer events from graph topology.
+
 ## 2026-09-23 State checkpoint A contracts
 
 `celltraj2.state_contracts` now validates frozen Boolean Type membership over
