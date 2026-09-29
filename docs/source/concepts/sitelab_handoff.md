@@ -1,5 +1,32 @@
 # SITE Handoff
 
+## 2026-09-25 Indexed State trajectory access
+
+`celltraj2.trajectory_index` now provides `GraphIndex`, `Runs`, and `FrameWindows`.
+The graph index stores disjoint nonbranching chains plus original parent/child
+links in O(N+E); shared ancestors are not duplicated into root-to-leaf paths.
+`trace()` follows only a selected history and unambiguous future. Population
+projection cuts gaps/excluded interior rows and Type/split boundaries. Division
+mothers can end a run, with daughters beginning separate runs. Window members
+are slices and pairs are two window indices plus actual elapsed time. L=1 is the
+raw observation view; initial/final/mean summaries and bounded feature gathers
+avoid eager N*L expansion. Integer frame-lag pairing is available headlessly.
+
+Sitelab persists a content-addressed project cache keyed by partition, graph and
+observation spine; it does not write caches into H5. Its new State viewer uses
+frame delays, per-file clock offsets, lazy snapshot columns, compact artifact
+schemas, bounded fitting and linked scatter/timeline layers. Empirical local
+flux is displacement/hour for a selected exact Type leaf. It is not a fitted
+kinetic model. Shared State membership/representations still span arbitrary
+Boolean taxonomy subsets and treatment/H5 restrictions.
+
+Validation: 19 trajectory tests passed (including five new graph-index tests).
+The new tests cover cycles, assignments/adjacency disagreement, branch partition,
+Type/split/frame barriers, bounded gathers and 100,000-row/1,000-frame storage.
+Legacy trajectory contracts remain supported. Optional H5 index persistence,
+unequal-time resampling, fate models and fitted propagators remain proposed.
+See [the updated State guide](../../../../sitelab/docs/cell_state_checkpoint_b.md).
+
 ## 2026-09-24 State checkpoint B trajectory representations
 
 `celltraj2.trajectory_representations` adds validated versioned physical timebase,
