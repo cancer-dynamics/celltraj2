@@ -1,5 +1,102 @@
 # SITE Handoff
 
+## 2026-09-30 State display follow-up
+
+Sitelab now toggles between scatter and Timeline, with a display-only inclusive
+frame filter over final delay anchors. Selected trajectories retain their full
+available span. Density/heatmaps use all finite filtered segments; empirical flux
+also requires both endpoints in the display range and still requires one exact
+Type leaf. No graph/index or classification contract changes were needed.
+
+ROI Objects can color current manual State/event evidence and saved published
+State classification outputs directly from the project. Published colors honor
+validated binding coverage, including reusable subsets with pending application.
+State plots also color by feature/representation coordinates and actual saved
+per-class model probabilities; human support is not interpreted as probability.
+Reads are bounded and asynchronous. Sources remain read-only; no release was
+published or materialized. Trained fate/event routes and typed event/forecast
+release consumers remain later checkpoint C work. See the
+[display guide](../../../../sitelab/docs/cell_state_checkpoint_b.md) and
+[annotation guide](../../../../sitelab/docs/cell_state_checkpoint_c.md).
+
+Validation: sitelab passes 150 State tests and 48 Type/Objects/selection/ROI
+regressions (198 total), including scoped published colors, asynchronous loading,
+frame-filter semantics and saved classifier probabilities. UI renders inspected;
+all fixtures are synthetic. Celltraj2 runtime/schema files are unchanged.
+
+## 2026-09-30 Selection-based State event UI
+
+Sitelab now records events from an explicit selected-cell/frame report, grouped
+by the user-chosen Objects track set. `GraphIndex` disjoint chains support the
+grouping and bounded Objects selection expansion; no full lineage-per-observation
+copy is introduced. Event occurrence bounds come from verified selected frames,
+independently of the wider participant/context span. Event-free interval review
+remains a separate explicit action.
+
+The existing celltraj2 EventRecord schema is unchanged. Sitelab saves the full
+selected observations, row roles, graph/source identity and timing choices in
+`event_selection` provenance. Multiple selected frames of the same verified
+unbranched participant contribute one representative per role to EventRecord,
+so two daughters reviewed across several frames still count as two participants.
+Unlinked observations are never silently combined. Future event consumers should
+use this retained context for temporal participant detail and revalidation.
+
+State annotation has one selected-cell action and visible color pickers. Saved
+evidence/reference/manual-output APIs remain; the latter two are no longer
+standalone annotation-panel actions. Shared Boolean membership, exact-leaf
+kinetics and Type behavior remain separate. No real data or releases were changed;
+checkpoint D and later C fitting/release routes are not implemented by this change.
+See the [updated UI guide](../../../../sitelab/docs/cell_state_checkpoint_c.md).
+
+Validation: 140 sitelab State tests with UI rendering, 46 Objects/Type/selection/ROI
+projection regressions and 23 celltraj2 supervision/index tests passed in WSL
+`sitelab-gui` (209 total). Fixtures are synthetic; no celltraj2 runtime contract
+changes were needed for this UI refinement.
+
+## 2026-09-29 State checkpoint C annotation/correspondence contracts
+
+The user approved the checkpoint C plan. The first annotation/correspondence
+review milestone is implemented; the proposal-only entry below is historical.
+New `celltraj2.state_supervision` provides versioned State annotation,
+event definition/role/occurrence, reviewed exposure and supervision-task contracts,
+plus final-anchor reference projection and bounded trajectory extension over the
+existing compact graph/run/window index. Task contracts do not imply an estimator
+or forecasting target adapter is implemented.
+
+Direct evidence remains single-observation evidence. Delay projection retains
+unknown/conflict/unmapped coverage, source-unit weighting and window identity.
+Extension is finite, respects run barriers, never traverses branches or recursively
+extends derived evidence, and yields to direct annotations. Event occurrence and
+participant decisions are separate; unreviewed/censored exposure is not a negative.
+
+Sitelab now exposes local draft definitions, separate State/fate controls in
+State and ROI, scoped edit history/review/Undo, event/exposure review, read-only
+overlays, validated selection transport and local manual State output. Shared
+Boolean State membership and exact-leaf kinetic bindings remain separate. Legacy
+release schemas are unchanged. See the
+[current UI guide](../../../../sitelab/docs/cell_state_checkpoint_c.md).
+
+Review C2/C3 before classifier fitting, scored event extraction, fixed-horizon
+target construction and broader State/event/forecast release integration. These
+later C stages and general H5 materialization remain unimplemented. No real
+project/H5 data or published release was modified.
+
+Validation: 18 supervision-contract tests plus 5 existing graph-index tests
+passed in WSL `sitelab-gui`. Sitelab's integrated State suite passed all 124 tests
+with UI rendering enabled; 39 Type/selection/ROI projection regressions also
+passed. Fixtures are synthetic and temporary. No new dependencies were added.
+
+## 2026-09-29 State checkpoint C proposal
+
+The [checkpoint C supervision and event review plan](../../../../../docs/SITE_cell_state_checkpoint_C_supervision_and_event_review_plan.md)
+is drafted for review, not implemented. It proposes reusable single-observation
+evidence projected to final-anchor delays, bounded State extension, custom event
+definitions/review, strict grouped supervision and typed event/forecast release
+bindings. Keep the existing compact graph/window index, shared Boolean State
+membership, exact-leaf kinetic bindings and legacy release serialization.
+Review the annotation/correspondence stages before training. No runtime or real
+project/H5 changes accompany this planning entry.
+
 ## 2026-09-25 Indexed State trajectory access
 
 `celltraj2.trajectory_index` now provides `GraphIndex`, `Runs`, and `FrameWindows`.
