@@ -1,5 +1,80 @@
 # SITE Handoff
 
+## 2026-10-01 Compact delays and linear State coordinate workflow
+
+Sitelab's [D0–D1 guide](../../../../sitelab/docs/cell_state_checkpoint_d01.md)
+now documents the implemented linear refinement: snapshot collective features
+in Population; explicit delay saving, method-specific extraction and active
+analysis selection in Representation. Exploratory delay changes do not save
+artifacts or enumerate every feature/member coordinate.
+
+Additional saved delays use a sitelab v2 population recipe/reference over one
+immutable graph/clock/eligibility/Type mapping, with no repeated feature or graph
+arrays. Repeated saves are deduplicated, including correct later registration of
+deferred annotation artifacts. Old formats remain readable. Snapshot PCA/UMAP
+outputs map by observation identity across graph/delay choices, with missing
+coverage retained. Delay fitting gathers raw and snapshot coordinates in bounded
+batches. Learned output values and row identity still require storage; analysis
+sets are recipes. Existing celltraj2 contracts required no changes for this
+refinement. Shared static Boolean membership and separate exact-leaf kinetics
+remain in force; later VAMP, partitions, operators and release routes remain
+unimplemented, along with C4–C6 trained/typed event routes.
+
+Validation: sitelab State discovery passed 194 of 195 tests with one optional
+annotation screenshot test skipped; 46 Type/Objects/selection/projection tests
+passed (240 total passing). Additional synthetic UI renders were inspected.
+Storage tests verify empty-table delay references, deduplication, corruption
+rejection, deferred registration, bounded projection and unchanged source-H5
+hashes. Fresh-window tests preserve active analysis independently of preview
+and restore mixed snapshot/delay coordinates. No real data or user releases were
+modified or materialized. No million-observation performance claim is made.
+
+## 2026-10-01 D0–D1 coordinate contracts and sitelab implementation
+
+The authorized D0–D1 milestone is implemented. See the
+[delivery guide](../../../../sitelab/docs/cell_state_checkpoint_d01.md).
+The planning entry below is historical; VAMP, micro/macrostate clustering,
+operators and D5 release routes remain future work, as do C4–C6 classifiers and
+typed event/forecast releases.
+
+New `celltraj2.state_coordinates` validates versioned sample-domain and named
+coordinate-set contracts plus shared-static versus exact-Type-leaf dynamic fit
+provenance. Dynamic contracts can identify PairSet dependencies before discrete
+partitions; this is validation only, not a PairSet estimator or VAMP runtime.
+Existing graph/window and kinetic binding behavior remains intact.
+
+Sitelab implements raw/direct/PCA/UMAP coordinate catalogs, mixed analysis sets,
+separate immutable fits/applications, multiple saved delay domains and independent
+view choices. Numeric UMAP persistence uses an explicit bounded sample and version
+checks; no pickle. Bounded raw-window gathering and on-demand inactive-domain
+loading preserve compact graph access. Shared static membership remains arbitrary
+Boolean taxonomy subsets with treatment/H5 restrictions, with no one-leaf/one-
+StateSpace constraint. Future learned dynamics and flux remain separately scoped
+to exact Type leaves.
+
+Validation: 28 celltraj2 State tests passed; sitelab passed 173 State tests and
+46 Type/Objects/selection/projection regressions (247 total across both repos),
+with one optional annotation screenshot test skipped. Additional synthetic UI
+renders were inspected. Coverage includes row/domain and semantic compatibility,
+frozen UMAP roundtrip, composed inputs, persistence/dependency integrity, fresh-
+window reopening of multiple delays/bases and standalone saved analysis sets.
+No real project data, source H5 files or user releases were modified or materialized.
+
+## 2026-10-01 Proposed checkpoint D framework
+
+Documentation only: the [workflow overview](../../../../../docs/SITE_cell_state_checkpoint_D_workflow_overview.md)
+and [implementation guide](../../../../../docs/SITE_cell_state_checkpoint_D_representation_and_kinetics_plan.md)
+expand D around reusable sample/coordinate domains, optional microstates,
+direct/microstate macro mappings, and separate exact-leaf dynamics.
+PCA/UMAP/VAMP and k-means/hierarchical adapters are proposed, not implemented.
+
+Reuse GraphIndex/FrameWindows and compact pairs. Versioned dynamic representation
+provenance must support VAMP before any discrete partition, without a dummy State
+binding. Static shared membership and existing leaf-specific kinetic contracts
+remain governing constraints. The guide specifies assessment, coverage,
+release compatibility and future MMIST/cellblob consumer boundaries.
+C4–C6 remains pending. No runtime/schema/source-H5 changes, release actions or
+new runtime tests were performed; the drafts and cross-references were checked.
 ## 2026-09-30 State display follow-up
 
 Sitelab now toggles between scatter and Timeline, with a display-only inclusive
