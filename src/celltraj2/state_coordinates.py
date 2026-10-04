@@ -1,6 +1,6 @@
 """Versioned row-domain and coordinate contracts; no numerical fitting or GUI.
 
-Static coordinates may share arbitrary validated State membership. A future
+Static coordinates may share arbitrary validated State membership. A
 pair-trained representation has its own exact-leaf scope before partitioning.
 """
 from __future__ import annotations
@@ -88,7 +88,7 @@ def validate_representation_fit_scope(data, *, taxonomy=None):
 
     A dynamic scope requires an actual taxonomy to establish that the selected
     UUID is a leaf. No dummy State component/partition binding is required.
-    This is a contract seam only; PairSet construction and VAMP are later work.
+    Sitelab's D2 PairSet and VAMP adapters validate this scope before fitting.
     """
     if not isinstance(data, Mapping):
         raise ValueError('Representation scope must be a mapping')

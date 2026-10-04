@@ -1,5 +1,45 @@
 # SITE Handoff
 
+## 2026-10-04 Supervised State/event/fate kernels and typed releases
+
+`state_supervised_targets` adds explicit reviewed event-detection and physical
+fixed-horizon target projection with causal input support, at-risk/follow-up
+evidence, occurrence intervals, censoring, competing events and compact support
+traversal. `state_event_assessment` adds frozen episode policies, extraction,
+one-to-one occurrence matching and reviewed-exposure/timing diagnostics.
+
+`state_release_outputs` defines typed event/prediction bindings and explicit
+StateSpace mappings. `BiologyRelease` v3 serializes these outputs without dummy
+State assignments; older supported v1/v2 releases preserve their formats. Sitelab
+provides shared Type/State fitting, separate storage, review/display, composition
+and compatibility checks; see its
+[C4-C6 guide](../../../../sitelab/docs/cell_state_checkpoint_c456.md).
+
+Validation: 56 combined celltraj2 State tests pass, including D2 and new target,
+event and contract coverage. Real trained synthetic detector/fate outputs also
+pass sitelab v3 composition/reopen tests. Generalized H5 materialization and
+standalone inference export remain checkpoint F; source H5 data was unchanged.
+
+## 2026-10-04 D2 PairSet contract and sitelab VAMP adapter
+
+`celltraj2.state_pairs.validate_pair_recipe` now validates
+`site.state_pair_recipe.v1`: exact Type leaf/release, sample domain, independent
+history/lag, full-path support and physical or descriptive frame semantics.
+Existing representation-fit scope validation is used before sitelab's VAMP
+fitting. No Type or source-H5 storage was changed.
+
+Sitelab provides compact PairSets, shared split/support/exposure services,
+deeptime VAMP, numeric persistence and GUI integration. See the
+[D2 guide](../../../../sitelab/docs/cell_state_checkpoint_d2.md) and
+[shared interfaces](../../../../../docs/SITE_cell_state_D2_shared_interfaces.md).
+Physical timing checks cover whole histories and connecting paths. Shared
+State membership remains unrestricted by kinetic leaf scope. D3–D5 remain
+planned; D2 adds no discrete operator or new published release output.
+
+Validation: 34 celltraj2 State/trajectory tests passed. Sitelab's full State
+suite passed 287 tests with one optional skip; final focused and Type checks
+also passed. Numerical/GUI fixtures used synthetic projects only.
+
 ## 2026-10-01 Compact delays and linear State coordinate workflow
 
 Sitelab's [D0–D1 guide](../../../../sitelab/docs/cell_state_checkpoint_d01.md)

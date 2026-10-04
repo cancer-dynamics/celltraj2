@@ -27,6 +27,7 @@ STATE_SPACE_SCHEMA = "site.state_space.v1"
 CLASSIFICATION_MANIFEST_SCHEMA = "site.classification_manifest.v1"
 BIOLOGY_RELEASE_SCHEMA = "site.biology_release.v1"
 BIOLOGY_RELEASE_V2_SCHEMA = "site.biology_release.v2"
+BIOLOGY_RELEASE_V3_SCHEMA = "site.biology_release.v3"
 MATERIALIZATION_RECEIPT_SCHEMA = "site.interpretation_materialization_receipt.v1"
 CLASSIFICATION_VALUES_SCHEMA = "celltraj2.classification_values.v1"
 
@@ -484,6 +485,8 @@ class BiologyRelease:
     dependency_closure: tuple[Any, ...] = ()
     completeness_scope: dict[str, Any] = field(default_factory=dict)
     compatibility_report: dict[str, Any] = field(default_factory=dict)
+    event_bindings: tuple[Any, ...] = ()
+    prediction_bindings: tuple[Any, ...] = ()
 
     def __post_init__(self) -> None:
         for name in ("release_id", "project_uuid", "type_taxonomy_id"):
@@ -516,8 +519,10 @@ class BiologyRelease:
             "representations",
             tuple(_uuid_text(item, field_name="representation") for item in self.representations),
         )
-        if self.schema not in {BIOLOGY_RELEASE_SCHEMA, BIOLOGY_RELEASE_V2_SCHEMA}:
+        if self.schema not in {BIOLOGY_RELEASE_SCHEMA, BIOLOGY_RELEASE_V2_SCHEMA, BIOLOGY_RELEASE_V3_SCHEMA}:
             raise ValueError(f"Unsupported biology-release schema {self.schema!r}")
+        if self.schema != BIOLOGY_RELEASE_V3_SCHEMA and (self.event_bindings or self.prediction_bindings):
+            raise ValueError("Typed event and prediction bindings require BiologyRelease v3")
         if self.schema == BIOLOGY_RELEASE_SCHEMA:
             if any((self.state_memberships, self.state_bindings, self.kinetic_bindings,
                     self.dependency_closure, self.completeness_scope, self.compatibility_report)):
@@ -538,6 +543,14 @@ class BiologyRelease:
                     for item in getattr(self, name)))
             if any(not role.strip() for role in self.type_classifications):
                 raise ValueError("Type role names must not be empty")
+            if self.schema == BIOLOGY_RELEASE_V3_SCHEMA:
+                from celltraj2.state_release_outputs import (
+                    EventOutputBinding, PredictionOutputBinding, validate_typed_output_structure,
+                )
+                for name, cls in (("event_bindings", EventOutputBinding), ("prediction_bindings", PredictionOutputBinding)):
+                    object.__setattr__(self, name, tuple(item if isinstance(item, cls) else cls.from_dict(item)
+                                                        for item in getattr(self, name)))
+                validate_typed_output_structure(self)
             validate_release_v2_structure(self)
 
     def to_dict(self) -> dict[str, Any]:
@@ -551,6 +564,11 @@ class BiologyRelease:
         else:
             for name in extension_fields[:4]:
                 result[name] = [item.to_dict() for item in getattr(self, name)]
+        for name in ("event_bindings", "prediction_bindings"):
+            if self.schema == BIOLOGY_RELEASE_V3_SCHEMA:
+                result[name] = [item.to_dict() for item in getattr(self, name)]
+            else:
+                result.pop(name)
         return result
 
     @classmethod

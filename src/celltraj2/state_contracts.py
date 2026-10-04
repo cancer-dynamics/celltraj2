@@ -22,6 +22,7 @@ STATE_COMPONENT_BINDING_SCHEMA = "site.state_component_binding.v1"
 KINETIC_MODEL_BINDING_SCHEMA = "site.kinetic_model_binding.v1"
 STATE_DEPENDENCY_SCHEMA = "site.state_dependency.v1"
 BIOLOGY_RELEASE_V2_SCHEMA = "site.biology_release.v2"
+BIOLOGY_RELEASE_V3_SCHEMA = "site.biology_release.v3"
 
 
 def _digest(value: str, name: str) -> str:
@@ -467,7 +468,8 @@ def release_required_artifact_ids(release: Any) -> frozenset[str]:
     for membership in release.state_memberships:
         result.update((membership.taxonomy_id, membership.type_release_id, membership.type_classification_id))
         result.update(dep.artifact_id for dep in membership.source_dependencies)
-    for binding in (*release.state_bindings, *release.kinetic_bindings):
+    for binding in (*release.state_bindings, *release.kinetic_bindings,
+                    *getattr(release, "event_bindings", ()), *getattr(release, "prediction_bindings", ())):
         result.update(binding.artifact_ids)
     return frozenset(result)
 
@@ -519,7 +521,8 @@ def validate_release_v2_structure(release: Any) -> None:
     missing = release_required_artifact_ids(release) - closure.keys()
     if missing:
         raise ValueError(f"Release dependency closure is missing required artifacts: {sorted(missing)}")
-    for owner in (*release.state_memberships, *release.state_bindings, *release.kinetic_bindings):
+    for owner in (*release.state_memberships, *release.state_bindings, *release.kinetic_bindings,
+                  *getattr(release, "event_bindings", ()), *getattr(release, "prediction_bindings", ())):
         for dependency in getattr(owner, "source_dependencies", getattr(owner, "dependencies", ())):
             if closure[dependency.artifact_id] != dependency.digest:
                 raise ValueError("Consumed dependency digest differs from release closure")
@@ -532,7 +535,7 @@ def validate_release_dependency_closure(release: Any, artifact_digests: Mapping[
     ``artifact_dependencies`` must describe the recursively loaded artifacts'
     references; omitted graph data cannot prove transitive closure and is rejected.
     """
-    if release.schema != BIOLOGY_RELEASE_V2_SCHEMA:
+    if release.schema not in {BIOLOGY_RELEASE_V2_SCHEMA, BIOLOGY_RELEASE_V3_SCHEMA}:
         raise ValueError("Legacy releases do not prove validated State dependency closure")
     validate_release_v2_structure(release)
     declared = {item.artifact_id: item.digest for item in release.dependency_closure}
@@ -560,7 +563,7 @@ def validate_release_state_context(release: Any, taxonomy: TypeTaxonomy,
     unknown/ambiguous/incompatible observations must be absent from the mapping.
     Artifact availability/digests are checked separately by the closure validator.
     """
-    if release.schema != BIOLOGY_RELEASE_V2_SCHEMA:
+    if release.schema not in {BIOLOGY_RELEASE_V2_SCHEMA, BIOLOGY_RELEASE_V3_SCHEMA}:
         raise ValueError("Legacy State scopes require explicit validated adoption")
     validate_release_v2_structure(release)
     if release.type_taxonomy_id != taxonomy.taxonomy_id:
