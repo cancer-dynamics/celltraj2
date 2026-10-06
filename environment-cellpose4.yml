@@ -6,6 +6,7 @@ channels:
 dependencies:
   - python=3.12
   - pip
+  - ipykernel>=6
   - pip:
       - cellpose==4.2.1.1
       - torch>=2.5

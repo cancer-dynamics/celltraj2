@@ -1,5 +1,26 @@
 # SITE Handoff
 
+## 2026-10-06 Plot notebooks and significance in sitelab
+
+Sitelab's Plot workflow now exports editable notebooks that read the same
+observation/feature tables and reproduce time series or distributions, including
+cell-type selections, transformations and pairwise significance. H5 access stays
+read-only through the coordinated lease API; no celltraj2 data contract changed.
+Cell-type replay retains the chosen project classification and validates the
+observation spine before joining its Parquet fragment.
+
+The celltraj2 and Cellpose environment recipes now include `ipykernel` for
+Resources-driven kernel registration. The main celltraj2 recipe also supplies
+JupyterLab and notebook execution support, so it can serve as a notebook host.
+Plot's execution kernel should normally be `sitelab-gui`, which includes sitelab
+and its plotting dependencies. A Jupyter host and execution kernel may use
+different environments. See sitelab's `docs/analysis_workflows.md` Plot section
+and `docs/resources_workflow.md` for the GUI setup and inference semantics.
+
+Existing environments need their corresponding YAML update to receive the new
+packages. This change does not update installed environments or register kernels
+until the user invokes Resources registration or Open in Python.
+
 ## 2026-10-04 Supervised State/event/fate kernels and typed releases
 
 `state_supervised_targets` adds explicit reviewed event-detection and physical
