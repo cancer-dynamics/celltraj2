@@ -1,5 +1,87 @@
 # SITE Handoff
 
+## 2026-10-13 Spatial kernel optimization and reusable Plot execution
+
+`compute_motion_surface` now batches accepted-pair moment reductions, reuses
+clock/reference lookups and spatial indexes, and prunes distant neighbors
+conservatively before exact distance/bin checks. Scientific definitions, NaN
+handling, continuity, counts, complete moments and support are unchanged. The
+optional `pair_search=auto|spatial_index|brute_force` argument allows direct
+validation without changing the output schema. Cancellation and scratch/support
+caps remain in force.
+
+Validation: 27 spatial tests (including independent scalar oracles covering
+all methods/normalizations, both geometry conventions, 2D/3D, gaps and cohorts),
+18 temporal tests, and 176 full-output comparisons with the original kernel.
+Synthetic speedups were 3.5–11.4x; the 250-cell x 24-frame dense case (8.24M pairs)
+fell from 33.78s to 9.68s. Run `benchmarks/spatial_motion.py`; production timing
+is still outstanding.
+
+Sitelab now owns a reusable per-H5 process executor independent of Jobs, with
+user concurrency, cancellation and ordered results. All four Plot families
+share validated per-H5 caches and saved `.siteplot` JSON/NPY result sessions.
+Display changes reuse calculations; later sessions can style without sources
+or recalculate a saved recipe. No executor, cache writer, GUI dependency or H5
+mutation was introduced into the celltraj2 kernels.
+
+## 2026-10-09 Spatial motion correlation checkpoint
+
+`celltraj2.spatial_correlations.compute_motion_surface` adds directed ROI-local
+motion surfaces over supplied disjoint graph runs and observation-aligned
+positions/clocks. It separates forward displacement duration delta from origin
+lag tau, exposes cross-time versus exact source-time geometry, and supports
+radial response (source snapshot only), relative radial motion, full dot,
+longitudinal and transverse products. Toward means positive approach; away
+reverses radial signs. Two-vector raw/covariance/coefficient calculations use
+joint finite pairs, with bin-local centering after projection and trace-variance
+normalization. Raw longitudinal + transverse sum equals full dot; normalized
+components do not share a denominator and do not generally sum.
+
+Independent continuous source/receiver cohort masks, original cell identities,
+optional lineage exclusion, nearest unique interval endpoints with explicit
+tolerance, no interpolation, zero/NaN/support reasons and realized times are
+explicit contracts. Pair arrays are bounded chunks; grids and unique support
+memberships have guarded caps. Progress and cooperative cancellation are
+supported. No H5 writer or source-table identifier reinterpretation is added.
+
+Sitelab provides registered physical-coordinate adapters, independent frozen
+Type filters, a Spatial motion Plot family, heatmaps/coverage/line slices,
+Replicate or ROI whole-surface pointwise intervals, numeric exports and frozen
+Python replay. Spatial significance remains checkpoint 5. The Murthy notebook
+comparison is in sitelab `docs/spatial_motion_reference.md`; its incoming-motion
+anchor, caller sign, units and NaN denominator differ explicitly from the new
+forward calibrated contract. Synthetic demo: sitelab
+`scripts/demo_spatial_motion.py --output <new-folder>`.
+
+Validation includes 24 analytic kernel tests plus H5, classification, replay,
+reference and Qt integration tests in sitelab. Real tracked-project validation
+remains outstanding. No original publication notebook or real H5 was modified.
+
+## 2026-10-09 Temporal correlations and Plot curve statistics
+
+`celltraj2.temporal_correlations.compute_temporal_curve` computes MSD and scalar
+or explicit vector auto/cross correlations over supplied disjoint `GraphIndex`
+runs. It accepts raw products, covariance, lag-local Pearson, fixed-reference
+normalization and ROI/within-run fluctuations. Positive lag is A(t), B(t+lag).
+The caller supplies clocks, registration and experimental units; no H5 writer or
+observation-ID reinterpretation is introduced. Finite endpoint pairs contribute
+once, run boundaries are never crossed, and missing/constant/under-supported
+bins retain explicit reasons and counts. Receiver chunks bound pair scratch
+memory; progress and cooperative cancellation are supported.
+
+Sitelab now exposes these methods in Analysis > Plot's five workflow tabs, with
+raw and compatible saved collective coordinates, Replicate/ROI uncertainty,
+independent/paired whole-curve inference, background jobs, support exports and
+frozen-input Python notebooks. The first two checkpoints are ready for review;
+spatial motion/state/event surfaces and delayed MI remain the second stage.
+See sitelab `docs/analysis_workflows.md` and `docs/correlation_analysis_plan.md`.
+
+Validation includes 18 analytic temporal kernel tests and 5 existing trajectory
+index tests, plus sitelab H5/notebook/Qt/artifact-integrity and statistics suites.
+Real sample H5 files were inspected read-only; they have no stored track graphs
+for a real-data temporal run. No real data or original publication notebooks
+were changed, no packages installed and no commits made for this review slice.
+
 ## 2026-10-06 Plot notebooks and significance in sitelab
 
 Sitelab's Plot workflow now exports editable notebooks that read the same
