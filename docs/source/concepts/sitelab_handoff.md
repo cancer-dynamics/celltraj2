@@ -1,5 +1,83 @@
 # SITE Handoff
 
+## 2026-10-13 State/event surfaces and delayed mutual information
+
+`celltraj2.state_correlations.compute_state_surface` adds ROI-local State,
+continuous-feature and fixed-event-anchor surfaces alongside motion. Methods
+are `state_conditional`, `state_joint`, `feature_correlation`, `event_state` and
+`event_feature`. Binary values are 0/1/NaN; unknown never becomes OFF. Continuous
+raw/covariance/Pearson estimates use jointly finite pairs and bin-local moments.
+Conditional/event responses support equal-anchor (default), equal-frame or
+pooled-pair weighting; joint occupancy and feature correlation use pairs.
+
+The kernel consumes observation-row anchors supplied by a validated identity
+adapter; it never interprets EventIDs or segment rows as observation IDs.
+Events retain their fixed focal position and actual chosen event clock, with
+no future source-survival condition. State geometry defaults to exact source-time
+separation in an unbroken receiver-eligible run; events default to cross-time
+anchor-to-receiver geometry. Self and related-lineage policies remain explicit.
+KD trees are reused by the relevant clocks, pair scratch is frame bounded, and
+the adjustable support budget also covers sparse anchor/support accumulation.
+Cancellation, empty/unknown support and finite denominators remain explicit.
+
+Response, baseline, excess and enrichment have distinct contracts. Baseline is
+all finite eligible receiver population exposure at each response pair's target
+clock in the ROI/cohort, respecting self/lineage/geometry policies and the same
+anchor/frame/pair weighting. It is not event-free control exposure. Zero baseline
+gives undefined enrichment. Separate response/baseline arrays, anchor/exposure
+counts and detailed support are retained for sitelab records and export.
+
+`celltraj2.mutual_information.compute_delayed_mutual_information` implements
+scalar `I(A(t); B(t+lag))` on the existing disjoint-run and elapsed-clock
+contract. `compute_temporal_curve(method='mutual_information', mi_options=...)`
+is a compatible dispatch. Declared continuous/discrete feature kinds select
+KSG1, empirical contingency or fixed-neighbor Ross mixed estimates. Units are
+nats or bits; there is no generic correlation normalization. Seeded `1e-10`-SD
+jitter resolves continuous ties, constant inputs have MI zero, and small/rare
+category support is reported without discarding samples. Signed raw estimates
+are retained alongside nonnegative displayed MI. The implementations follow
+[Kraskov et al.](https://doi.org/10.1103/PhysRevE.69.066138) and
+[Ross](https://doi.org/10.1371/journal.pone.0087357).
+
+Exact pairs are stored for one lag bin at a time with `max_pairs=1_000_000`
+by default (0 = unlimited); a cap failure never subsamples data. Neighbor
+queries and gathers check cancellation in bounded chunks. Optional seeded
+circular B shifts operate within finite, regularly sampled run segments and
+preserve missing rows. Short/irregular segments or invalid surrogate support
+produce unavailable diagnostics. Null mean/SD and observed-minus-null describe
+a stationary circular surrogate distribution, not a p-value, causal effect or
+automatic bias correction. Settings, support, tie and null diagnostics are
+returned as ordinary arrays/dicts; no GUI/H5 writer dependency is introduced.
+
+Sitelab resolves saved State/reviewed EventSet inputs and frozen published
+bindings, retains exact/interval timing provenance, and owns all experimental-unit
+inference. Its declared spatial domains use complete whole ROI/replicate units,
+bin-width/area integration, independent or explicitly paired resampling,
+all-pair multiplicity and an eligible independent omnibus. New methods reuse
+the private per-H5 executor, source-free `.siteplot` sessions, independent figure
+galleries, CSV and frozen-input notebooks. Blocked/paired multigroup omnibus and
+heteroskedastic mean-only functional designs remain explicitly unsupported.
+
+MI validation includes analytic Gaussian/discrete cases, nonlinear dependence,
+mixed-estimator comparison to public scikit-learn, signed lags, gaps/ties/constants,
+finite-scale stability, small/rare support, deterministic nulls and cancellation/
+caps, plus immutable synthetic-H5, result and notebook replay tests. State/event
+tests cover conditional denominators, fixed terminating anchors and exposure
+policies. Production-scale timing and representative biological validation are
+still follow-ups; no original notebook or real H5 was changed.
+
+## Adjustable spatial support budget
+
+`compute_motion_surface(..., max_support_entries=20_000_000)` replaces the
+fixed 2,000,000-entry support guard. Zero disables this guard. The budget counts
+combined distinct source-cell, receiver-cell and receiver-origin memberships
+across bins, per call, rather than measuring RAM or counting pairs. Inputs must
+be nonnegative integers. `SpatialSupportLimitExceeded` (a `ValueError`) reports
+required entries so far and the configured budget, and survives multiprocessing
+exception transport. Estimates and exact support counts do not depend on the
+budget when the calculation succeeds. Sitelab exposes the value under Plot >
+Output, including saved-recipe recalculation. Grid and scratch bounds remain.
+
 ## 2026-10-13 Spatial kernel optimization and reusable Plot execution
 
 `compute_motion_surface` now batches accepted-pair moment reductions, reuses

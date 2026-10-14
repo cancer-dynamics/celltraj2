@@ -333,9 +333,21 @@ class SpatialCorrelationTests(unittest.TestCase):
         common = two_motions()
         with self.assertRaisesRegex(ValueError, "accumulator limit"):
             compute_motion_surface(**(common | {"distance_edges": np.arange(100002)}))
-        with patch("celltraj2.spatial_correlations._MAX_SUPPORT_ENTRIES", 2):
-            with self.assertRaisesRegex(ValueError, "support membership limit"):
-                compute_motion_surface(**common)
+        with self.assertRaisesRegex(ValueError, "at least 3.*configured limit 2"):
+            compute_motion_surface(**common, max_support_entries=2)
+
+    def test_adjustable_support_budget_preserves_exact_results(self):
+        from celltraj2.spatial_correlations import DEFAULT_MAX_SUPPORT_ENTRIES
+        self.assertEqual(DEFAULT_MAX_SUPPORT_ENTRIES, 20_000_000)
+        # One source-cell, receiver-cell and receiver-origin membership = 3.
+        bounded = compute_motion_surface(**two_motions(), max_support_entries=3)
+        unlimited = compute_motion_surface(**two_motions(), max_support_entries=0)
+        for name in ('values', 'pair_counts', 'source_counts', 'receiver_counts',
+                     'source_track_counts', 'receiver_track_counts', 'status'):
+            np.testing.assert_equal(bounded[name], unlimited[name])
+        for invalid in (-1, True, 2.5, None, float('inf')):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(ValueError, 'max_support_entries'):
+                compute_motion_surface(**two_motions(), max_support_entries=invalid)
 
     def test_receiver_pair_chunks_and_cooperative_cancellation(self):
         # More receivers than one pair chunk; no dense pair matrix is needed.

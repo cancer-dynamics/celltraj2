@@ -11,7 +11,11 @@ from scipy.spatial import cKDTree
 from .temporal_correlations import _matrix, _validate_runs
 
 _MAX_SURFACE_BINS = 100000
-_MAX_SUPPORT_ENTRIES = 2000000
+DEFAULT_MAX_SUPPORT_ENTRIES = 20_000_000
+
+
+class SpatialSupportLimitExceeded(ValueError):
+    """Exact support accounting reached the caller's configured entry budget."""
 
 
 class SpatialCorrelationCancelled(RuntimeError):
@@ -90,6 +94,7 @@ def compute_motion_surface(
     transverse_mode="sum", source_mask=None, receiver_mask=None, cell_ids=None,
     lineage_ids=None, exclude_same_cell=True, exclude_related_lineage=False,
     min_pairs=2, progress=None, cancelled=None, pair_search="auto",
+    max_support_entries=DEFAULT_MAX_SUPPORT_ENTRIES,
 ):
     """Compute motion versus directed origin lag and pair separation.
 
@@ -159,12 +164,20 @@ def compute_motion_surface(
     retain distinct contributing receiver origins and cell IDs per occupied bin,
     so their memory scales with unique support, not pair multiplicity. Work still
     scales with accepted neighbor pairs and unique support. At most 100,000 surface bins
-    and 2,000,000 bin-component entries are allowed. A 2,000,000-entry limit on
-    combined support sets raises a clear error before those sets grow further.
+    and 2,000,000 bin-component entries are allowed. ``max_support_entries``
+    limits the combined source-cell, receiver-cell and receiver-origin set
+    memberships across all bins in this call (default 20,000,000; 0 = unlimited).
+    The same identity in several bins counts separately. This is an entry budget,
+    not a measurement of available RAM; concurrent calls each have their own
+    budget. Reaching it raises SpatialSupportLimitExceeded without truncating
+    support or returning a partial surface. Changing it does not change estimates.
     ``progress`` receives strings;
     ``cancelled`` is a predicate or event and raises SpatialCorrelationCancelled.
     """
     _check_cancelled(cancelled)
+    if (isinstance(max_support_entries, (bool, np.bool_))
+            or not isinstance(max_support_entries, (int, np.integer)) or max_support_entries < 0):
+        raise ValueError("max_support_entries must be a nonnegative integer (0 = unlimited)")
     if pair_search not in {"auto", "spatial_index", "brute_force"}:
         raise ValueError("pair_search must be auto, spatial_index or brute_force")
     radial = method in {"radial_response", "relative_radial"}
@@ -300,8 +313,12 @@ def compute_motion_surface(
         nonlocal support_entries
         members = mapping.setdefault(int(ibin), set())
         additions = {int(x) for x in identities}.difference(members)
-        if support_entries + len(additions) > _MAX_SUPPORT_ENTRIES:
-            raise ValueError("Spatial support membership limit exceeded; use fewer bins or a smaller observation scope")
+        required = support_entries + len(additions)
+        if max_support_entries and required > max_support_entries:
+            raise SpatialSupportLimitExceeded(
+                f"Spatial support membership limit exceeded: at least {required:,} combined "
+                f"bin memberships needed; configured limit {max_support_entries:,} per surface. "
+                "Increase max_support_entries or set it to 0 for unlimited support accounting")
         members.update(additions)
         support_entries += len(additions)
 

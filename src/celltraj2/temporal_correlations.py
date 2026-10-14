@@ -99,7 +99,7 @@ def _references(values, order, offsets, centering, cancelled, batch_size):
 def compute_temporal_curve(
     runs, times, *, lag_edges, method="autocorrelation", feature_a=None,
     feature_b=None, positions=None, normalization="coefficient", centering="roi",
-    min_pairs=2, progress=None, cancelled=None,
+    min_pairs=2, progress=None, cancelled=None, mi_options=None,
 ):
     """Compute a pooled finite-endpoint curve without materializing all pairs.
 
@@ -138,6 +138,11 @@ def compute_temporal_curve(
     Position units/calibration and selected components are the caller's choice.
     Zero displacement is valid; no unit-direction normalization is applied.
 
+    ``method='mutual_information'`` dispatches scalar A/B inputs to
+    ``compute_delayed_mutual_information``. Its explicit feature kinds, nearest
+    neighbor count, nats/bits, seed, optional circular null and storage budget
+    are passed in ``mi_options``. Correlation normalization/centering are unused.
+
     ``track_counts`` counts contributing supplied runs, not unique physical
     lineages or experimental replicates. Counts remain available when a value
     is masked by ``min_pairs``. Optional ``progress`` receives strings and
@@ -145,6 +150,11 @@ def compute_temporal_curve(
     :class:`TemporalCorrelationCancelled`. Scratch pair memory is bounded by a
     target chunk, while work scales with candidate pairs inside the lag range.
     """
+    if method == "mutual_information":
+        from .mutual_information import compute_delayed_mutual_information
+        return compute_delayed_mutual_information(
+            runs, times, lag_edges=lag_edges, feature_a=feature_a, feature_b=feature_b,
+            min_pairs=min_pairs, progress=progress, cancelled=cancelled, **(mi_options or {}))
     _check_cancelled(cancelled)
     if method not in {"msd", "autocorrelation", "crosscorrelation"}:
         raise ValueError("Unknown temporal method")
