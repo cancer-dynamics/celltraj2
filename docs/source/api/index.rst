@@ -10,6 +10,7 @@ API Reference
    boundaries
    boundary_batch
    boundary_features
+   boundary_drift
    batch
    features
    feature_extraction
