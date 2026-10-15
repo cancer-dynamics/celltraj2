@@ -58,6 +58,7 @@ class TrackingFileJob:
     ot_method: str | None = None
     score_ot_method: str | None = None
     winner_ot_method: str | None = None
+    winner_cost_prealign: str | None = None
     sinkhorn_regularization: float = 0.05
     unbalanced_reach: float = 2.0
     partial_mass: float = 0.9
@@ -126,6 +127,9 @@ class TrackingFileJob:
                 "winner_ot_method must be emd, sinkhorn, unbalanced, or partial"
             )
         max_boundary_points_value = payload.get("max_boundary_points", 512)
+        winner_cost_prealign = payload.get("winner_cost_prealign") or None
+        if winner_cost_prealign not in {None, "none", "centroid", "cell_centroid"}:
+            raise ValueError("winner_cost_prealign must be none, centroid, or cell_centroid")
         return cls(
             h5_path=Path(path_value),
             object_set=object_set,
@@ -156,6 +160,7 @@ class TrackingFileJob:
             ot_method=legacy_ot_method,
             score_ot_method=score_ot_method,
             winner_ot_method=winner_ot_method,
+            winner_cost_prealign=winner_cost_prealign,
             sinkhorn_regularization=float(payload.get("sinkhorn_regularization", 0.05)),
             unbalanced_reach=float(payload.get("unbalanced_reach", 2.0)),
             partial_mass=float(payload.get("partial_mass", 0.9)),
@@ -304,6 +309,10 @@ def run_batch_tracking(
                     file_job.winner_ot_method or file_job.ot_method or "unbalanced"
                     if file_job.method == "minimum_registered_boundary_ot_cost" else None
                 ),
+                "winner_cost_prealign": (
+                    file_job.cost_prealign if file_job.winner_cost_prealign is None
+                    else file_job.winner_cost_prealign
+                ),
                 "max_boundary_points": (
                     file_job.max_boundary_points
                     if file_job.method == "minimum_registered_boundary_ot_cost" else None
@@ -410,6 +419,7 @@ def _run_file_job(
                 ot_method=file_job.ot_method,
                 score_ot_method=file_job.score_ot_method,
                 winner_ot_method=file_job.winner_ot_method,
+                winner_cost_prealign=file_job.winner_cost_prealign,
                 sinkhorn_regularization=file_job.sinkhorn_regularization,
                 unbalanced_reach=file_job.unbalanced_reach,
                 partial_mass=file_job.partial_mass,

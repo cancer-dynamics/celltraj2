@@ -219,6 +219,7 @@ def run_batch_surface_motion(
                 "event": "file_started",
                 "registration_set": file_job.registration_set,
                 "ot_method": file_job.ot_method,
+                "cost_prealign": file_job.cost_prealign,
                 "max_boundary_points": file_job.max_boundary_points,
             }
         )
@@ -280,6 +281,7 @@ def _run_surface_motion_file(
             return None
         selected_registration = file_job.registration_set or trajectory.store.active_registration_name()
         dependency_paths = [
+            f"/object_sets/{file_job.object_set}/observations",
             f"/object_sets/{file_job.object_set}/tracks/{file_job.track_set}",
             f"/boundaries/{file_job.boundary_set}",
             f"/boundaries/{file_job.boundary_set}/motion/{file_job.motion_set}",

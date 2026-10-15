@@ -65,7 +65,9 @@ density plus explicit weights is the invariant that matters.
 
 ### Robust unbalanced transport
 
-`unbalanced` is the recommended mode. For source mass `a`, target mass `b`,
+`unbalanced` permits unmatched mass, but its uncentered cost can substantially
+attenuate coherent cell translation. It is the current default winner method,
+not a guarantee of material-motion recovery. For source mass `a`, target mass `b`,
 distance matrix `C`, and plan `pi`, it minimizes
 
 ```text
@@ -143,8 +145,31 @@ frame blocks and registered once in memory. Candidate scoring retains the dense
 solver result only long enough to identify the best parent. Numerical edge
 sparsification, distance quantiles, and point-level motion summaries are
 materialized only for that winning link, and only when accepted boundary motion
-is requested. If the score and winner methods differ, the winning pair is
-solved again with the winner method before that materialization.
+is requested. If the score and winner methods or alignments differ, the winning
+pair is resampled as needed and solved again before that materialization.
+
+`winner_cost_prealign='cell_centroid'` centers both surfaces on their registered
+observation centroids **before** common-density weighted sampling and matching.
+`'none'` uses registered positions. Candidate `cost_prealign` is independent.
+Omitting winner alignment inherits the candidate value for old recipe replay;
+`'centroid'` retains legacy sampled-boundary centering after sampling.
+Independent surface motion selects these modes with `cost_prealign`.
+Fresh SITE Track configurations explicitly choose `cell_centroid` for winner
+and independent motion, retaining unaligned EMD candidate scores. API omission
+and existing saved configurations retain legacy behavior.
+Both Track motion panels offer an aligned weighted unbalanced preset and an
+unaligned weighted balanced EMD preset. The latter had the best tested unaligned
+recovery, but still forces outlier matches. Presets set the existing solver and
+alignment controls together; custom combinations remain available.
+
+Full saved vectors always use registered target minus registered source,
+including translation. Motion links store the exact `source_cost_origin_zyx`,
+`target_cost_origin_zyx`, and `sampling_voxel_spacing` (zero for no thinning).
+Schemas identify cost/sampling coordinate frames and represented-point weights.
+`max_transport_distance` and stored edge costs/quantiles refer to **cost
+coordinates**: residual shape mismatch for aligned plans, full registered
+distance for unaligned plans. Alignment is a translation prior, not a post-hoc
+correction forcing the mean boundary vector to match the centroid vector.
 
 For surface motion along an already accepted object link, low coverage or a
 winner-solver convergence warning does not delete or change the object link.
@@ -222,6 +247,27 @@ to work; new readers should prefer the point summaries.
 
 ## Visualization and features
 
+New motion calculations add a `centroid_motion_diagnostics` schema block and
+per-link centroid/boundary mean vectors, recovery, cosine, vector disagreement,
+supported fraction and validity. Recovery is the component of the mean boundary
+vector along the registered observation-centroid displacement, divided by that
+centroid displacement magnitude. The mean uses represented-point mass among
+finite, quality-valid points with matched fraction >=0.5. Ratios exclude
+branches/merges, nonconverged links, unsupported motion and centroid shifts below
+0.25 registered distance units. Missing ratios are NaN. The schema records
+units, thresholds and a digest of registered centroid inputs; a summary is
+emitted during both motion calculation workflows. These additive fields do
+not alter transport vectors or link acceptance. Surface and volume centroids
+can differ during deformation, so agreement is not a material-accuracy test.
+
+The 2026-10-14 synthetic comparison in sitelab's
+`docs/boundary_transport_policy.md` supports cell-centroid-centered winner cost
+and weighted spatial sampling. It recovers about 98% of known segmented-scene
+drift versus 28% with the uncentered unbalanced recipe. Equal-count sampling
+alone does not solve attenuation, and uniform equal-count weights can bias the
+surface measure. This policy is now the default for fresh SITE configurations;
+existing recipes keep their previous behavior.
+
 SITE displays one barycentric arrow per sampled source point, filters it by
 minimum confidence, and applies the vector budget after confidence ranking.
 The raw-edge display is an explicit debug option. Boundary coloring by mapped
@@ -241,8 +287,9 @@ registered data:
 
 1. Set boundary-library `point_spacing` from the smallest meaningful surface
    detail.
-2. Set `max_transport_distance` from the largest physically plausible
-   frame-to-frame surface displacement after global registration.
+2. Set `max_transport_distance` from the largest plausible residual shape
+   mismatch after centering for aligned plans, or surface displacement after
+   global registration for unaligned plans.
 3. Start transport blur near a fraction of the boundary spacing; increase it
    for noisier sampling and decrease it for sharper correspondences.
 4. Sweep unmatched reach and inspect source/target coverage together with

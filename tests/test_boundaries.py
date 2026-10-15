@@ -790,6 +790,8 @@ class BoundaryLibraryTests(unittest.TestCase):
                 )
                 self.assertIsNotNone(split_tracking.motion_result)
                 assert split_tracking.motion_result is not None
+                self.assertIn('centroid_motion_recovery', split_tracking.motion_result.links.dtype.names)
+                self.assertEqual(split_tracking.motion_result.schema['centroid_motion_diagnostics']['summary']['comparison_link_count'], 1)
                 self.assertEqual(
                     split_tracking.motion_result.schema["ot_method_requested"],
                     "unbalanced",
@@ -819,6 +821,8 @@ class BoundaryLibraryTests(unittest.TestCase):
                     "interaction_domain", "centroid_surface_ot"
                 )
                 self.assertEqual(stored["links"].shape[0], 1)
+                self.assertIn('centroid_motion_recovery', stored['links'].dtype.names)
+                self.np.testing.assert_allclose(stored['links']['centroid_displacement_zyx'], [[0, 0, 1]])
                 self.assertEqual(stored["schema"]["schema"], "celltraj2.boundary_motion.v2")
                 self.assertIn("source_summary", stored["point_summaries"])
                 source_summary = stored["point_summaries"]["source_summary"]
@@ -853,6 +857,7 @@ class BoundaryLibraryTests(unittest.TestCase):
             self.assertTrue(
                 any(event.get("event") == "surface_motion_link_summary" for event in motion_events)
             )
+            self.assertTrue(any(event.get('event') == 'boundary_motion_diagnostics' for event in motion_events))
             with Trajectory(path, mode="r") as trajectory:
                 self.assertNotIn("dry_motion", trajectory.boundary_library("interaction_domain").motion_sets())
 

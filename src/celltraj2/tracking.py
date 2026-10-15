@@ -607,31 +607,83 @@ def _transport_pair_samples(
 ) -> dict[str, Any]:
     from celltraj2.boundaries import common_density_point_samples
 
+    source_coordinates = np.asarray(source_points["registered"], dtype=float)
+    target_coordinates = np.asarray(target_points["registered"], dtype=float)
+    source_origin = np.zeros(3)
+    target_origin = np.zeros(3)
+    if cost_prealign == "cell_centroid":
+        # Center BEFORE sampling: a rigid translation must not move the surface
+        # through a fixed voxel grid and change its representative point masses.
+        for points in (source_points, target_points):
+            center = np.asarray(points.get("cell_centroid"), dtype=float)
+            if center.shape != (3,) or not np.all(np.isfinite(center)):
+                raise ValueError("cell_centroid alignment requires finite registered observation centroids")
+        source_origin = np.asarray(source_points["cell_centroid"], dtype=float)
+        target_origin = np.asarray(target_points["cell_centroid"], dtype=float)
+        source_coordinates = source_coordinates - source_origin
+        target_coordinates = target_coordinates - target_origin
+    elif cost_prealign not in {"none", "centroid"}:
+        raise ValueError("cost_prealign must be 'none', 'centroid', or 'cell_centroid'")
     source_sample, target_sample = common_density_point_samples(
-        source_points["registered"],
-        target_points["registered"],
+        source_coordinates,
+        target_coordinates,
         max_boundary_points,
         mass_mode=mass_mode,  # type: ignore[arg-type]
         point_measure=point_measure,
     )
-    source_cost = np.asarray(source_points["registered"][source_sample.rows], dtype=float)
-    target_cost = np.asarray(target_points["registered"][target_sample.rows], dtype=float)
+    source_cost = source_coordinates[source_sample.rows]
+    target_cost = target_coordinates[target_sample.rows]
     if cost_prealign == "centroid":
-        source_cost = source_cost - np.average(
+        source_origin = np.average(
             source_cost, axis=0, weights=source_sample.weights
         )
-        target_cost = target_cost - np.average(
+        target_origin = np.average(
             target_cost, axis=0, weights=target_sample.weights
         )
-    elif cost_prealign != "none":
-        raise ValueError("cost_prealign must be 'none' or 'centroid'")
+        source_cost = source_cost - source_origin
+        target_cost = target_cost - target_origin
     return {
         "source": source_sample,
         "target": target_sample,
         "source_cost": source_cost,
         "target_cost": target_cost,
+        "source_cost_origin_zyx": source_origin,
+        "target_cost_origin_zyx": target_origin,
         "voxel_spacing": max(source_sample.voxel_spacing, target_sample.voxel_spacing),
     }
+
+
+def _transport_coordinate_schema(cost_prealign: str) -> dict[str, Any]:
+    if cost_prealign not in {"none", "centroid", "cell_centroid"}:
+        raise ValueError("cost_prealign must be 'none', 'centroid', or 'cell_centroid'")
+    return {
+        "cost_prealign": cost_prealign,
+        "cost_coordinate_system": {
+            "none": "registered_roi_physical",
+            "centroid": "sampled_boundary_centroid_relative",
+            "cell_centroid": "registered_observation_centroid_relative",
+        }[cost_prealign],
+        "sampling_coordinate_system": (
+            "registered_observation_centroid_relative" if cost_prealign == "cell_centroid"
+            else "registered_roi_physical"
+        ),
+        "max_transport_distance_applies_to": "cost_coordinates",
+        "sampling_weights": "represented_canonical_point_count",
+    }
+
+
+def _motion_sampling_provenance(links: Any, pairs: list[Mapping[str, Any]], *, np: Any) -> Any:
+    """Persist exact sampling spacing and cost origins without changing base link tuples."""
+    fields = [("source_cost_origin_zyx", "<f8", (3,)),
+              ("target_cost_origin_zyx", "<f8", (3,)), ("sampling_voxel_spacing", "<f8")]
+    result = np.empty(links.shape, dtype=np.dtype(links.dtype.descr + fields))
+    for name in links.dtype.names:
+        result[name] = links[name]
+    for row, pair in enumerate(pairs):
+        result["source_cost_origin_zyx"][row] = pair.get("source_cost_origin_zyx", np.full(3, np.nan))
+        result["target_cost_origin_zyx"][row] = pair.get("target_cost_origin_zyx", np.full(3, np.nan))
+        result["sampling_voxel_spacing"][row] = pair.get("voxel_spacing", np.nan)
+    return result
 
 
 def _centroid_knn_candidates(
@@ -937,6 +989,12 @@ def compute_boundary_motion(
         ),
     }
 
+    from celltraj2.motion_diagnostics import registered_centroid_lookup
+    observation_centroids = registered_centroid_lookup(
+        trajectory.store.read_observations(object_name), scale, registration
+    )
+    _transport_coordinate_schema(cost_prealign)  # Validate even for an empty graph.
+    pair_provenance: list[dict[str, Any]] = []
     point_cache: dict[int, dict[str, Any]] = {}
 
     def registered_entity_points(entity_id: int) -> dict[str, Any]:
@@ -990,6 +1048,8 @@ def compute_boundary_motion(
         child_entity_id = entity_by_observation[child_observation_id]
         parent_points = registered_entity_points(parent_entity_id)
         child_points = registered_entity_points(child_entity_id)
+        parent_points["cell_centroid"] = observation_centroids.get(parent_observation_id)
+        child_points["cell_centroid"] = observation_centroids.get(child_observation_id)
         if not parent_points["native"].shape[0] or not child_points["native"].shape[0]:
             raise ValueError(
                 f"Track link {parent_observation_id}->{child_observation_id} has an empty boundary"
@@ -1019,6 +1079,9 @@ def compute_boundary_motion(
             relative_mass_tolerance=relative_mass_tolerance,
             retained_mass_fraction=retained_mass_fraction,
         )
+        pair_provenance.append({key: pair[key] for key in (
+            "source_cost_origin_zyx", "target_cost_origin_zyx", "voxel_spacing"
+        ) if key in pair})
         selected_methods.add(str(plan.method))
         source_local = pair["source"].rows[plan.source_rows]
         target_local = pair["target"].rows[plan.target_rows]
@@ -1188,7 +1251,7 @@ def compute_boundary_motion(
         "relative_mass_tolerance": float(relative_mass_tolerance),
         "retained_mass_fraction": float(retained_mass_fraction),
         "mass_mode": str(mass_mode),
-        "cost_prealign": str(cost_prealign),
+        **_transport_coordinate_schema(cost_prealign),
         "max_boundary_points": max_boundary_points,
         "sampling": {
             "method": "shared_physical_voxel_grid",
@@ -1211,6 +1274,15 @@ def compute_boundary_motion(
         "metadata": dict(metadata or {}),
     }
     links = np.asarray(motion_links, dtype=boundary_motion_link_dtype())
+    links = _motion_sampling_provenance(links, pair_provenance, np=np)
+    from celltraj2.motion_diagnostics import add_centroid_motion_diagnostics
+    links, schema["centroid_motion_diagnostics"], diagnostic_event = add_centroid_motion_diagnostics(
+        links, point_summaries["source_summary"],
+        observation_centroids,
+        graph.links, distance_unit=str(boundary.schema.get("distance_unit") or "scaled_coordinate_unit"),
+    )
+    if progress is not None:
+        progress(diagnostic_event)
     motion_path = None
     if save_outputs:
         motion_path = trajectory.store.write_boundary_motion(
@@ -1254,6 +1326,7 @@ def track_minimum_boundary_ot_cost(
     ot_method: str | None = None,
     score_ot_method: str | None = None,
     winner_ot_method: str | None = None,
+    winner_cost_prealign: str | None = None,
     sinkhorn_regularization: float = 0.05,
     unbalanced_reach: float = 2.0,
     partial_mass: float = 0.9,
@@ -1280,6 +1353,14 @@ def track_minimum_boundary_ot_cost(
     preceding local frame. Point identities and stored boundary coordinates
     remain native; only the cost and displacement calculations use the selected
     registration.
+
+    ``cost_prealign`` controls candidate scoring. ``winner_cost_prealign``
+    independently controls saved motion: ``cell_centroid`` centers on registered
+    observation centroids before weighted spatial sampling; ``none`` matches
+    registered positions. Omission inherits the candidate setting for legacy
+    replay. ``centroid`` retains the older sampled-boundary centering behavior.
+    Match-distance limits apply in cost coordinates; saved vectors are always
+    full registered physical displacements.
     """
 
     from celltraj2.boundaries import (
@@ -1309,6 +1390,9 @@ def track_minimum_boundary_ot_cost(
         raise ValueError("ot_cost_cutoff must be > 0 and may be infinity")
     candidate_ot_method = str(score_ot_method or ot_method or "emd").lower()
     accepted_winner_ot_method = str(winner_ot_method or ot_method or "unbalanced").lower()
+    accepted_winner_prealign = cost_prealign if winner_cost_prealign is None else winner_cost_prealign
+    _transport_coordinate_schema(cost_prealign)
+    _transport_coordinate_schema(accepted_winner_prealign)
     valid_ot_methods = {"emd", "sinkhorn", "unbalanced", "partial"}
     if candidate_ot_method not in valid_ot_methods:
         raise ValueError(
@@ -1576,6 +1660,7 @@ def track_minimum_boundary_ot_cost(
             child_observation_id = child_row + 1
             child_entity_id = entity_by_observation[child_observation_id]
             child_points = registered_entity_points(child_entity_id, frame)
+            child_points["cell_centroid"] = centroids[child_row]
             if not child_points["native"].shape[0]:
                 continue
             best: dict[str, Any] | None = None
@@ -1583,6 +1668,7 @@ def track_minimum_boundary_ot_cost(
                 parent_observation_id = parent_row + 1
                 parent_entity_id = entity_by_observation[parent_observation_id]
                 parent_points = registered_entity_points(parent_entity_id, frame - 1)
+                parent_points["cell_centroid"] = centroids[parent_row]
                 if not parent_points["native"].shape[0]:
                     continue
                 pair = _transport_pair_samples(
@@ -1649,8 +1735,15 @@ def track_minimum_boundary_ot_cost(
             )
             if save_motion and boundary_set is not None:
                 winner_score = best_score
-                if accepted_winner_ot_method != candidate_ot_method:
-                    pair = best["pair"]
+                pair = best["pair"]
+                if accepted_winner_prealign != cost_prealign:
+                    pair = _transport_pair_samples(
+                        best["parent_points"], best["child_points"],
+                        max_boundary_points=max_boundary_points, mass_mode=mass_mode,
+                        point_measure=point_measure, cost_prealign=accepted_winner_prealign, np=np,
+                    )
+                if (accepted_winner_ot_method != candidate_ot_method
+                        or accepted_winner_prealign != cost_prealign):
                     winner_score = _optimal_transport_score(
                         pair["source_cost"],
                         pair["target_cost"],
@@ -1672,7 +1765,6 @@ def track_minimum_boundary_ot_cost(
                     relative_mass_tolerance=relative_mass_tolerance,
                     retained_mass_fraction=retained_mass_fraction,
                 )
-                pair = best["pair"]
                 parent_points = best["parent_points"]
                 child_points = best["child_points"]
                 accepted_plans.append(
@@ -1684,6 +1776,9 @@ def track_minimum_boundary_ot_cost(
                         "child_observation_id": best["child_observation_id"],
                         "child_entity_id": best["child_entity_id"],
                         "plan": plan,
+                        "sampling_provenance": {key: pair[key] for key in (
+                            "source_cost_origin_zyx", "target_cost_origin_zyx", "voxel_spacing"
+                        ) if key in pair},
                         "quality_flags": (
                             (1 if float(winner_score.source_coverage) < float(min_source_coverage) else 0)
                             | (2 if float(winner_score.target_coverage) < float(min_target_coverage) else 0)
@@ -1753,6 +1848,7 @@ def track_minimum_boundary_ot_cost(
         "winner_ot_method_requested": accepted_winner_ot_method,
         "candidate_scoring": {
             "ot_method_requested": candidate_ot_method,
+            **_transport_coordinate_schema(cost_prealign),
             "determines": ["parent_ranking", "track_link_ot_cost", "ot_cost_cutoff"],
             "max_transport_distance": (
                 None
@@ -1767,6 +1863,8 @@ def track_minimum_boundary_ot_cost(
         },
         "winner_motion": {
             "ot_method_requested": accepted_winner_ot_method,
+            **_transport_coordinate_schema(accepted_winner_prealign),
+            "cost_prealign_inherited": winner_cost_prealign is None,
             "enabled": bool(save_motion and boundary_set is not None),
             "executed_plan_count": len(accepted_plans),
             "affects_track_selection": False,
@@ -1853,6 +1951,8 @@ def track_minimum_boundary_ot_cost(
             boundary_name=boundary_name,
             motion_name=motion_name,
             observations=observations,
+            centroids=centroids,
+            track_links=links,
             accepted_plans=accepted_plans,
             boundary_dependency=boundary_dependency,
             registration_dependency=registration_dependency,
@@ -1860,6 +1960,7 @@ def track_minimum_boundary_ot_cost(
             max_boundary_points=max_boundary_points,
             transport_settings={
                 "ot_method_requested": accepted_winner_ot_method,
+                "distance_unit": distance_unit,
                 "solver": dict(schema["solver"]),
                 "sinkhorn_regularization": float(sinkhorn_regularization),
                 "unbalanced_reach": float(unbalanced_reach),
@@ -1878,12 +1979,15 @@ def track_minimum_boundary_ot_cost(
                 "relative_mass_tolerance": float(relative_mass_tolerance),
                 "retained_mass_fraction": float(retained_mass_fraction),
                 "mass_mode": str(mass_mode),
-                "cost_prealign": str(cost_prealign),
+                **_transport_coordinate_schema(accepted_winner_prealign),
                 "sampling": dict(schema["sampling"]),
             },
             frame_counts=frame_counts,
             np=np,
         )
+        if progress is not None:
+            progress({"event": "boundary_motion_diagnostics",
+                      **motion_result.schema["centroid_motion_diagnostics"]["summary"]})
     run_name = validate_name(run_id or default_tracking_run_id(), kind="tracking run")
     if save_outputs:
         track_path = trajectory.store.write_track_graph(
@@ -1922,6 +2026,8 @@ def track_minimum_boundary_ot_cost(
             "candidate_k": centroid_candidate_k,
             "score_ot_method": candidate_ot_method,
             "winner_ot_method": accepted_winner_ot_method,
+            "cost_prealign": cost_prealign,
+            "winner_cost_prealign": accepted_winner_prealign,
             "ot_cost_cutoff": None if not np.isfinite(ot_cutoff) else ot_cutoff,
             "distance_unit": distance_unit,
             "registration_dependency": registration_dependency,
@@ -1968,6 +2074,8 @@ def _tracking_motion_from_plans(
     boundary_name: str,
     motion_name: str,
     observations: Any,
+    centroids: Any,
+    track_links: Any,
     accepted_plans: list[dict[str, Any]],
     boundary_dependency: Mapping[str, Any],
     registration_dependency: Mapping[str, Any] | None,
@@ -2094,12 +2202,22 @@ def _tracking_motion_from_plans(
         },
         "transport_edge_count": int(transport_start),
     }
+    from celltraj2.motion_diagnostics import add_centroid_motion_diagnostics
+    motion_link_array = _motion_sampling_provenance(
+        np.asarray(motion_links, dtype=boundary_motion_link_dtype()),
+        [accepted.get("sampling_provenance", {}) for accepted in accepted_plans], np=np,
+    )
+    motion_link_array, motion_schema["centroid_motion_diagnostics"], _ = add_centroid_motion_diagnostics(
+        motion_link_array, point_summaries["source_summary"],
+        {int(oid): point for oid, point in zip(observations["observation_id"], centroids)}, track_links,
+        distance_unit=str(transport_settings.get("distance_unit") or "scaled_coordinate_unit"),
+    )
     return BoundaryMotionResult(
         object_set=object_name,
         track_set=track_name,
         boundary_set=boundary_name,
         motion_set=motion_name,
-        links=np.asarray(motion_links, dtype=boundary_motion_link_dtype()),
+        links=motion_link_array,
         transport=transport,
         point_summaries=point_summaries,
         schema=motion_schema,
