@@ -1,5 +1,33 @@
 # SITE Handoff
 
+## 2026-10-22 State partition domains and compact kinetic binding v2
+
+`celltraj2.state_coordinates.PartitionDomain` adds immutable partition-qualified
+cluster rows without treating them as snapshot observations. The new
+`site.kinetic_model_binding.v2` contract references compact PairSet, assignment,
+operator, assessment and vocabulary artifacts. Legacy v1 serialization retains
+its original fields; BiologyRelease v1/v2/v3 remain readable, and unknown nested
+kinetic schemas are rejected explicitly.
+
+Sitelab D3–D5 now owns partition fit/apply/grouping, sparse directed operators,
+training-aware assessment, H/T descriptors and compact runtime export. Shared
+State definitions/static fits can cover Boolean taxonomy subsets with H5 and
+treatment restrictions; each kinetic binding and dynamic descendant remains
+scoped to one exact Type leaf. Biological many-to-one class mappings require
+numerical count aggregation before kinetic release. Unsupported source rows and
+propagated probability mass remain explicit rather than silently normalized.
+
+Release candidates remain separate from publication. Frozen exports support
+known observation lookup and supported state-probability propagation without
+source H5s; they do not imply new-dataset inference, H5 materialization, source
+freshness checks or recomputation of assessments. See the sitelab
+`docs/cell_state_checkpoint_d35.md` delivery guide for the full workflow.
+
+Validation: 68 celltraj2 interpretation/contract/pair/supervision/event tests
+passed; sitelab's complete State suite ran 415 tests with one skip and no failures.
+Additional Type/classification regression and synthetic frozen-consumer checks
+passed. No real project data was modified or release published/materialized.
+
 ## 2026-10-13 State/event surfaces and delayed mutual information
 
 `celltraj2.state_correlations.compute_state_surface` adds ROI-local State,

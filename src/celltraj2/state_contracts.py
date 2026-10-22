@@ -20,6 +20,7 @@ from celltraj2.interpretation import (
 STATE_MEMBERSHIP_SCHEMA = "site.state_membership.v1"
 STATE_COMPONENT_BINDING_SCHEMA = "site.state_component_binding.v1"
 KINETIC_MODEL_BINDING_SCHEMA = "site.kinetic_model_binding.v1"
+KINETIC_MODEL_BINDING_V2_SCHEMA = "site.kinetic_model_binding.v2"
 STATE_DEPENDENCY_SCHEMA = "site.state_dependency.v1"
 BIOLOGY_RELEASE_V2_SCHEMA = "site.biology_release.v2"
 BIOLOGY_RELEASE_V3_SCHEMA = "site.biology_release.v3"
@@ -340,13 +341,18 @@ class KineticModelBinding:
     assessment_id: str | None = None
     dependencies: tuple[StateDependency, ...] = ()
     schema: str = KINETIC_MODEL_BINDING_SCHEMA
+    pair_set_id: str | None = None
+    assignment_id: str | None = None
+    pair_set_digest: str | None = None
+    assignment_digest: str | None = None
+    vocabulary: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         for name in ("binding_id", "state_binding_id", "leaf_type_id", "partition_id",
                      "score_mapping_id", "operator_id", "flux_id", "assessment_id"):
             if getattr(self, name) is not None:
                 object.__setattr__(self, name, _uuid_text(getattr(self, name), field_name=name))
-        if self.schema != KINETIC_MODEL_BINDING_SCHEMA:
+        if self.schema not in {KINETIC_MODEL_BINDING_SCHEMA, KINETIC_MODEL_BINDING_V2_SCHEMA}:
             raise ValueError(f"Unsupported kinetic binding schema {self.schema!r}")
         observations = tuple(sorted(_keys(self.observation_cohort, "observation_cohort")))
         if not observations:
@@ -360,11 +366,27 @@ class KineticModelBinding:
         object.__setattr__(self, "dependencies", _dependencies(self.dependencies))
         if self.timebase.get("unit") not in {"s", "ms", "min", "h"} or not self.timebase.get("source"):
             raise ValueError("Kinetics require a declared physical timebase unit and source")
-        expected = kinetic_cohort_digest(self.leaf_type_id, observations,
-                                         self.window_ids, self.pair_ids, self.timebase)
+        if self.schema == KINETIC_MODEL_BINDING_V2_SCHEMA:
+            if self.window_ids or self.pair_ids:
+                raise ValueError('Compact kinetic bindings use PairSets, not individual window/pair records')
+            for name in ('pair_set_id', 'assignment_id', 'operator_id', 'assessment_id', 'partition_id'):
+                object.__setattr__(self, name, _uuid_text(getattr(self, name), field_name=name))
+            for name in ('pair_set_digest', 'assignment_digest'):
+                _digest(getattr(self, name), name)
+            ids = tuple(_uuid_text(value, field_name='vocabulary') for value in self.vocabulary)
+            if not ids or len(set(ids)) != len(ids):
+                raise ValueError('Compact kinetics require an ordered unique state vocabulary')
+            object.__setattr__(self, 'vocabulary', ids)
+            expected = compact_kinetic_cohort_digest(self.leaf_type_id, observations, self.pair_set_id,
+                self.assignment_id, self.timebase, ids)
+        else:
+            if self.pair_set_id or self.assignment_id or self.pair_set_digest or self.assignment_digest or self.vocabulary:
+                raise ValueError('Kinetic v1 cannot contain compact PairSet semantics')
+            expected = kinetic_cohort_digest(self.leaf_type_id, observations,
+                                             self.window_ids, self.pair_ids, self.timebase)
         if self.cohort_digest != expected:
             raise ValueError("cohort_digest does not match the exact leaf/cohort/timebase")
-        if (self.operator_id or self.flux_id) and not self.pair_ids:
+        if self.schema == KINETIC_MODEL_BINDING_SCHEMA and (self.operator_id or self.flux_id) and not self.pair_ids:
             raise ValueError("A kinetic operator/flux requires an explicit lag-pair cohort")
         if self.operator_id or self.flux_id:
             if not (self.partition_id or self.score_mapping_id) or not self.assessment_id:
@@ -373,7 +395,8 @@ class KineticModelBinding:
     def validate_context(self, taxonomy: TypeTaxonomy, membership: StateMembershipSpec,
                          exact_type_assignments: Mapping[ProjectObservationKey, str], *,
                          windows: Mapping[str, Mapping[str, Any]] | None = None,
-                         pairs: Mapping[str, Mapping[str, Any]] | None = None) -> None:
+                         pairs: Mapping[str, Mapping[str, Any]] | None = None,
+                         pair_sets: Mapping[str, Mapping[str, Any]] | None = None) -> None:
         """Check all admitted members, not only pair endpoints, against one leaf.
 
         Window records have ``anchor`` and ``members``. Pair records have
@@ -391,6 +414,17 @@ class KineticModelBinding:
             raise ValueError("Kinetic cohort escapes shared State membership")
         if any(exact_type_assignments.get(key) != self.leaf_type_id for key in cohort):
             raise ValueError("Kinetic cohort contains unresolved or mixed Type leaves")
+        if self.schema == KINETIC_MODEL_BINDING_V2_SCHEMA:
+            if pair_sets is None or self.pair_set_id not in pair_sets:
+                raise ValueError('Compact kinetic binding requires a validated PairSet context')
+            context = pair_sets[self.pair_set_id]
+            from .state_pairs import validate_pair_recipe
+            recipe = validate_pair_recipe(context['recipe'], taxonomy=taxonomy)
+            if (recipe['time_mode'] != 'physical' or recipe['exact_leaf_type_id'] != self.leaf_type_id
+                    or context.get('content_digest') != self.pair_set_digest
+                    or set(_keys(context['support_observations'], 'PairSet support')) != cohort):
+                raise ValueError('Compact kinetic PairSet scope, digest or complete support differs')
+            return
 
         def key(value: Any) -> ProjectObservationKey:
             return value if isinstance(value, ProjectObservationKey) else ProjectObservationKey.from_dict(value)
@@ -439,12 +473,16 @@ class KineticModelBinding:
     def artifact_ids(self) -> frozenset[str]:
         return frozenset(value for value in (
             self.partition_id, self.score_mapping_id, self.operator_id, self.flux_id,
-            self.assessment_id, *self.window_ids, *self.pair_ids,
+            self.assessment_id, self.pair_set_id, self.assignment_id, *self.window_ids, *self.pair_ids,
             *(dep.artifact_id for dep in self.dependencies),
         ) if value is not None)
 
     def to_dict(self) -> dict[str, Any]:
-        return _json_safe(self)
+        result = _json_safe(self)
+        if self.schema == KINETIC_MODEL_BINDING_SCHEMA:
+            for name in ('pair_set_id', 'assignment_id', 'pair_set_digest', 'assignment_digest', 'vocabulary'):
+                result.pop(name, None)
+        return result
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> KineticModelBinding:
@@ -460,6 +498,14 @@ def kinetic_cohort_digest(leaf_type_id: str, observation_cohort: Sequence[Projec
         "window_ids": sorted(window_ids), "pair_ids": sorted(pair_ids),
         "timebase": dict(timebase or {}),
     })
+
+
+def compact_kinetic_cohort_digest(leaf_type_id, observation_cohort, pair_set_id,
+                                  assignment_id, timebase, vocabulary):
+    return canonical_json_digest({'schema': KINETIC_MODEL_BINDING_V2_SCHEMA,
+        'leaf_type_id': leaf_type_id, 'observations': [k.to_dict() for k in sorted(observation_cohort)],
+        'pair_set_id': pair_set_id, 'assignment_id': assignment_id,
+        'timebase': dict(timebase), 'vocabulary': list(vocabulary)})
 
 
 def release_required_artifact_ids(release: Any) -> frozenset[str]:
@@ -556,7 +602,8 @@ def validate_release_dependency_closure(release: Any, artifact_digests: Mapping[
 def validate_release_state_context(release: Any, taxonomy: TypeTaxonomy,
                                    exact_type_assignments: Mapping[ProjectObservationKey, str], *,
                                    windows: Mapping[str, Mapping[str, Any]] | None = None,
-                                   pairs: Mapping[str, Mapping[str, Any]] | None = None) -> None:
+                                   pairs: Mapping[str, Mapping[str, Any]] | None = None,
+                                   pair_sets: Mapping[str, Mapping[str, Any]] | None = None) -> None:
     """Validate saved membership decisions and exact kinetic leaves before use.
 
     Callers provide *only valid assigned hard calls* from the pinned Type role;
@@ -577,4 +624,4 @@ def validate_release_state_context(release: Any, taxonomy: TypeTaxonomy,
             raise ValueError("Frozen membership contains an ineligible or unresolved Type assignment")
     for binding in release.kinetic_bindings:
         binding.validate_context(taxonomy, memberships[states[binding.state_binding_id].membership_id],
-                                 exact_type_assignments, windows=windows, pairs=pairs)
+                                 exact_type_assignments, windows=windows, pairs=pairs, pair_sets=pair_sets)

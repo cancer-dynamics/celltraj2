@@ -14,6 +14,49 @@ from .interpretation import _uuid_text, canonical_json_digest
 SAMPLE_DOMAIN_SCHEMA = 'site.state_sample_domain.v1'
 COORDINATE_SET_SCHEMA = 'site.state_coordinate_set.v1'
 REPRESENTATION_SCOPE_SCHEMA = 'site.state_representation_scope.v1'
+PARTITION_DOMAIN_SCHEMA = 'site.state_partition_domain.v1'
+
+
+@dataclass(frozen=True)
+class PartitionDomain:
+    """Rows of one immutable partition, never observation/snapshot identities."""
+
+    domain_id: str
+    partition_fit_id: str
+    cluster_ids: tuple[str, ...]
+    row_count: int
+    row_order_digest: str
+    domain_kind: str = 'partition'
+    schema: str = PARTITION_DOMAIN_SCHEMA
+
+    def __post_init__(self):
+        if self.schema != PARTITION_DOMAIN_SCHEMA or self.domain_kind != 'partition':
+            raise ValueError('Unsupported partition row-domain schema/kind')
+        object.__setattr__(self, 'partition_fit_id', _uuid_text(self.partition_fit_id, field_name='partition_fit_id'))
+        ids = tuple(_uuid_text(value, field_name='cluster_id') for value in self.cluster_ids)
+        if not ids or len(set(ids)) != len(ids):
+            raise ValueError('Partition rows require unique immutable cluster IDs')
+        object.__setattr__(self, 'cluster_ids', ids)
+        if isinstance(self.row_count, bool) or self.row_count != len(ids):
+            raise ValueError('Partition row count differs from its vocabulary')
+        if self.row_order_digest != canonical_json_digest(list(ids)):
+            raise ValueError('Partition row-order digest differs from its vocabulary')
+        if self.domain_id != canonical_json_digest({k: v for k, v in self.to_dict().items() if k != 'domain_id'}):
+            raise ValueError('Partition domain identity differs from its immutable rows')
+
+    def to_dict(self):
+        return {**vars(self), 'cluster_ids': list(self.cluster_ids)}
+
+    @classmethod
+    def create(cls, partition_fit_id, cluster_ids):
+        ids = list(cluster_ids)
+        seed = dict(partition_fit_id=partition_fit_id, cluster_ids=ids, row_count=len(ids),
+                    row_order_digest=canonical_json_digest(ids), domain_kind='partition', schema=PARTITION_DOMAIN_SCHEMA)
+        return cls(domain_id=canonical_json_digest(seed), **seed)
+
+    @classmethod
+    def from_dict(cls, data):
+        return cls(**dict(data))
 
 
 def _digest(value, name):
