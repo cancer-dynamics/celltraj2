@@ -43,6 +43,13 @@ the exact pending result into a compressed `.ct2commit.npz` bundle. The bundle
 contains JSON and NumPy arrays only, is read with `allow_pickle=false`, carries
 a SHA-256 digest, and records the H5 input revisions used by the calculation.
 
+Surface-motion workers stream their large result arrays to private H5 scratch
+storage during calculation. Their deferred bundle is a self-contained,
+compressed `.ct2commit.h5` file with the same JSON plan and numeric arrays.
+Bundle creation and retries copy arrays in bounded slices; retrying a locked H5
+does not reload the complete motion result into RAM. Existing NPZ bundles stay
+supported. Both formats retain the digest and input-revision checks.
+
 When SITE launched the worker, `defer_commit_plan` also appends a
 `deferred_h5_commit` job to the workstation queue named by
 `CELLTRAJ2_WORKFLOW_QUEUE_PATH`. It copies the SITE instance/workspace
@@ -93,6 +100,12 @@ Detailed frame starts, summaries, skip/failure state, lock waits, stale-commit
 retries, and backend output belong in the external job log and `events.jsonl`.
 This removes repeated progress-only mutations from the H5 and leaves the H5
 focused on canonical analysis results.
+
+Surface-motion link events include result-buffer bytes, scratch flush count,
+and boundary-cache bytes. Frame summaries emit as soon as all links targeting
+that frame finish. Storage events identify the scratch directory and configured
+buffer limits. These describe retained result/cache memory, not total process
+memory or the temporary pairwise matrices used inside an OT solver.
 
 Queued workers also check `CELLTRAJ2_CANCEL_PATH` after every structured
 progress event, including frame/slice summaries and periodic H5 wait events. A

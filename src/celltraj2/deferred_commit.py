@@ -1,6 +1,6 @@
 """Durable, safe deferred commit bundles for blocked canonical H5 files.
 
-Bundles contain JSON plus NumPy arrays in a compressed NPZ.  They never use
+Bundles contain JSON plus numeric arrays in compressed NPZ or streamed H5. They never use
 pickle, and commit execution is limited to the allow-listed store operations
 below.  This preserves an expensive calculation without cloning the source H5.
 """
@@ -20,6 +20,7 @@ from types import SimpleNamespace
 from typing import Any, Callable, Mapping
 
 from celltraj2.h5_access import H5AccessTimeout, file_lease, validate_revisions
+from celltraj2.array_stream import H5Array, copy_array, is_disk_array
 from celltraj2.schema import utc_now_iso
 from celltraj2.trajectory import Trajectory
 
@@ -36,6 +37,10 @@ class CommitOutcome:
     reason: str | None = None
     bundle_path: str | None = None
     queue_job_id: str | None = None
+    queued: bool = False
+    job_path: str | None = None
+    queue_path: str | None = None
+    queue_error: str | None = None
 
     @property
     def deferred(self) -> bool:
@@ -57,7 +62,7 @@ def _safe_name(value: Any, fallback: str) -> str:
 
 def _encode_value(value: Any, arrays: dict[str, Any]) -> Any:
     np = _require_numpy()
-    if isinstance(value, np.ndarray):
+    if isinstance(value, np.ndarray) or is_disk_array(value):
         key = f"array_{len(arrays):06d}"
         arrays[key] = value
         return {"__ndarray__": key}
@@ -109,13 +114,25 @@ def write_bundle(path: str | Path, plan: Mapping[str, Any]) -> tuple[Path, str]:
         "plan": _encode_value(dict(plan), arrays),
     }
     manifest_bytes = json.dumps(manifest, sort_keys=True).encode("utf-8")
+    streamed = any(is_disk_array(value) for value in arrays.values())
+    if streamed:
+        destination = destination.with_suffix(".h5")
     arrays["__manifest__"] = np.frombuffer(manifest_bytes, dtype=np.uint8)
     temporary = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.tmp")
     try:
-        with temporary.open("wb") as handle:
-            np.savez_compressed(handle, **arrays)
-            handle.flush()
-            os.fsync(handle.fileno())
+        if streamed:
+            import h5py
+            with h5py.File(temporary, "w") as h5:
+                for key, values in arrays.items():
+                    copy_array(h5, key, values)
+                h5.flush()
+            with temporary.open("rb+") as handle:
+                os.fsync(handle.fileno())
+        else:
+            with temporary.open("wb") as handle:
+                np.savez_compressed(handle, **arrays)
+                handle.flush()
+                os.fsync(handle.fileno())
         os.replace(temporary, destination)
     finally:
         if temporary.exists():
@@ -124,23 +141,30 @@ def write_bundle(path: str | Path, plan: Mapping[str, Any]) -> tuple[Path, str]:
 
 
 def read_bundle(path: str | Path, *, expected_sha256: str | None = None) -> dict[str, Any]:
-    """Read and validate a deferred commit bundle without enabling pickle."""
+    """Validate a bundle; streamed H5 arrays remain lazy through the commit."""
 
     np = _require_numpy()
     source = Path(path)
     if expected_sha256 and _sha256(source) != str(expected_sha256):
         raise ValueError(f"Deferred commit bundle digest mismatch: {source}")
-    with np.load(source, allow_pickle=False) as archive:
-        if "__manifest__" not in archive:
-            raise ValueError(f"Deferred commit bundle has no manifest: {source}")
-        manifest = json.loads(bytes(archive["__manifest__"].tolist()).decode("utf-8"))
-        if manifest.get("schema") != BUNDLE_SCHEMA:
-            raise ValueError(f"Unsupported deferred commit bundle schema: {manifest.get('schema')!r}")
-        arrays = {
-            str(key): archive[key].copy()
-            for key in archive.files
-            if str(key) != "__manifest__"
-        }
+    import h5py
+    if h5py.is_hdf5(source):
+        with h5py.File(source, "r") as archive:
+            manifest = json.loads(archive["__manifest__"][()].tobytes().decode("utf-8"))
+            arrays = {key: H5Array(source, key, dataset.shape, dataset.dtype)
+                      for key, dataset in archive.items() if key != "__manifest__"}
+    else:
+        with np.load(source, allow_pickle=False) as archive:
+            if "__manifest__" not in archive:
+                raise ValueError(f"Deferred commit bundle has no manifest: {source}")
+            manifest = json.loads(bytes(archive["__manifest__"].tolist()).decode("utf-8"))
+            arrays = {
+                str(key): archive[key].copy()
+                for key in archive.files
+                if str(key) != "__manifest__"
+            }
+    if manifest.get("schema") != BUNDLE_SCHEMA:
+        raise ValueError(f"Unsupported deferred commit bundle schema: {manifest.get('schema')!r}")
     plan = _decode_value(manifest.get("plan"), arrays)
     if not isinstance(plan, dict) or plan.get("schema") != PLAN_SCHEMA:
         raise ValueError("Deferred commit bundle contains an invalid commit plan")
@@ -337,13 +361,26 @@ def defer_commit_plan(
     retry_number: int = 1,
     bundle_path: str | Path | None = None,
     bundle_sha256: str | None = None,
+    queue_path: str | Path | None = None,
+    deferred_root: str | Path | None = None,
+    submitted_by: Mapping[str, Any] | None = None,
 ) -> CommitOutcome:
-    """Persist a plan and append a runnable deferred-commit queue record."""
+    """Persist a plan and append a runnable deferred-commit queue record.
+
+    Direct GUI callers pass their workspace context explicitly. Worker processes
+    may continue using the environment defaults without changing global state.
+    """
 
     emit = reporter or (lambda _event: None)
     payload = dict(plan)
     commit_id = f"h5_commit_{uuid.uuid4().hex[:12]}"
-    root = _deferred_root(payload)
+    root = _deferred_root(payload) if deferred_root is None else Path(deferred_root)
+    queue_path_value = queue_path if queue_path is not None else os.environ.get("CELLTRAJ2_WORKFLOW_QUEUE_PATH")
+    submission = dict(submitted_by) if submitted_by is not None else {
+        "instance_id": str(os.environ.get("SITELAB_INSTANCE_ID") or ""),
+        "workspace_id": str(os.environ.get("SITELAB_WORKSPACE_ID") or ""),
+        "instance_label": str(os.environ.get("SITELAB_INSTANCE_LABEL") or ""),
+    }
     job_dir = root / commit_id
     job_dir.mkdir(parents=True, exist_ok=True)
     if bundle_path is None:
@@ -360,6 +397,9 @@ def defer_commit_plan(
         "bundle_sha256": digest,
         "h5_path": str(payload["h5_path"]),
         "created_at": utc_now_iso(),
+        "queue_path": str(queue_path_value) if queue_path_value not in (None, "") else None,
+        "deferred_root": str(root),
+        "submitted_by": submission,
     }
     job_path = job_dir / "deferred_commit_job.json"
     _write_json_atomic(job_path, job_payload)
@@ -386,19 +426,17 @@ def defer_commit_plan(
             str(sys.executable), "-m", "celltraj2.runners.apply_deferred_commit", str(job_path),
         ],
     }
-    submitted_by = {
-        "instance_id": str(os.environ.get("SITELAB_INSTANCE_ID") or ""),
-        "workspace_id": str(os.environ.get("SITELAB_WORKSPACE_ID") or ""),
-        "instance_label": str(os.environ.get("SITELAB_INSTANCE_LABEL") or ""),
-    }
-    if submitted_by["instance_id"] or submitted_by["workspace_id"]:
-        queue_record["submitted_by"] = submitted_by
+    if submission.get("instance_id") or submission.get("workspace_id"):
+        queue_record["submitted_by"] = submission
     queue_record["revision"] = 0
-    queue_path_value = os.environ.get("CELLTRAJ2_WORKFLOW_QUEUE_PATH")
     queued = False
+    queue_error = None
     if queue_path_value not in (None, ""):
-        append_queue_record(Path(str(queue_path_value)), queue_record)
-        queued = True
+        try:
+            append_queue_record(Path(str(queue_path_value)), queue_record)
+            queued = True
+        except (OSError, H5AccessTimeout) as exc:
+            queue_error = f"Could not add saved H5 write to Jobs at {queue_path_value}: {exc}"
     emit(
         {
             "event": "deferred_commit_created",
@@ -410,11 +448,15 @@ def defer_commit_plan(
             "bundle_sha256": digest,
             "deferred_job_path": str(job_path),
             "queued": queued,
+            "queue_error": queue_error,
             "retry_number": int(retry_number),
         }
     )
     return CommitOutcome(
-        status="deferred", operation_results={}, bundle_path=str(bundle), queue_job_id=commit_id
+        status="deferred", operation_results={}, bundle_path=str(bundle), queue_job_id=commit_id,
+        queued=queued, job_path=str(job_path),
+        queue_path=str(queue_path_value) if queue_path_value not in (None, "") else None,
+        queue_error=queue_error,
     )
 
 
@@ -477,6 +519,9 @@ def apply_deferred_job(
             retry_number=int(payload.get("retry_number") or 1) + 1,
             bundle_path=payload["bundle_path"],
             bundle_sha256=payload.get("bundle_sha256"),
+            queue_path=payload.get("queue_path"),
+            deferred_root=payload.get("deferred_root"),
+            submitted_by=payload.get("submitted_by"),
         )
     if outcome.status in {"committed", "skipped"}:
         bundle = Path(str(payload["bundle_path"]))

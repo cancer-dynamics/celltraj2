@@ -152,6 +152,45 @@ class DeferredCommitTests(unittest.TestCase):
             self.assertEqual(records[1]["bundle_path"], first.bundle_path)
             self.assertTrue(Path(str(first.bundle_path)).exists())
 
+    def test_explicit_workspace_context_is_isolated_and_survives_retry(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            wrong_queue = root / "other-workspace.jsonl"
+            environment = {"CELLTRAJ2_WORKFLOW_QUEUE_PATH": str(wrong_queue),
+                "CELLTRAJ2_DEFERRED_ROOT": str(root / "other-results"), "SITELAB_WORKSPACE_ID": "other"}
+            with patch.dict(os.environ, environment):
+                before = dict(os.environ)
+                jobs = []
+                for name in ("a", "b"):
+                    queue = root / f"{name}.jsonl"
+                    owner = {"instance_id": name, "workspace_id": name, "instance_label": name}
+                    result = defer_commit_plan(self._plan(root / f"{name}.h5"), queue_path=queue,
+                        deferred_root=root / f"results-{name}", submitted_by=owner)
+                    self.assertTrue(result.queued)
+                    record = json.loads(queue.read_text())
+                    self.assertEqual(record["submitted_by"], owner)
+                    self.assertEqual(record["job_path"], result.job_path)
+                    jobs.append(json.loads(Path(result.job_path).read_text()))
+                with patch("celltraj2.deferred_commit.execute_commit_plan", side_effect=H5AccessTimeout("busy")):
+                    retried = apply_deferred_job(jobs[0])
+                self.assertTrue(retried.queued)
+                self.assertEqual(retried.queue_path, str(root / "a.jsonl"))
+                records = [json.loads(line) for line in (root / "a.jsonl").read_text().splitlines()]
+                self.assertEqual(len(records), 2)
+                self.assertEqual(records[1]["submitted_by"]["workspace_id"], "a")
+                self.assertEqual(records[1]["bundle_path"], jobs[0]["bundle_path"])
+                self.assertFalse(wrong_queue.exists())
+                self.assertEqual(dict(os.environ), before)
+
+    def test_queue_failure_retains_bundle_and_reports_manual_retry_path(self):
+        with TemporaryDirectory() as tmp, patch("celltraj2.deferred_commit.append_queue_record", side_effect=PermissionError("denied")):
+            result = defer_commit_plan(self._plan(Path(tmp) / "target.h5"),
+                queue_path=Path(tmp) / "queue.jsonl", deferred_root=Path(tmp) / "saved")
+            self.assertFalse(result.queued)
+            self.assertIn("denied", result.queue_error)
+            self.assertTrue(Path(result.bundle_path).is_file())
+            self.assertTrue(Path(result.job_path).is_file())
+
 
 if __name__ == "__main__":
     unittest.main()

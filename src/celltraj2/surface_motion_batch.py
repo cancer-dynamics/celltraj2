@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
+import os
 from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass, field, is_dataclass
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any
 
 from celltraj2.deferred_commit import PLAN_SCHEMA, defer_commit_plan
@@ -16,6 +18,7 @@ from celltraj2.reporting import JobCancelledError
 from celltraj2.schema import utc_now_iso
 from celltraj2.tracking import compute_boundary_motion, default_tracking_run_id
 from celltraj2.trajectory import Trajectory
+from celltraj2.motion_stream import MotionSpool
 
 
 def _json_safe(value: Any) -> Any:
@@ -236,10 +239,10 @@ def run_batch_surface_motion(
             if commit_deferred:
                 summary.deferred += 1
             summary.completed += 1
-            summary.links += result.link_count
-            summary.transport_edges += result.transport_edge_count
+            summary.links += result["link_count"]
+            summary.transport_edges += result["transport_edge_count"]
             emit({
-                **common, "event": "file_completed", **result.to_dict(),
+                **common, "event": "file_completed", **result,
                 "saved": bool(save_outputs and not commit_deferred),
                 "deferred": commit_deferred, "motion_path": motion_path,
             })
@@ -260,6 +263,28 @@ def _run_surface_motion_file(
     h5_path: Path,
     emit: Reporter,
     common: Mapping[str, Any],
+) -> tuple[Any, str | None, bool] | None:
+    """Own scratch lifetime per attempt, including stale retries/cancellation."""
+    configured = os.environ.get("CELLTRAJ2_SURFACE_MOTION_TEMP_DIR")
+    scratch = (Path(configured) if configured else
+               batch_job.project_root / "cache" / "surface_motion" if batch_job.project_root else
+               h5_path.parent / ".sitelab_temp" / "surface_motion")
+    scratch.mkdir(parents=True, exist_ok=True)
+    with TemporaryDirectory(prefix="motion_", dir=scratch) as tmp:
+        with MotionSpool(Path(tmp) / "motion.h5") as spool:
+            emit({**common, "event": "surface_motion_storage", "storage": "disk",
+                  "scratch_directory": tmp, "result_buffer_limit_bytes": spool.buffer_bytes,
+                  "boundary_cache_limit_bytes": 32 * 1024 * 1024})
+            return _calculate_surface_motion_file(batch_job, file_job, h5_path, emit, common, spool)
+
+
+def _calculate_surface_motion_file(
+    batch_job: SurfaceMotionBatchJob,
+    file_job: SurfaceMotionFileJob,
+    h5_path: Path,
+    emit: Reporter,
+    common: Mapping[str, Any],
+    spool: MotionSpool,
 ) -> tuple[Any, str | None, bool] | None:
     """Calculate read-only, then hold the canonical H5 only for commit."""
 
@@ -320,9 +345,8 @@ def _run_surface_motion_file(
             save_outputs=False,
             metadata={**batch_job.metadata, **file_job.metadata},
             progress=report_progress,
+            result_spool=spool,
         )
-        for frame, counts in result.frame_counts.items():
-            emit({**common, "event": "surface_motion_frame_summary", "frame": int(frame), **counts})
 
     motion_path = None
     commit_deferred = False
@@ -400,7 +424,7 @@ def _run_surface_motion_file(
         except H5AccessTimeout:
             defer_commit_plan(commit_plan, reporter=emit, parent_job_id=batch_job.job_id)
             commit_deferred = True
-    return result, motion_path, commit_deferred
+    return result.to_dict(), motion_path, commit_deferred
 
 
 __all__ = [

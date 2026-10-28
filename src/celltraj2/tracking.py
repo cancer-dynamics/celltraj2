@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+from collections import OrderedDict
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Callable, Sequence
@@ -872,12 +873,15 @@ def compute_boundary_motion(
     save_outputs: bool = True,
     metadata: Mapping[str, Any] | None = None,
     progress: Callable[[Mapping[str, Any]], None] | None = None,
+    result_spool: Any | None = None,
 ) -> BoundaryMotionResult:
     """Map boundary points across every accepted link in a stored object graph.
 
     Object tracking owns link selection. This function only calculates the
     point-level transport attached to those links, making surface motion usable
     with centroid, imported, or boundary-OT track graphs.
+    Batch workers supply a MotionSpool to retain large edge/summary arrays on
+    disk. Direct callers keep the existing in-memory return contract by default.
     """
 
     from celltraj2.boundaries import (
@@ -995,10 +999,14 @@ def compute_boundary_motion(
     )
     _transport_coordinate_schema(cost_prealign)  # Validate even for an empty graph.
     pair_provenance: list[dict[str, Any]] = []
-    point_cache: dict[int, dict[str, Any]] = {}
+    point_cache: OrderedDict[int, dict[str, Any]] = OrderedDict()
+    point_cache_bytes = 0
+    point_cache_limit = 32 * 1024 * 1024
 
     def registered_entity_points(entity_id: int) -> dict[str, Any]:
+        nonlocal point_cache_bytes
         if entity_id in point_cache:
+            point_cache.move_to_end(entity_id)
             return point_cache[entity_id]
         entity = boundary.entity(entity_id)
         point_data = boundary.read_points(entity_id, fields=("point_id", "native_position_zyx"))
@@ -1014,7 +1022,13 @@ def compute_boundary_motion(
             "native": native,
             "registered": registered,
         }
-        point_cache[entity_id] = result
+        size = sum(value.nbytes for value in result.values())
+        while point_cache and point_cache_bytes + size > point_cache_limit:
+            _, old = point_cache.popitem(last=False)
+            point_cache_bytes -= sum(old[key].nbytes for key in ("point_id", "native", "registered"))
+        if size <= point_cache_limit:
+            point_cache[entity_id] = result
+            point_cache_bytes += size
         return result
 
     motion_links: list[tuple[Any, ...]] = []
@@ -1036,6 +1050,8 @@ def compute_boundary_motion(
     canonical_spacing = float(sampling.get("effective_point_spacing") or sampling.get("point_spacing") or 1.0)
     spatial_ndim = int(boundary.schema.get("spatial_ndim") or 3)
     point_measure = canonical_spacing ** max(1, spatial_ndim - 1)
+    target_frames, target_counts = np.unique(graph.links["target_frame"], return_counts=True)
+    remaining_by_frame = dict(zip(target_frames.tolist(), target_counts.tolist()))
     for motion_link_id, link in enumerate(graph.links, start=1):
         parent_observation_id = int(link["parent_observation_id"])
         child_observation_id = int(link["child_observation_id"])
@@ -1142,13 +1158,19 @@ def compute_boundary_motion(
                 | (4 if not plan.solver_converged else 0),
             )
         )
-        transport_columns["source_point_id"].append(source_point_ids.astype(np.int64))
-        transport_columns["target_point_id"].append(target_point_ids.astype(np.int64))
-        transport_columns["mass"].append(np.asarray(plan.mass, dtype=np.float64))
-        transport_columns["edge_cost"].append(np.asarray(plan.edge_cost, dtype=np.float32))
-        transport_columns["registered_displacement_zyx"].append(np.asarray(displacement, dtype=np.float32))
-        _append_columns(source_summary_columns, source_summary)
-        _append_columns(target_summary_columns, target_summary)
+        link_transport = {
+            "source_point_id": source_point_ids.astype(np.int64),
+            "target_point_id": target_point_ids.astype(np.int64),
+            "mass": np.asarray(plan.mass, dtype=np.float64),
+            "edge_cost": np.asarray(plan.edge_cost, dtype=np.float32),
+            "registered_displacement_zyx": np.asarray(displacement, dtype=np.float32),
+        }
+        if result_spool is None:
+            _append_columns(transport_columns, link_transport)
+            _append_columns(source_summary_columns, source_summary)
+            _append_columns(target_summary_columns, target_summary)
+        else:
+            result_spool.append(target_frame, link_transport, source_summary, target_summary)
         transport_start += transport_count
         source_summary_start += source_summary_count
         target_summary_start += target_summary_count
@@ -1198,14 +1220,34 @@ def compute_boundary_motion(
                     "solver_iterations": int(plan.solver_iterations),
                     "solver_converged": bool(plan.solver_converged),
                     "ot_cost": float(plan.total_cost),
+                    "result_buffer_bytes": 0 if result_spool is None else result_spool.pending_bytes,
+                    "result_flush_count": 0 if result_spool is None else result_spool.flush_count,
+                    "boundary_cache_bytes": point_cache_bytes,
                 }
             )
+        remaining_by_frame[target_frame] -= 1
+        if remaining_by_frame[target_frame] == 0 and progress is not None:
+            completed = dict(frame_summary)
+            for name in ("ot_cost", "source_coverage", "target_coverage"):
+                completed[f"mean_{name}"] = completed.pop(f"{name}_sum") / completed["link_count"]
+            progress({"event": "surface_motion_frame_summary", "frame": target_frame, **completed})
+        # Do not retain the previous solver's large arrays during the next solve.
+        del plan, pair, parent_points, child_points, displacement, source_local, target_local
+        del source_point_ids, target_point_ids, link_transport, source_summary, target_summary
 
-    transport = _concatenate_column_blocks(transport_columns, np=np)
-    point_summaries = {
-        "source_summary": _concatenate_column_blocks(source_summary_columns, np=np),
-        "target_summary": _concatenate_column_blocks(target_summary_columns, np=np),
-    }
+    point_cache.clear()
+    if result_spool is None:
+        transport = _concatenate_column_blocks(transport_columns, np=np)
+        point_summaries = {
+            "source_summary": _concatenate_column_blocks(source_summary_columns, np=np),
+            "target_summary": _concatenate_column_blocks(target_summary_columns, np=np),
+        }
+    else:
+        transport, point_summaries = result_spool.finish(_concatenate_column_blocks(transport_columns, np=np))
+        if progress is not None:
+            progress({"event": "surface_motion_storage_summary", "flush_count": result_spool.flush_count,
+                      "peak_result_buffer_bytes": result_spool.peak_buffer_bytes,
+                      "transport_edge_count": transport_start})
     for counts in frame_counts.values():
         counts["mean_ot_cost"] = (
             counts.pop("ot_cost_sum") / counts["link_count"] if counts["link_count"] else None

@@ -972,7 +972,9 @@ class TrajectoryStore:
         point_summaries: Mapping[str, Mapping[str, Any]] | None = None,
         overwrite: bool = False,
     ) -> str:
-        """Write entity links and sparse point-level transport edges."""
+        """Write entity links and transport edges with bounded array copies."""
+
+        from celltraj2.array_stream import copy_array
 
         boundary_name = validate_name(boundary_set, kind="boundary set")
         motion_name = validate_name(motion_set, kind="boundary motion set")
@@ -989,35 +991,49 @@ class TrajectoryStore:
                     f"Boundary transport column {column_name!r} has {actual} rows; expected {edge_count}"
                 )
         group_path = f"{base_path}/motion/{motion_name}"
-        if group_path in self._h5:
-            if not overwrite:
-                raise FileExistsError(f"/{group_path}")
-            del self._h5[group_path]
-        group = self._h5.require_group(group_path)
-        group.create_dataset("links", data=links, compression="gzip", shuffle=True)
-        transport_group = group.require_group("transport")
-        for column_name, column_values in transport.items():
-            dataset = transport_group.create_dataset(
-                str(column_name), data=column_values, compression="gzip", shuffle=True
-            )
-            dataset.attrs["row_alignment"] = "transport_edge"
-        for summary_name, columns in dict(point_summaries or {}).items():
-            summary_group = group.require_group(str(summary_name))
-            summary_count: int | None = None
-            for column_name, column_values in columns.items():
-                actual = int(getattr(column_values, "shape", (0,))[0])
-                if summary_count is None:
-                    summary_count = actual
-                elif actual != summary_count:
-                    raise ValueError(
-                        f"Boundary {summary_name} column {column_name!r} has {actual} rows; "
-                        f"expected {summary_count}"
-                    )
-                dataset = summary_group.create_dataset(
-                    str(column_name), data=column_values, compression="gzip", shuffle=True
-                )
-                dataset.attrs["row_alignment"] = str(summary_name)
-        self.write_json(f"/{group_path}/schema.json", dict(schema), overwrite=True)
+        if group_path in self._h5 and not overwrite:
+            raise FileExistsError(f"/{group_path}")
+        staging = f"_pending_motion_{uuid.uuid4().hex}"
+        backup = f"{staging}_previous"
+        try:
+            group = self._h5.create_group(staging)
+            copy_array(group, "links", links)
+            transport_group = group.require_group("transport")
+            for column_name, column_values in transport.items():
+                dataset = copy_array(transport_group, str(column_name), column_values)
+                dataset.attrs["row_alignment"] = "transport_edge"
+            for summary_name, columns in dict(point_summaries or {}).items():
+                summary_group = group.require_group(str(summary_name))
+                summary_count: int | None = None
+                for column_name, column_values in columns.items():
+                    actual = int(getattr(column_values, "shape", (0,))[0])
+                    if summary_count is None:
+                        summary_count = actual
+                    elif actual != summary_count:
+                        raise ValueError(
+                            f"Boundary {summary_name} column {column_name!r} has {actual} rows; "
+                            f"expected {summary_count}"
+                        )
+                    dataset = copy_array(summary_group, str(column_name), column_values)
+                    dataset.attrs["row_alignment"] = str(summary_name)
+            # Prepare everything before changing the published motion group.
+            group.create_dataset("schema.json", data=_json_text(dict(schema)),
+                                 dtype=_require_h5py().string_dtype(encoding="utf-8"))
+            self._h5.flush()
+            self._h5.require_group(f"{base_path}/motion")
+            if group_path in self._h5:
+                self._h5.move(group_path, backup)
+            try:
+                self._h5.move(staging, group_path)
+            except Exception:
+                if backup in self._h5:
+                    self._h5.move(backup, group_path)
+                raise
+            if backup in self._h5:
+                del self._h5[backup]
+        finally:
+            if staging in self._h5:
+                del self._h5[staging]
         self._mark_mutation(group_path)
         return f"/{group_path}"
 

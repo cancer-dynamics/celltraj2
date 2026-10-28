@@ -1,5 +1,48 @@
 # SITE Handoff
 
+## 2026-10-28 Bounded surface-motion result storage
+
+Independent Surface Motion batch jobs (Run, Test, and queue) now stream sparse
+transport columns and source/target point summaries to `MotionSpool`, a private
+H5 scratch file. Buffers flush at target-frame changes or 8 MiB; an individual
+larger link flushes immediately. No full-result concatenation or materialization
+occurs at commit. Registered/native boundary-point reuse is capped at 32 MiB,
+and previous per-pair solver arrays are released before the next solve.
+The graph, entity/observation identity tables, link rows and diagnostic metadata
+remain proportional to object/link count. Per-pair OT matrices remain bounded
+by the selected point sampling cap, not the spool limit; All points can still
+exhaust memory on one large pair. Direct Python calls retain their established
+in-memory result API unless explicitly given a caller-owned `MotionSpool`.
+
+Scratch defaults to `<project>/cache/surface_motion/`; standalone jobs use
+`.sitelab_temp/surface_motion/` beside the source H5. Override with
+`CELLTRAJ2_SURFACE_MOTION_TEMP_DIR`. Each attempt gets its own temporary directory
+and cleans it on completion, exceptions, cooperative cancellation, or stale
+retry. Hard process termination can leave scratch files behind. Tests still
+leave the canonical H5 unchanged. The final exclusive commit validates input
+revisions and stages a complete motion group before replacing the published
+one, copying arrays in at most 8 MiB slices. Existing results survive handled
+copy errors. This is not a process-crash transaction for the entire H5.
+
+Write timeouts retain the exact results in a compressed, SHA-256-checked
+`.ct2commit.h5` bundle. Array descriptors stay lazy on deferred retries. Legacy
+NPZ bundles are unchanged. Upgrade celltraj2 in worker/retry environments;
+sitelab only adds storage/status explanation and the point-limit tooltip.
+The scientific v2 motion schema, identities, offsets, transport settings,
+sampling, summaries, diagnostics and downstream feature readers are unchanged.
+
+`test_surface_motion_stream.py` checks exact parity for EMD, Sinkhorn, unbalanced
+and partial OT, empty graphs, branch links, bounded copies, final publication,
+test/cancellation/failure cleanup, stale retries and lazy deferred commits.
+`benchmarks/surface_motion_storage.py` measures storage/commit in fresh processes
+using synthetic numeric transport results (not OT runtime): at 128 vs 1,024
+links/8,192 edges per link, memory accumulation used 147 vs 783 MiB peak RSS;
+streaming used 82 vs 91 MiB. Large-case storage elapsed time was 6.79 vs 8.34 s.
+This isolates storage overhead and is not a forecast for a network filesystem
+or a particular dataset's solver cost.
+Validation passed 69 affected celltraj2 tests and 18 SITE workflow/UI tests in
+the WSL `sitelab-gui` environment. Large real project jobs were not run here.
+
 ## 2026-10-22 State partition domains and compact kinetic binding v2
 
 `celltraj2.state_coordinates.PartitionDomain` adds immutable partition-qualified
