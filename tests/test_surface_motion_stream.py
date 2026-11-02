@@ -1,5 +1,6 @@
 """Parity, bounded IO and lifecycle checks for surface-motion disk results."""
 import json
+import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
@@ -86,13 +87,13 @@ class SurfaceMotionStreamTests(unittest.TestCase):
             events = []
             summary = run_batch_surface_motion(config(root), reporter=events.append)
             self.assertEqual(summary.completed, 1)
-            links = [e for e in events if e['event'] == 'surface_motion_link_summary']
-            self.assertEqual(len(links), summary.links)
-            self.assertTrue(any(e['result_flush_count'] > 0 for e in links))
-            self.assertTrue(all(e['boundary_cache_bytes'] <= 32 * 1024**2 for e in links))
+            self.assertFalse(any(e['event'] == 'surface_motion_link_summary' for e in events))
             frame_events = [e for e in events if e['event'] == 'surface_motion_frame_summary']
             self.assertEqual(len(frame_events), 3)
-            self.assertLess(events.index(frame_events[0]), events.index(links[-1]))
+            self.assertEqual(sum(e['link_count'] for e in frame_events), summary.links)
+            self.assertEqual(sum(e['transport_edge_count'] for e in frame_events), summary.transport_edges)
+            self.assertTrue(any(e['result_flush_count'] > 0 for e in frame_events))
+            self.assertTrue(all(e['boundary_cache_bytes'] <= 32 * 1024**2 for e in frame_events))
             with Trajectory(path) as trajectory:
                 stored = trajectory.store.read_boundary_motion("surface", "motion")
                 expected = compute_boundary_motion(trajectory, "cells", "nearest", boundary_set="surface",
@@ -100,11 +101,16 @@ class SurfaceMotionStreamTests(unittest.TestCase):
                 self.assert_columns(stored['transport'], expected.transport)
                 for name in expected.links.dtype.names:
                     np.testing.assert_array_equal(stored['links'][name], expected.links[name])
+                for event in frame_events:
+                    selected = stored['links'][stored['links']['target_frame'] == event['frame']]
+                    self.assertAlmostEqual(event['mean_ot_cost'], float(selected['ot_cost'].mean()))
+                    self.assertAlmostEqual(event['mean_source_coverage'], float(selected['source_coverage'].mean()))
+                    self.assertAlmostEqual(event['dropped_mass'], float(selected['dropped_mass'].sum()))
             before = path.read_bytes()
             run_batch_surface_motion(config(root, save_outputs=False))
             self.assertEqual(path.read_bytes(), before)
             def cancel(event):
-                if event['event'] == 'surface_motion_link_summary':
+                if event['event'] == 'surface_motion_frame_summary':
                     raise JobCancelledError("cancel")
             with self.assertRaises(JobCancelledError):
                 run_batch_surface_motion(config(root, overwrite=True), reporter=cancel)
@@ -114,6 +120,28 @@ class SurfaceMotionStreamTests(unittest.TestCase):
                     run_batch_surface_motion(config(root, overwrite=True))
             self.assertEqual(path.read_bytes(), before)
             self.assertEqual(list((root / "cache/surface_motion").iterdir()), [])
+
+    def test_cancellation_between_cells_without_per_cell_events(self):
+        from celltraj2.boundaries import optimal_transport_plan
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = root / 'sample.ct2.h5'
+            fixture(path)
+            before = path.read_bytes()
+            request = root / 'cancel'
+            events = []
+            def calculate(*args, **kwargs):
+                result = optimal_transport_plan(*args, **kwargs)
+                request.write_text('cancel')
+                return result
+            with patch.dict(os.environ, {'CELLTRAJ2_CANCEL_PATH': str(request)}), \
+                 patch('celltraj2.boundaries.optimal_transport_plan', side_effect=calculate) as solve:
+                with self.assertRaises(JobCancelledError):
+                    run_batch_surface_motion(config(root), reporter=events.append)
+                self.assertEqual(solve.call_count, 1)
+            self.assertFalse(any(e['event'] == 'surface_motion_frame_summary' for e in events))
+            self.assertEqual(path.read_bytes(), before)
+            self.assertEqual(list((root / 'cache/surface_motion').iterdir()), [])
 
     def test_deferred_bundle_remains_lazy_on_retry_and_preserves_values(self):
         with TemporaryDirectory() as tmp:

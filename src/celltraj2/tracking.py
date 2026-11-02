@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Sequence
 
 from celltraj2.paths import validate_name
+from celltraj2.reporting import raise_if_cancelled
 from celltraj2.schema import utc_now_iso
 
 
@@ -1052,7 +1053,15 @@ def compute_boundary_motion(
     point_measure = canonical_spacing ** max(1, spatial_ndim - 1)
     target_frames, target_counts = np.unique(graph.links["target_frame"], return_counts=True)
     remaining_by_frame = dict(zip(target_frames.tolist(), target_counts.tolist()))
+    # Cancellation is independent of progress output, including before the first solve.
+    raise_if_cancelled()
     for motion_link_id, link in enumerate(graph.links, start=1):
+        source_frame = int(link["source_frame"])
+        target_frame = int(link["target_frame"])
+        if target_frame not in frame_counts and progress is not None:
+            progress({"event": "surface_motion_frame_started", "frame": target_frame,
+                      "source_frame": source_frame, "target_frame": target_frame,
+                      "link_count": remaining_by_frame[target_frame]})
         parent_observation_id = int(link["parent_observation_id"])
         child_observation_id = int(link["child_observation_id"])
         if parent_observation_id not in entity_by_observation or child_observation_id not in entity_by_observation:
@@ -1121,8 +1130,6 @@ def compute_boundary_motion(
         transport_count = int(plan.mass.shape[0])
         source_summary_count = int(pair["source"].rows.size)
         target_summary_count = int(pair["target"].rows.size)
-        source_frame = int(link["source_frame"])
-        target_frame = int(link["target_frame"])
         motion_links.append(
             (
                 motion_link_id,
@@ -1187,6 +1194,12 @@ def compute_boundary_motion(
                 "target_coverage_sum": 0.0,
                 "dropped_mass": 0.0,
                 "nonconverged_link_count": 0,
+                "raw_transport_edge_count": 0,
+                "source_sample_count": 0,
+                "target_sample_count": 0,
+                "low_source_coverage_link_count": 0,
+                "low_target_coverage_link_count": 0,
+                "maximum_edge_distance": 0.0,
             },
         )
         frame_summary["link_count"] += 1
@@ -1197,40 +1210,22 @@ def compute_boundary_motion(
         frame_summary["target_coverage_sum"] += float(plan.target_coverage)
         frame_summary["dropped_mass"] += float(plan.dropped_mass)
         frame_summary["nonconverged_link_count"] += int(not plan.solver_converged)
-        if progress is not None:
-            progress(
-                {
-                    "event": "surface_motion_link_summary",
-                    "motion_link_id": int(motion_link_id),
-                    "track_link_id": int(link["link_id"]),
-                    "source_observation_id": parent_observation_id,
-                    "target_observation_id": child_observation_id,
-                    "source_frame": source_frame,
-                    "target_frame": target_frame,
-                    "source_point_count": int(parent_points["native"].shape[0]),
-                    "target_point_count": int(child_points["native"].shape[0]),
-                    "transport_edge_count": transport_count,
-                    "raw_transport_edge_count": int(plan.raw_edge_count),
-                    "transported_mass": float(plan.transported_mass),
-                    "source_coverage": float(plan.source_coverage),
-                    "target_coverage": float(plan.target_coverage),
-                    "dropped_mass": float(plan.dropped_mass),
-                    "edge_distance_p99": float(plan.edge_distance_p99),
-                    "edge_distance_max": float(plan.edge_distance_max),
-                    "solver_iterations": int(plan.solver_iterations),
-                    "solver_converged": bool(plan.solver_converged),
-                    "ot_cost": float(plan.total_cost),
-                    "result_buffer_bytes": 0 if result_spool is None else result_spool.pending_bytes,
-                    "result_flush_count": 0 if result_spool is None else result_spool.flush_count,
-                    "boundary_cache_bytes": point_cache_bytes,
-                }
-            )
+        frame_summary["raw_transport_edge_count"] += int(plan.raw_edge_count)
+        frame_summary["source_sample_count"] += source_summary_count
+        frame_summary["target_sample_count"] += target_summary_count
+        frame_summary["low_source_coverage_link_count"] += int(plan.source_coverage < min_source_coverage)
+        frame_summary["low_target_coverage_link_count"] += int(plan.target_coverage < min_target_coverage)
+        frame_summary["maximum_edge_distance"] = max(frame_summary["maximum_edge_distance"], float(plan.edge_distance_max))
+        raise_if_cancelled()
         remaining_by_frame[target_frame] -= 1
         if remaining_by_frame[target_frame] == 0 and progress is not None:
             completed = dict(frame_summary)
             for name in ("ot_cost", "source_coverage", "target_coverage"):
                 completed[f"mean_{name}"] = completed.pop(f"{name}_sum") / completed["link_count"]
-            progress({"event": "surface_motion_frame_summary", "frame": target_frame, **completed})
+            progress({"event": "surface_motion_frame_summary", "frame": target_frame, **completed,
+                      "result_buffer_bytes": 0 if result_spool is None else result_spool.pending_bytes,
+                      "result_flush_count": 0 if result_spool is None else result_spool.flush_count,
+                      "boundary_cache_bytes": point_cache_bytes})
         # Do not retain the previous solver's large arrays during the next solve.
         del plan, pair, parent_points, child_points, displacement, source_local, target_local
         del source_point_ids, target_point_ids, link_transport, source_summary, target_summary

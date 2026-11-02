@@ -101,9 +101,12 @@ retries, and backend output belong in the external job log and `events.jsonl`.
 This removes repeated progress-only mutations from the H5 and leaves the H5
 focused on canonical analysis results.
 
-Surface-motion link events include result-buffer bytes, scratch flush count,
-and boundary-cache bytes. Frame summaries emit as soon as all links targeting
-that frame finish. Storage events identify the scratch directory and configured
+Surface motion emits frame starts and summaries rather than per-cell events.
+Frame summaries aggregate link/sample/edge counts, transported and dropped mass,
+mean cost and coverage, low-coverage counts, maximum edge distance and solver
+nonconvergence. They also include result-buffer bytes, scratch flush count and
+boundary-cache bytes. Summaries emit as soon as all links targeting that frame
+finish. Storage events identify the scratch directory and configured
 buffer limits. These describe retained result/cache memory, not total process
 memory or the temporary pairwise matrices used inside an OT solver.
 
@@ -112,3 +115,5 @@ progress event, including frame/slice summaries and periodic H5 wait events. A
 request raises a cooperative cancellation at that safe boundary and runners
 exit with code 130 after writing a final `job_cancelled` event. Cancellation is
 cooperative: it does not terminate a process in the middle of an H5 mutation.
+Surface motion additionally checks cancellation before the first solve and
+between cell pairs without serializing/flushing a progress message per cell.

@@ -1,5 +1,26 @@
 # SITE Handoff
 
+## 2026-11-02 Frame-only surface-motion reporting
+
+`compute_boundary_motion` no longer creates/emits `surface_motion_link_summary`
+payloads. It emits frame starts and completed-frame aggregate metrics, including
+coverage/convergence quality counts, and checks cancellation between solves
+without calling the reporter. This removes per-cell JSON formatting, stdout
+flushes and event-file open/write/flush operations. Per-pair scientific results
+and diagnostics, numerical methods, point sampling, and disk spooling remain
+unchanged. Each accepted cell pair remains an independent array-based OT problem;
+combining all frame points would change transport semantics and increase memory.
+
+The corresponding sitelab fix bounds the Qt Jobs/direct Track log documents and
+per-job display histories, batches pipe/UI work, and streams completion events.
+The provided `std::bad_alloc` trace was in Qt `appendPlainText`, so worker result
+spooling alone did not address this separate source of memory growth. Validation
+includes numerical parity, frame metric sums/means, and cancellation during the
+first frame before any frame-summary event. Update both repos on other workers.
+Validation passed 72 backend and 27 SITE GUI/status tests; the actual Qt Jobs
+widget stayed near 99.5 MiB process RSS while receiving 200 MB of synthetic log
+text. This stress test validates the log retention fix, not worst-case OT memory.
+
 ## 2026-10-28 Bounded surface-motion result storage
 
 Independent Surface Motion batch jobs (Run, Test, and queue) now stream sparse

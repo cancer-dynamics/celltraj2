@@ -855,7 +855,7 @@ class BoundaryLibraryTests(unittest.TestCase):
             self.assertEqual(motion_summary.completed, 1)
             self.assertEqual(motion_summary.links, 1)
             self.assertTrue(
-                any(event.get("event") == "surface_motion_link_summary" for event in motion_events)
+                any(event.get("event") == "surface_motion_frame_summary" for event in motion_events)
             )
             self.assertTrue(any(event.get('event') == 'boundary_motion_diagnostics' for event in motion_events))
             with Trajectory(path, mode="r") as trajectory:
