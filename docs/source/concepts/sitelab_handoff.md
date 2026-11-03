@@ -1,5 +1,25 @@
 # SITE Handoff
 
+## 2026-11-03 Compact observation scopes for single-population Type
+
+`observation_scope.py` adds `celltraj2.observation_scope.v1`: full partitions are
+frozen identity/count records, arbitrary selections are packed bitmaps, and
+containment/set operations avoid expanded UUID objects per observation.
+`StateMembershipSpec` accepts compact scopes as `site.state_membership.v2`;
+explicit compact `StateComponentBinding` coverage uses v2. v1 records still load.
+Release validation uses compact overlap/subset checks while kinetic bindings
+continue to require one exact leaf. No one-leaf/one-StateSpace constraint was added.
+
+The corresponding sitelab default creates working single-population contexts
+without dense predictions, identity snapshots, or H5 materialization. Update both
+repos. See sitelab `docs/SITE_single_population_default.md` for contracts and the
+synthetic 30-million-observation benchmark (97.8 MiB peak process RSS including
+Type/State save/reopen/composition). New tests cover scope masks/algebra, schema
+rejection, project isolation, serialization, and large scopes. No real H5 files
+or boundary/transport calculation code were changed by this work.
+Validation: 25 celltraj2 scope/State/interpretation tests passed; SITE passed
+414 State tests (one skipped) and 57 Type/integration tests.
+
 ## 2026-11-02 Frame-only surface-motion reporting
 
 `compute_boundary_motion` no longer creates/emits `surface_motion_link_summary`

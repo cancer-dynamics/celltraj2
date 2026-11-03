@@ -64,6 +64,9 @@ def _require_numpy() -> Any:
 
 
 def _json_safe(value: Any) -> Any:
+    from .observation_scope import ObservationScope
+    if isinstance(value, ObservationScope):
+        return value.to_dict()
     if isinstance(value, Path):
         return str(value)
     if isinstance(value, BiologyRelease):

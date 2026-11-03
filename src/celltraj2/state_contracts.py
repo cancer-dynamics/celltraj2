@@ -10,6 +10,7 @@ import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
+from .observation_scope import ObservationScope, observation_scope
 
 from celltraj2.interpretation import (
     ProjectObservationKey, TypeTaxonomy, _json_safe, _uuid_text,
@@ -205,7 +206,7 @@ class StateMembershipSpec:
             object.__setattr__(self, name, _uuid_text(getattr(self, name), field_name=name))
         if not self.type_role.strip():
             raise ValueError("type_role must not be empty")
-        if self.schema != STATE_MEMBERSHIP_SCHEMA:
+        if self.schema not in {STATE_MEMBERSHIP_SCHEMA, "site.state_membership.v2"}:
             raise ValueError(f"Unsupported State membership schema {self.schema!r}")
         expr = self.expression
         if not isinstance(expr, MembershipExpression):
@@ -215,13 +216,20 @@ class StateMembershipSpec:
         if tuple(self.allowed_assignment_statuses) != ("assigned",):
             raise ValueError("State membership currently admits only valid assigned hard calls")
         object.__setattr__(self, "allowed_assignment_statuses", ("assigned",))
-        observations = tuple(sorted(_keys(self.resolved_observations, "resolved_observations")))
+        compact = isinstance(self.resolved_observations, (ObservationScope, Mapping))
+        observations = (observation_scope(self.resolved_observations) if compact else
+                        tuple(sorted(_keys(self.resolved_observations, "resolved_observations"))))
+        if compact:
+            object.__setattr__(self, "schema", "site.state_membership.v2")
+        elif self.schema == "site.state_membership.v2":
+            raise ValueError("Compact State membership requires a compact scope")
         partitions = tuple(sorted(_partition(item) for item in self.resolved_partitions))
         if len(partitions) != len(set(partitions)):
             raise ValueError("Duplicate resolved partitions")
-        if len({key.project_uuid for key in observations}) > 1:
+        if not compact and len({key.project_uuid for key in observations}) > 1:
             raise ValueError("A membership cannot span projects")
-        if any(key.partition not in partitions for key in observations):
+        if (set(observations.partitions) - set(partitions) if compact else
+                any(key.partition not in partitions for key in observations)):
             raise ValueError("Membership observations escape the frozen resolved file set")
         object.__setattr__(self, "resolved_observations", observations)
         object.__setattr__(self, "resolved_partitions", partitions)
@@ -229,7 +237,7 @@ class StateMembershipSpec:
         object.__setattr__(self, "source_dependencies", _dependencies(self.source_dependencies))
         # Exact Type leaf identity is deliberately absent: a shared prediction may
         # survive a retype that stays inside its requested membership.
-        expected = canonical_json_digest([key.to_dict() for key in observations])
+        expected = canonical_json_digest(observations.to_dict() if compact else [key.to_dict() for key in observations])
         if self.conditioning_digest is not None and self.conditioning_digest != expected:
             raise ValueError("conditioning_digest does not match the frozen observation membership")
         object.__setattr__(self, "conditioning_digest", expected)
@@ -291,7 +299,7 @@ class StateComponentBinding:
                 object.__setattr__(self, name, _uuid_text(getattr(self, name), field_name=name))
         if not self.channel.strip():
             raise ValueError("State channel must not be empty")
-        if self.schema != STATE_COMPONENT_BINDING_SCHEMA:
+        if self.schema not in {STATE_COMPONENT_BINDING_SCHEMA, "site.state_component_binding.v2"}:
             raise ValueError(f"Unsupported State binding schema {self.schema!r}")
         if self.compatibility_status not in {
             "unchanged", "subset_reusable", "needs_application", "needs_refit",
@@ -303,8 +311,12 @@ class StateComponentBinding:
         object.__setattr__(self, "conditioning_digest", _digest(self.conditioning_digest, "conditioning_digest"))
         object.__setattr__(self, "dependencies", _dependencies(self.dependencies))
         if self.coverage_observations is not None:
-            object.__setattr__(self, "coverage_observations", tuple(sorted(
-                _keys(self.coverage_observations, "coverage_observations"))))
+            if isinstance(self.coverage_observations, (ObservationScope, Mapping)):
+                object.__setattr__(self, "coverage_observations", observation_scope(self.coverage_observations))
+                object.__setattr__(self, "schema", "site.state_component_binding.v2")
+            else:
+                object.__setattr__(self, "coverage_observations", tuple(sorted(
+                    _keys(self.coverage_observations, "coverage_observations"))))
 
     @property
     def artifact_ids(self) -> frozenset[str]:
@@ -410,7 +422,7 @@ class KineticModelBinding:
         if self.leaf_type_id not in {node.type_id for node in taxonomy.leaf_nodes}:
             raise ValueError("Kinetics require one exact Type leaf, never a parent node")
         cohort = set(self.observation_cohort)
-        if not cohort.issubset(membership.resolved_observations):
+        if any(key not in membership.resolved_observations for key in cohort):
             raise ValueError("Kinetic cohort escapes shared State membership")
         if any(exact_type_assignments.get(key) != self.leaf_type_id for key in cohort):
             raise ValueError("Kinetic cohort contains unresolved or mixed Type leaves")
@@ -534,7 +546,9 @@ def validate_release_v2_structure(release: Any) -> None:
             raise ValueError("State membership uses a different taxonomy revision")
         if release.type_classifications.get(membership.type_role) != membership.type_classification_id:
             raise ValueError("Membership Type classification/role is not selected in the release")
-        if any(key.project_uuid != release.project_uuid for key in membership.resolved_observations):
+        if (membership.resolved_observations.project_uuid != release.project_uuid
+                if isinstance(membership.resolved_observations, ObservationScope) else
+                any(key.project_uuid != release.project_uuid for key in membership.resolved_observations)):
             raise ValueError("State membership belongs to a different project")
     for binding in states.values():
         if binding.membership_id not in memberships:
@@ -542,19 +556,19 @@ def validate_release_v2_structure(release: Any) -> None:
         membership = memberships[binding.membership_id]
         if binding.conditioning_digest != membership.conditioning_digest:
             raise ValueError("State binding conditioning digest differs from its membership")
-        scope = set(membership.resolved_observations if binding.coverage_observations is None
-                    else binding.coverage_observations)
-        if not scope.issubset(membership.resolved_observations):
+        scope = observation_scope(membership.resolved_observations if binding.coverage_observations is None
+                                  else binding.coverage_observations, release.project_uuid)
+        if not scope.issubset(observation_scope(membership.resolved_observations, release.project_uuid)):
             raise ValueError("State output coverage escapes membership")
-        previous = covered.setdefault(binding.channel, set())
+        previous = covered.get(binding.channel, ObservationScope(release.project_uuid))
         if previous.intersection(scope):
             raise ValueError(f"Overlapping authoritative outputs for State channel {binding.channel!r}")
-        previous.update(scope)
+        covered[binding.channel] = previous.union(scope)
     for binding in release.kinetic_bindings:
         if binding.state_binding_id not in states:
             raise ValueError("Kinetic binding references a missing State binding")
         membership = memberships[states[binding.state_binding_id].membership_id]
-        if not set(binding.observation_cohort).issubset(membership.resolved_observations):
+        if not observation_scope(binding.observation_cohort, release.project_uuid).issubset(membership.resolved_observations):
             raise ValueError("Kinetic cohort escapes State membership")
     # Historical v1 State IDs are not evidence of a validated v2 scope.
     if set(release.state_classifications.values()) - {item.assignment_id for item in states.values()}:
