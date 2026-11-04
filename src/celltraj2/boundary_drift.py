@@ -19,6 +19,7 @@ VALIDITY_CODES = {
     12: 'interval_mismatch', 13: 'branch_or_merge', 14: 'gap',
     15: 'motion_quality', 16: 'unknown_cohort', 17: 'unsupported_registration',
     18: 'mixed_displacement_intervals', 19: 'unverified_weighting',
+    20: 'nonfinite_measurement',
 }
 
 
@@ -78,7 +79,14 @@ class BoundaryTargetIndex:
                 dd, ii = self.tree.query(positions[rows], k=k, workers=1)
                 dd, ii = np.asarray(dd).reshape(len(rows), k), np.asarray(ii).reshape(len(rows), k)
                 for row, ds, ix in zip(rows, dd, ii):
-                    eligible = self.object_ids[ix] != object_ids[row]
+                    if np.isfinite(ds[-1]):
+                        eligible = self.object_ids[ix] != object_ids[row]
+                    else:
+                        # Infinite tree distances use an out-of-bounds sentinel.
+                        # Keep any finite neighbor; mark an unresolvable query.
+                        candidates = (ix >= 0) & (ix < count) & np.isfinite(ds)
+                        eligible = np.zeros(ix.shape, bool)
+                        eligible[candidates] = self.object_ids[ix[candidates]] != object_ids[row]
                     if eligible.any():
                         minimum = ds[eligible].min()
                         # Resolve all exact distance ties before assigning identity/direction.
@@ -87,6 +95,9 @@ class BoundaryTargetIndex:
                             winner = ties[np.argmin(self.point_ids[ties])]
                             result[row], distance[row] = winner, minimum
                             continue
+                    if not np.isfinite(ds[-1]):
+                        distance[row] = np.inf
+                        continue
                     if k < count:
                         unresolved.append(row)
             pending = np.asarray(unresolved, dtype=np.int64)
@@ -98,7 +109,10 @@ class BoundaryTargetIndex:
                     for start in range(0, count, 65536):
                         _cancel(cancelled)
                         stop = min(start + 65536, count)
-                        ds = np.linalg.norm(self.positions[start:stop] - positions[row], axis=1)
+                        with np.errstate(over='ignore', invalid='ignore'):
+                            ds = np.hypot.reduce(self.positions[start:stop] - positions[row], axis=1)
+                        if np.any(~np.isfinite(ds) & (self.object_ids[start:stop] != object_ids[row])):
+                            distance[row] = np.inf
                         ds[self.object_ids[start:stop] == object_ids[row]] = np.inf
                         minimum = ds.min()
                         if np.isfinite(minimum) and minimum <= best:
@@ -113,6 +127,30 @@ class BoundaryTargetIndex:
         return result, distance
 
 
+def require_finite_moments(*arrays, context='boundary moments'):
+    """Unusable accumulated statistics must never masquerade as low support."""
+    if any(not np.isfinite(a).all() for a in arrays):
+        raise FloatingPointError(f'Boundary drift numerical overflow or nonfinite {context}. '
+            'Calculation stopped; no valid result was produced. Check saved motion magnitudes, '
+            'coordinates/calibration, weights and elapsed time; repair the inputs and recalculate. '
+            'This is arithmetic overflow, not RAM exhaustion; increasing RAM or reducing workers will not fix it.')
+
+
+def measurement_validity(distance, values, weights, validity):
+    """Reject individual nonfinite/overflowing moments, retaining prior reasons."""
+    distance, values, weights = (np.asarray(v, dtype=float) for v in (distance, values, weights))
+    reason = np.asarray(validity, dtype=np.int16).copy()
+    if any(a.shape != distance.shape for a in (values, weights, reason)) or distance.ndim != 1:
+        raise ValueError('Boundary distance, values, weights and validity must be aligned vectors')
+    reason[(reason == 0) & (~np.isfinite(weights) | (weights <= 0))] = 8
+    with np.errstate(over='ignore', invalid='ignore'):
+        products_finite = (np.isfinite(weights*values) & np.isfinite(weights*values*values)
+                           & np.isfinite(weights*weights))
+    finite = np.isfinite(distance) & np.isfinite(values) & products_finite
+    reason[(reason == 0) & ~finite] = 20
+    return reason
+
+
 def summarize_boundary_samples(distance, values, weights, validity, distance_edges, *, min_pairs=2):
     """Finite weighted sufficient statistics; support counts are not biological n."""
     edges = distance_bins(distance_edges)
@@ -121,12 +159,13 @@ def summarize_boundary_samples(distance, values, weights, validity, distance_edg
     distance, values, weights = (np.asarray(v, dtype=float) for v in (distance, values, weights))
     bins = np.searchsorted(edges, distance, side='right') - 1
     bins[distance == edges[-1]] = len(edges) - 2
-    valid = ((np.asarray(validity) == 0) & np.isfinite(values) & np.isfinite(distance) &
+    valid = ((measurement_validity(distance, values, weights, validity) == 0) & np.isfinite(values) & np.isfinite(distance) &
              np.isfinite(weights) & (weights > 0) & (bins >= 0) & (bins < len(edges) - 1))
     n = len(edges) - 1
     b, v, w = bins[valid], values[valid], weights[valid]
     counts = np.bincount(b, minlength=n).astype(np.int64)
     sums = [np.bincount(b, weights=entry, minlength=n) for entry in (w, w*v, w*v*v, w*w)]
+    require_finite_moments(*sums)
     means = np.divide(sums[1], sums[0], out=np.full(n, np.nan), where=(counts >= min_pairs) & (sums[0] > 0))
     status = np.full(n, 'ok', dtype='U20')
     status[counts < min_pairs] = 'insufficient_support'
@@ -161,6 +200,7 @@ def project_boundary_drift(source_positions, displacements, source_object_ids, t
     reject(~np.isfinite(u).all(axis=1), 2)
     reject(~np.isfinite(w) | (w <= 0), 8)
     target, distance = target_index.nearest_other(p, ids, cancelled=cancelled)
+    reject(np.isinf(distance), 20)
     reject(target < 0, 3)
     reject(distance == 0, 4)
     reject((distance < edges[0]) | (distance > edges[-1]), 5)
@@ -179,7 +219,9 @@ def project_boundary_drift(source_positions, displacements, source_object_ids, t
         reject(~np.isfinite(norm) | (norm <= 0), 6)
         cosine = np.divide(np.sum(normals * direction, axis=1), norm, out=np.full(n, np.nan), where=norm > 0)
         reject(cosine < angle_min, 7)
-    projected = np.einsum('ij,ij->i', u, direction)
+    with np.errstate(over='ignore', invalid='ignore'):
+        projected = np.einsum('ij,ij->i', u, direction)
+    reason = measurement_validity(distance, projected, w, reason)
     projected[reason != 0] = np.nan
     target_rows = np.full(n, -1, dtype=np.int64)
     target_rows[target >= 0] = target_index.original_rows[target[target >= 0]]

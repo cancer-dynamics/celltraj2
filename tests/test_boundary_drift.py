@@ -51,6 +51,21 @@ class BoundaryDriftTests(unittest.TestCase):
         self.assertEqual(result['counts'][1], 1)
         self.assertEqual(result['values'][1], 0)
 
+    def test_extreme_finite_vectors_are_reported_and_preserve_healthy_measurements(self):
+        result = self.project([[0, 0], [0, 1]], [[1.e200, 0], [2, 0]], [[10, 0], [10, 1]])
+        np.testing.assert_equal(result['validity'], [20, 0])
+        self.assertEqual(result['counts'][1], 1)
+        self.assertEqual(result['values'][1], 2.)
+
+    def test_infinite_tree_distance_sentinel_does_not_index_past_targets(self):
+        result = self.project([[0, 0]], [[1, 0]], [[1.e200, 0]])
+        self.assertEqual(result['validity'][0], 20)
+        self.assertEqual(result['counts'].sum(), 0)
+
+    def test_finite_individual_moments_with_overflowing_sum_stop(self):
+        with self.assertRaisesRegex(FloatingPointError, 'numerical overflow'):
+            summarize_boundary_samples([1, 1], [1.e154, 1.e154], [1, 1], [0, 0], [0, 2])
+
     def test_ties_choose_stable_smallest_point_identity(self):
         index = BoundaryTargetIndex([[2, 0], [-2, 0]], [2, 3], [30, 10])
         result = project_boundary_drift([[0, 0]], [[1, 0]], [1], index, distance_edges=[0, 3], min_pairs=1)
